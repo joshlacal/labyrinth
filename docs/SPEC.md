@@ -394,21 +394,58 @@ To read a message:
 
 ## 9. Storage backends
 
-The protocol core does no I/O. It defines `MetaStore` (devices, epochs, virtual devices, MEK distributions) and `MailboxStore` (owner records and the shared sender records), with compare-and-swap on the mailbox head.
+The protocol layers do no I/O. `src/records/` defines the record shapes, `src/store/` the storage traits, and `src/client/` a client built only on those traits.
 
-| Backend | Where | Writes | Reads | CAS |
+### 9.1 Records
+
+Every record is a `blue.catbird.labyrinth.*` lexicon in `lexicons/blue/catbird/labyrinth/`. The Rust types in `src/records/` serialize to the atproto JSON data model: camelCase fields, `$type` = the NSID, bytes as `{"$bytes": "<base64, no padding>"}`, datetimes in RFC 3339. Each converts losslessly to its protocol struct. `tests/lexicon_records.rs` validates every emitted record against the lexicon JSON (required fields, unknown fields, types, length limits, integer bounds, closed unions).
+
+| Record | Space | rkey | Mutability |
+|---|---|---|---|
+| `device` | personal mailbox | `hex(deviceKeyPubkey)` | immutable except `revokedAt`, set once |
+| `epoch` | personal mailbox | `epochID` = 12-digit zero-padded seq ([CB-9]) | immutable; created together with its initial `epochMember`s |
+| `epochMember` | personal mailbox | `<12-digit seq>-<hex deviceKeyPubkey>` | immutable |
+| `virtualDevice` | personal mailbox | `hex(vdeviceId)` | immutable |
+| `ownerBatch` | personal mailbox | TID | append-only, one thread per batch |
+| `mailboxKeys` | **public** repo | `self` | overwritten on each rotation ([CB-19]) |
+| `mek` | conversation space, sender's repo | `hex(mekId)` | immutable ([CB-21]) |
+| `batch` | conversation space, sender's repo | TID | append-only ([CB-15]) |
+
+`mek#labyrinthSender` embeds the sender's full `epochPublic`, because the public `mailboxKeys` record only shows a sender's *latest* epoch and readers need the auth key of the epoch that sealed an older MEK. The embedded copy is self-authenticating (head, self signature, [CB-18] attestation).
+
+### 9.2 Store traits
+
+- `MailboxStore`: the caller's own mailbox (devices, epochs, epoch members, virtual devices, owner batches) plus publishing `mailboxKeys`.
+- `ThreadStore`: the conversation spaces. Writes go to the caller's repo; reads see every member's repo.
+- `MailboxDirectory`: other accounts' latest `epochPublic` and their MLS chat device keys, current and historical ([CB-27]).
+
+The traits are **synchronous** and return `Result`, so the crate needs no async runtime. A handle is bound to one authenticated DID. Every backend must provide:
+
+- **Create-if-absent.** `create_*` on an existing rkey fails with `Error::Conflict`. Space writes have no `swapRecord`; instead `#create` on an existing rkey fails with `RecordAlreadyExists` (reference `actor-store/space/transactor.ts`), and epoch rkeys are the zero-padded sequence number, so creating an epoch is the race guard between devices.
+- **Atomic epoch creation.** `create_epoch(epoch, members)` writes the epoch and its initial members in one `applyWrites`.
+- **Immutability** as in the table above.
+- `Error::Forbidden` when a space refuses reads (e.g. after removal, [CB-22]); `Error::Backend` for I/O failures.
+
+| Backend | Where | Writes | Reads | Race guard |
 |---|---|---|---|---|
-| **atproto Space** | Mailbox: a personal Space on the user's PDS, `spaceType = blue.catbird.labyrinth.mailbox`, authority = the user's DID. Sender records: a conversation Space whose authority is mls-ds's service DID; each sender writes into their own repo | OAuth `com.atproto.space.applyWrites` | the owner uses `read_self`; other members use space credentials | Space writes have no `swapRecord`. Instead, `#create` on an existing rkey fails with `RecordAlreadyExists` (reference `actor-store/space/transactor.ts:202`), and epoch rkeys are the zero-padded sequence number, so a create-if-absent on rkey acts as the guard |
-| **mls-ds** | `blue.catbird.labyrinth.*` XRPC procedures on the delivery service | DPoP-authenticated chat device | same | row version |
-| **memory** | tests | – | – | – |
+| **atproto Space** | Mailbox: a personal Space on the user's PDS, `spaceType = blue.catbird.labyrinth.mailbox`, authority = the user's DID. Sender records: a conversation Space whose authority is mls-ds's service DID; each sender writes into their own repo | OAuth `com.atproto.space.applyWrites` | the owner uses `read_self`; other members use space credentials | create-if-absent on the epoch rkey |
+| **mls-ds** | `blue.catbird.labyrinth.*` XRPC procedures on the delivery service (not yet built) | DPoP-authenticated chat device | same | row uniqueness |
+| **memory** (`store::memory`) | tests; one value plays every server | per-DID handles | no read ACL unless a space revokes a member | create-if-absent |
 
-**[CB-20] Batching.** Messages are batched, up to 256 per `batch`/`ownerBatch` record. This keeps us within the reference PDS's per-account write budget (about 1.7k creates/hour), the 1 MB write cap, and the current ~60k-record export ceiling.
+**[CB-20] Batching.** Messages are batched, up to 256 per `batch`/`ownerBatch` record, and a client flushes earlier if a batch would exceed about 900 KB of JSON. This keeps us within the reference PDS's per-account write budget (about 1.7k creates/hour), the 1 MB write cap, and the current ~60k-record export ceiling. A MEK record lists at most 512 recipients for the same reason.
 
-The record lexicons are in `lexicons/blue/catbird/labyrinth/`. They are drafts until the Spaces GA in mid-November 2026.
+### 9.3 Client
+
+`client::Labyrinth` is one enrolled device. It holds the device secrets and an epoch-secret cache in memory only; persisting them is the embedding app's job.
+
+- **Lifecycle:** `initialize` (epoch 0, device, `mailboxKeys`), `sync_epochs` (forward-chain into epochs opened by sibling devices, then the [CB-28] integrity check), `revoke_device` (mark revoked, open the next epoch without it, publish `mailboxKeys`; retries on `Conflict`).
+- **Enrollment:** `create_recovery_code`, `create_passkey_recovery`, `restore_with_recovery_code` (typo correction, forward-chaining with the virtual device, integrity check, then enrollment in the newest epoch), `restore_with_passkey`, and one-time codes (`otc_offer`/`otc_respond` on the existing device, `otc_start`/`enroll_via_otc` on the new one).
+- **Sending:** `resolve_roster` and `archive_outgoing` check every recipient epoch against the DID's current chat devices ([CB-18]), reuse a cached MEK under the reuse rules or distribute a new one, and buffer the sealed message; `flush` writes batches.
+- **Reading:** `load_thread` opens sender batches through any MEK addressed to any of the caller's epochs (backward-chaining as needed) plus owner batches, and reports what it could not open (for example `NotRecipient` before a join or after a leave). `archive_owner` writes v1.0 owner messages; `rearchive_thread_before_leave` implements [CB-22].
 
 ## 10. Known limitations we keep from the paper (p.47)
 
 - **Epoch truncation by a malicious backend.**
-  - Planned mitigation: `mls-ds` publishes each member's latest epoch head in the MLS roster view, so a restoring device can check that it reached it.
+  - Mitigation **[CB-28]**: a device compares the newest epoch it reached (on sync, restore and one-time-code enrollment) with the latest epoch the `MailboxDirectory` publishes for its own DID, and fails with `EpochTruncated` if the directory is ahead or its head forks. This only helps if the directory is independent of the mailbox store; the planned source is `mls-ds` publishing each member's latest epoch head in the MLS roster view. A backend that controls both can still truncate.
 - **Membership enumeration.**
 - **Only partial post-quantum security.** Entropy distribution stays classical X25519, as in the paper.
