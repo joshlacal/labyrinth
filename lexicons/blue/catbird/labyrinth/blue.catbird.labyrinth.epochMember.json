@@ -18,7 +18,8 @@
           "epochNumber": {
             "type": "integer",
             "description": "Sequence number of the epoch.",
-            "minimum": 0
+            "minimum": 0,
+            "maximum": 1099511627776
           },
           "deviceKeyPubkey": {
             "type": "bytes",

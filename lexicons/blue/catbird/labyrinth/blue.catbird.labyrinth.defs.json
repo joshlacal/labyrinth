@@ -18,7 +18,8 @@
         "epochNumber": {
           "type": "integer",
           "description": "epochSequenceID, starting at 0.",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 1099511627776
         },
         "authPubkey": {
           "type": "bytes",
@@ -161,7 +162,8 @@
         "epochNumber": {
           "type": "integer",
           "description": "Epoch whose root key derived the message key.",
-          "minimum": 0
+          "minimum": 0,
+          "maximum": 1099511627776
         },
         "version": {
           "type": "integer",

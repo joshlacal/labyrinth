@@ -274,4 +274,31 @@ fn validator_rejects_bad_records() {
     lex.validate_record(nsid::OWNER_BATCH, &v).unwrap();
     v["items"][0]["version"] = json!(5);
     assert!(lex.validate_record(nsid::OWNER_BATCH, &v).is_err());
+    // epochNumber is bounded at 2^40, in the lexicon and in the records layer.
+    v["items"][0]["version"] = json!(3);
+    v["items"][0]["epochNumber"] = json!(labyrinth::records::MAX_EPOCH_NUMBER);
+    lex.validate_record(nsid::OWNER_BATCH, &v).unwrap();
+    for n in [labyrinth::records::MAX_EPOCH_NUMBER + 1, u64::MAX] {
+        v["items"][0]["epochNumber"] = json!(n);
+        assert!(lex.validate_record(nsid::OWNER_BATCH, &v).is_err());
+        let ob: OwnerBatch = serde_json::from_value(v.clone()).unwrap();
+        assert!(ob.to_messages().is_err());
+    }
+    let mut em = serde_json::to_value(EpochMember::from_record(
+        &labyrinth::epoch::add_device_mac(
+            &labyrinth::epoch::PendingEpoch::new(1, [1; 32]),
+            a.public(),
+        )
+        .unwrap(),
+        datetime_from_ms(0),
+    ))
+    .unwrap();
+    lex.validate_record(nsid::EPOCH_MEMBER, &em).unwrap();
+    em["epochNumber"] = json!(u64::MAX);
+    assert!(lex.validate_record(nsid::EPOCH_MEMBER, &em).is_err());
+    let rec: EpochMember = serde_json::from_value(em).unwrap();
+    assert!(rec.to_record().is_err());
+    let mut pubdef = labyrinth::records::EpochPublicDef::from_public(&m.epoch);
+    pubdef.epoch_number = u64::MAX;
+    assert!(pubdef.to_public().is_err());
 }

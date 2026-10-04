@@ -47,6 +47,20 @@ pub const MAX_BATCH_ITEMS: usize = 256;
 /// headroom under the PDS's 1 MB record cap after base64 expansion.
 pub const BATCH_BYTE_BUDGET: usize = 900_000;
 
+/// Largest `epochNumber` any record may carry (2^40). Epoch numbers come
+/// from the store, so they are bounded here, well below `u64::MAX`, to
+/// keep every `seq + 1` in the protocol layers far from overflow. The
+/// lexicons carry the same `maximum`.
+pub const MAX_EPOCH_NUMBER: u64 = 1 << 40;
+
+/// Rejects an `epochNumber` above [`MAX_EPOCH_NUMBER`].
+pub fn check_epoch_number(n: u64) -> Result<u64> {
+    if n > MAX_EPOCH_NUMBER {
+        return Err(Error::Malformed("epochNumber out of range"));
+    }
+    Ok(n)
+}
+
 /// An atproto `bytes` value: `{"$bytes": "<base64 no padding>"}` in JSON.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Bytes(pub Vec<u8>);

@@ -58,7 +58,7 @@ impl EpochPublicDef {
     /// [`EpochPublic::verify`] on the result.
     pub fn to_public(&self) -> Result<EpochPublic> {
         Ok(EpochPublic {
-            seq: self.epoch_number,
+            seq: super::check_epoch_number(self.epoch_number)?,
             keys: MailboxPublicKeys {
                 auth: X25519Public(self.auth_pubkey.array("authPubkey length")?),
                 enc: HawkEncPublic::from_bytes(&self.encryption_pubkey.0)?,

@@ -156,7 +156,7 @@ impl EpochMember {
     pub fn to_record(&self) -> Result<EpochMemberRecord> {
         check_type(&self.type_, nsid::EPOCH_MEMBER)?;
         Ok(EpochMemberRecord {
-            seq: self.epoch_number,
+            seq: super::check_epoch_number(self.epoch_number)?,
             device_key_pub: XVerifyingKey(self.device_key_pubkey.array("deviceKeyPubkey")?),
             device_mac: self.device_mac.array("deviceMac length")?,
             encrypted_entropy: self.encrypted_entropy.clone().map(|b| b.0),
@@ -313,6 +313,9 @@ impl OwnerBatch {
         }
         if self.items.iter().any(|i| i.thread_id != self.thread_id) {
             return Err(Error::Malformed("owner batch mixes threads"));
+        }
+        for i in &self.items {
+            super::check_epoch_number(i.epoch_number)?;
         }
         Ok(())
     }
