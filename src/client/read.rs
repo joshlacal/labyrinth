@@ -1,7 +1,7 @@
 //! Reader path: loading a thread's history, and owner-mode archiving
 //! (SPEC §7.1, §7.4, [CB-22]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::Labyrinth;
 use crate::epoch::EpochKeys as _;
@@ -30,6 +30,10 @@ pub struct LoadedMessage {
     pub sender: Option<String>,
     pub frame: Vec<u8>,
     pub source: MessageSource,
+    /// True when another, different copy with the same `message_id` was
+    /// also loaded (from another author, or a differing owner copy). Both
+    /// copies are returned; the caller decides which one MLS vouches for.
+    pub conflict: bool,
 }
 
 /// A message this device could see but not open.
@@ -56,8 +60,15 @@ pub struct ThreadHistory {
 impl Labyrinth {
     /// Load and decrypt every message of `thread_id` in `range`: sender
     /// batches via any MEK addressed to any of my epochs (backward-chaining
-    /// as needed), plus my owner batches. A message present in both is
-    /// returned once, from the sender copy.
+    /// as needed), plus my owner batches.
+    ///
+    /// Copies are merged only when they are provably the same message: a
+    /// sender copy is deduplicated on `(author DID, messageId)` with a
+    /// byte-equal frame, and an owner copy is dropped only when its frame
+    /// is byte-equal to a loaded copy with the same `messageId`. Anything
+    /// else that shares a `messageId` is returned with
+    /// [`LoadedMessage::conflict`] set, so a group member who reuses
+    /// another member's id cannot suppress the genuine message.
     pub fn load_thread(&mut self, thread_id: &str, range: TimeRange) -> Result<ThreadHistory> {
         let mut h = ThreadHistory {
             space_readable: true,
@@ -99,6 +110,7 @@ impl Labyrinth {
                         sender: author.clone(),
                         frame,
                         source: MessageSource::Sender,
+                        conflict: false,
                     }),
                     Err(error) => h.undecryptable.push(Undecryptable {
                         message_id: s.message_id.clone(),
@@ -111,11 +123,7 @@ impl Labyrinth {
         }
         self.load_owner(thread_id, range, &mut h)?;
 
-        let mut seen = HashSet::new();
-        h.messages
-            .sort_by_key(|m| m.source != MessageSource::Sender);
-        h.messages.retain(|m| seen.insert(m.message_id.clone()));
-        h.undecryptable.retain(|u| !seen.contains(&u.message_id));
+        dedupe(&mut h);
         h.messages
             .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
         h.undecryptable
@@ -145,6 +153,7 @@ impl Labyrinth {
                         sender: None,
                         frame,
                         source: MessageSource::Owner,
+                        conflict: false,
                     }),
                     Err(error) => h.undecryptable.push(Undecryptable {
                         message_id: m.message_id,
@@ -271,22 +280,66 @@ impl Labyrinth {
     /// it inside the frame.
     pub fn rearchive_thread_before_leave(&mut self, thread_id: &str) -> Result<usize> {
         let history = self.load_thread(thread_id, TimeRange::ALL)?;
-        let mut archived = HashSet::new();
-        for b in self
-            .b
-            .mailbox
-            .list_owner_batches(thread_id, TimeRange::ALL)?
-        {
-            archived.extend(b.value.items.into_iter().map(|i| i.message_id));
-        }
+        // What the owner archive already holds, by (messageId, frame): a
+        // copy counts as archived only if its plaintext is byte-equal, so
+        // two distinct messages sharing an id are both kept.
+        let mut owner = ThreadHistory::default();
+        self.load_owner(thread_id, TimeRange::ALL, &mut owner)?;
+        let mut archived: HashSet<(String, Vec<u8>)> = owner
+            .messages
+            .into_iter()
+            .map(|m| (m.message_id, m.frame))
+            .collect();
         let mut n = 0;
         for m in history.messages {
-            if m.source == MessageSource::Sender && !archived.contains(&m.message_id) {
-                self.archive_owner(thread_id, &m.message_id, m.timestamp, &m.frame)?;
-                n += 1;
+            if m.source != MessageSource::Sender {
+                continue;
             }
+            let key = (m.message_id, m.frame);
+            if archived.contains(&key) {
+                continue;
+            }
+            self.archive_owner(thread_id, &key.0, m.timestamp, &key.1)?;
+            archived.insert(key);
+            n += 1;
         }
         self.flush_owner(thread_id)?;
         Ok(n)
     }
+}
+
+/// Merge provably identical copies and flag the rest (see
+/// [`Labyrinth::load_thread`]). Sender copies are considered first.
+fn dedupe(h: &mut ThreadHistory) {
+    let mut all = core::mem::take(&mut h.messages);
+    all.sort_by_key(|m| m.source != MessageSource::Sender);
+    let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
+    for m in all {
+        let same = by_id.get(&m.message_id).is_some_and(|ix| {
+            ix.iter().any(|&i| {
+                let k = &h.messages[i];
+                k.frame == m.frame && (m.source == MessageSource::Owner || k.sender == m.sender)
+            })
+        });
+        if !same {
+            by_id
+                .entry(m.message_id.clone())
+                .or_default()
+                .push(h.messages.len());
+            h.messages.push(m);
+        }
+    }
+    for ix in by_id.values().filter(|ix| ix.len() > 1) {
+        for &i in ix {
+            h.messages[i].conflict = true;
+        }
+    }
+    // An unopenable copy is hidden only behind an opened copy from the
+    // same author (or, for my own owner archive, any opened copy).
+    let messages = &h.messages;
+    h.undecryptable.retain(|u| {
+        !messages
+            .iter()
+            .any(|m| m.message_id == u.message_id && (u.sender.is_none() || m.sender == u.sender))
+    });
 }
