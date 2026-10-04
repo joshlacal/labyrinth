@@ -273,6 +273,8 @@ A PIN vault (HSM or Juicebox) is out of scope for the first release.
 
 ## 7. Messages
 
+Code: `src/message.rs` (§7.1–7.2), `src/mek.rs` and `src/mek/distribute.rs` (§7.3–7.4).
+
 ### 7.1 Owner upload (v1.0 mode, cipher version 3; p.37–38)
 
 ```
@@ -281,6 +283,13 @@ encrypted  = encrypt(messageKey, "message_thread_" || threadId, pad(messageData)
 ```
 
 Stored record: `(threadId, messageId, timestamp, epochSequenceID, version = 3, encrypted)`.
+
+- We write only version 3. For completeness we also **decrypt** the other key derivations from the paper's implementation notes (p.51–52), all with the same AAD:
+  - version 0: `kdf(root, threadId, "message_key_in_epoch_" || seq)` (the salt is the thread id);
+  - version 2: `kdf(root, threadId, "message_key_in_epoch_" || seq || "cipher_version_2")` (no underscore before `cipher`, as printed);
+  - version 4: version 3 with `_cipher_version_4_thread_`.
+  - Version 1 and anything above 4 are rejected.
+- Only `threadId`, `epochSequenceID` and `version` are authenticated (they feed the key or the AAD). `messageId` and `timestamp` are not, exactly as in the paper: a backend can swap them between owner messages of the same thread and epoch. Sender mode (§7.2) binds both.
 
 ### 7.2 Sender upload (v1.1, p.38–39)
 
@@ -295,6 +304,10 @@ sig = Ed25519(transportKey, "minos.unstructured_signature.message:" || ct)     /
 signedEncMessage = sig(64) || ct
 ```
 
+- The key label is taken literally, so it reads `single_message_key:;message_id=…` (colon then semicolon). It does not include `mek_id`; the AAD does.
+- Stored record (`defs#sealedMessage`): `(messageId, timestamp, mekId, senderTransportPk, signedEncMessage)`. The thread id comes from the enclosing `batch` record.
+- Opening: check `mekId` equals the MEK's id, verify `sig` (strict Ed25519) under `senderTransportPk`, rebuild the AAD from the record fields and the batch's thread id, decrypt, unpad. The reader separately checks that `senderTransportPk` is one of the claimed sender's MLS chat devices (`verify_sender_device`).
+
 **[CB-15] (the hybrid storage choice).** The `signedEncMessage` bytes don't depend on the recipient. So we store each message **once per conversation**, in the sender's record set in the conversation's shared store, not once per recipient mailbox. Each recipient's mailbox holds only the MEK distributions. Readers check `sig` against the sender's chat device key, which they get from MLS.
 
 ### 7.3 MEK distribution (p.39–41)
@@ -305,12 +318,13 @@ mek   = random(32)
 mekId = kdf(mek, MINOS_SALT, "minos.kdf.mek.mek_id:recipient_roster_hash=" || hex(rosterHash), 12)
 ```
 
+- The paper's prose says to hex-encode and sort the heads, but its pseudocode concatenates `epochHeads[i]`. We concatenate the sorted lowercase **hex strings** (ASCII), not the raw bytes.
 - **Labyrinth sender MEK:**
 
 ```
 aad = "minos.hpke.mek_distribution_from_minos_v2:" || "mek_id=" || hex(mekId)
       || ";recipient_epoch=" || hex(recipHead) || ";recipient_roster_hash=" || hex(rosterHash)
-      || ";sender_epoch=" || hex(senderHead)
+      || ";sender_epoch=" || hex(senderHead) || ";thread_id=" || hex(threadId)        // [CB-24]
 ct  = hawk_encrypt(recip.encPub, sender.authPriv, sender.authPub, aad, mek)
 ```
 
@@ -322,25 +336,36 @@ sig = Ed25519(transportKey, "minos.structured_signature.mek_distribution.ephemer
               || "k=" || hex(ephPub) || ";mek_id=" || hex(mekId))
 aad = "minos.hpke.mek_distribution_from_transport_v2:" || "mek_id=" || hex(mekId)
       || ";recipient_epoch=" || hex(recipHead) || ";recipient_roster_hash=" || hex(rosterHash)
-      || ";sender_transport_pubkey=" || hex(transportPub)
+      || ";sender_transport_pubkey=" || hex(transportPub) || ";thread_id=" || hex(threadId)  // [CB-24]
 ct  = hawk_encrypt(recip.encPub, ephPriv, ephPub, aad, mek)
 ```
 
+- **[CB-24] Thread binding.** Both AADs end with `;thread_id=hex(threadId)`, which the paper's AADs lack. Without it a backend could move a MEK record into another thread unnoticed. The field keeps the AAD's alphabetical key order. This breaks byte compatibility with Messenger MEKs, which we don't claim anyway.
+- **Record** (`blue.catbird.labyrinth.mek`): `(threadId, mekId, rosterHash, sender, recipients[])`. `sender` is either `{did, senderEpochHead}` or `{transportPubkey, ephemeralAuthPubkey, sig}`. Each recipient is `{did, recipientEpochHead, ciphertext}`.
+- **Sender checks.** Every recipient `epochPublic` is verified (head, self signature, transport attestation; the caller checks the attesting key is that DID's MLS device, [CB-18]). DIDs and heads must be unique. `rosterHash(recipient heads)` must equal the MEK's roster hash. A Labyrinth sender's own `(did, head)` must be a recipient ([CB-16]), and its mailbox keys must match its epoch.
+- **Opening** a record, in order:
+  1. DIDs and heads in `recipients` are unique, and `rosterHash` recomputes from **all** recipient heads.
+  2. Find my entry by DID; its head must be the head of the epoch I open with, that epoch must verify, and my mailbox keys must match it.
+  3. Labyrinth sender: the sender's `epochPublic` must have the record's `senderEpochHead`, verify for the sender DID, and appear among the recipients. Transport sender: `sig` must verify under `transportPubkey`; the Hawk auth key is `ephemeralAuthPubkey`.
+  4. Rebuild the AAD from the record and `hawk_decrypt`; the plaintext must be 32 bytes.
+  5. Re-derive `mekId` from the secret and `rosterHash`; it must match.
+  - The opened MEK carries its *provenance*: the sender DID and epoch head, or the transport key. The caller still checks that key against the sender's MLS devices.
 - **[CB-21] Where MEKs live.** Under Spaces only the account owner can write its own repo. So the sender writes **one** `blue.catbird.labyrinth.mek` record per MEK into its own repo inside the conversation space, listing a ciphertext for every recipient. It does not write into each recipient's mailbox. Recipients read it with their conversation-space credential.
 - **[CB-22] Leaving a conversation.** After removal, Spaces no longer lets the user read the conversation space. Before that happens, the client re-archives the history it can read into its own mailbox as owner messages (§7.1). The mls-ds backend instead authorizes reads per MEK distribution, so no re-archive is needed there.
 - **The roster** is every Labyrinth-enrolled DID that is currently a member of the MLS group, the sender included **[CB-16]**.
   - Any roster change, such as an add, a remove, or a member opening a new epoch, invalidates the cached MEK.
   - That is what stops a removed member from reading anything new, and stops a new member from reading anything older than their join.
-- **Reuse rule (p.38–39).** A sender reuses a cached MEK only if both hold:
-  1. its roster hash matches the current heads;
-  2. it is authenticated to some participant's latest epoch keys.
+- **Reuse rule (p.38–39).** A sender reuses a cached MEK only if both hold (`Mek::reusable_for(currentHeads)`):
+  1. its roster hash equals `rosterHash(currentHeads)`, the caller's view of every roster member's latest head;
+  2. it is authenticated to some participant's latest epoch keys. A Labyrinth MEK is authenticated by the sender's epoch auth key, so rule 2 holds iff its `senderEpochHead` is in `currentHeads`. This applies equally to the device that distributed it and to a member who opened it.
+  - **[CB-23]** A transport MEK is authenticated by no epoch key. Only the device that minted it may reuse it (under rule 1); members who opened it never reuse it and mint their own Labyrinth MEK instead. A freshly generated, undistributed MEK is never reusable.
 
 ### 7.4 Loading (p.41)
 
 To read a message:
-1. Find the MEK by `mekId` in the reader's own mailbox, decrypting it under the mailbox encryption key of the epoch it was addressed to.
+1. Find the MEK by `mekId` in the conversation's MEK records ([CB-21]) and open it under the mailbox encryption key of the epoch it was addressed to (§7.3).
 2. Check the AAD fields against the record.
-3. Verify `sig`.
+3. Verify `sig` and that the sender key is one of the sender's MLS devices.
 4. Decrypt the message and remove the padding.
 
 ## 8. Attachments (p.41–43)
