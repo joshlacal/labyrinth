@@ -92,8 +92,10 @@ fn is_reduced_field(x: &[u8; 32]) -> bool {
 impl XSigningKey {
     pub fn generate() -> crate::Result<Self> {
         let mut b = [0u8; 32];
-        crate::encoding::random(&mut b)?;
-        Ok(Self(b))
+        let r = crate::encoding::random(&mut b);
+        let k = Self(b);
+        b.zeroize();
+        r.map(|()| k)
     }
     pub fn from_bytes(b: [u8; 32]) -> Self {
         Self(b)

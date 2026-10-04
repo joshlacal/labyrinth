@@ -90,7 +90,7 @@ pub fn seal_owner(
         timestamp,
         epoch_seq,
         version: OWNER_VERSION,
-        encrypted: aead::seal(&key, &owner_aad(thread_id), &pad(data))?,
+        encrypted: aead::seal(&key, &owner_aad(thread_id), &Zeroizing::new(pad(data)))?,
     })
 }
 
@@ -161,7 +161,8 @@ pub fn seal_sender(
     let sender_pk = transport.transport_public_key();
     let key = sender_message_key(mek, thread_id, message_id, timestamp);
     let aad = sender_aad(mek.id(), message_id, &sender_pk, thread_id, timestamp);
-    let ct = aead::seal(&key, &aad, &pad(data))?;
+    let padded = Zeroizing::new(pad(data));
+    let ct = aead::seal(&key, &aad, &padded)?;
     let sig = transport.sign_transport(&[MESSAGE_SIG_PREFIX, &ct].concat());
     Ok(SealedMessage {
         message_id: message_id.to_owned(),
