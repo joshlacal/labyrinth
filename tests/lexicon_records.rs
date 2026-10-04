@@ -52,7 +52,21 @@ fn check<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
 #[test]
 fn lexicons_are_well_formed() {
     let lex = lexicons();
-    assert_eq!(lex.docs().count(), 9);
+    // 9 record lexicons, `defs`, and 26 XRPC queries and procedures.
+    assert_eq!(lex.docs().count(), 36);
+    for (id, doc) in lex.docs() {
+        let main = &doc["defs"]["main"];
+        if let Some(t @ ("query" | "procedure")) = main["type"].as_str() {
+            assert!(
+                main["description"].as_str().is_some_and(|d| !d.is_empty()),
+                "{id}"
+            );
+            assert!(main["output"]["encoding"].is_string(), "{id} output");
+            if t == "procedure" {
+                assert_eq!(main["input"]["encoding"], json!("application/json"), "{id}");
+            }
+        }
+    }
     fn walk(v: &Value, cur: &str, ids: &[String]) {
         match v {
             Value::Object(o) => {

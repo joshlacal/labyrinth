@@ -1,7 +1,9 @@
-//! A small structural validator for atproto lexicon records: required
-//! fields, unknown fields, types, string/bytes/array length limits,
-//! integer bounds, refs and closed unions. It is not a full lexicon
-//! implementation; it covers the features our lexicons use.
+//! A small structural validator for atproto lexicon records and XRPC
+//! inputs, outputs, query parameters and error names: required fields,
+//! unknown fields, types, string/bytes/array length limits, integer
+//! bounds, refs, closed unions and `unknown` (validated as the record its
+//! `$type` names). It is not a full lexicon implementation; it covers the
+//! features our lexicons use.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,6 +30,7 @@ impl Lexicons {
         Self { docs }
     }
 
+    #[allow(dead_code)]
     pub fn docs(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.docs.iter()
     }
@@ -42,6 +45,77 @@ impl Lexicons {
             return Err(format!("$type must be {nsid}"));
         }
         self.object(nsid, &main["record"], v, "", true)
+    }
+
+    /// Validate `v` as the JSON input of procedure `nsid`.
+    #[allow(dead_code)]
+    pub fn validate_input(&self, nsid: &str, v: &Value) -> R {
+        let main = self.def(nsid, "main")?;
+        if main["type"] != "procedure" {
+            return Err(format!("{nsid} is not a procedure"));
+        }
+        self.object(nsid, &main["input"]["schema"], v, "input", false)
+    }
+
+    /// Validate `v` as the JSON output of query or procedure `nsid`.
+    #[allow(dead_code)]
+    pub fn validate_output(&self, nsid: &str, v: &Value) -> R {
+        let main = self.def(nsid, "main")?;
+        self.object(nsid, &main["output"]["schema"], v, "output", false)
+    }
+
+    /// Validate the query parameters of `nsid`.
+    #[allow(dead_code)]
+    pub fn validate_params(&self, nsid: &str, params: &[(&str, String)]) -> R {
+        let main = self.def(nsid, "main")?;
+        if main["type"] != "query" {
+            return Err(format!("{nsid} is not a query"));
+        }
+        let def = &main["parameters"];
+        for req in def["required"].as_array().into_iter().flatten() {
+            let k = req.as_str().unwrap();
+            if !params.iter().any(|(n, _)| *n == k) {
+                return Err(format!("params: missing required {k}"));
+            }
+        }
+        for (k, raw) in params {
+            let pdef = def["properties"]
+                .get(*k)
+                .ok_or(format!("params: unknown parameter {k}"))?;
+            let v = if pdef["type"] == "integer" {
+                Value::from(
+                    raw.parse::<i64>()
+                        .map_err(|_| format!("params.{k}: not an integer"))?,
+                )
+            } else {
+                Value::from(raw.as_str())
+            };
+            self.value(nsid, pdef, &v, &format!("params.{k}"))?;
+        }
+        Ok(())
+    }
+
+    /// Whether `name` is an error `nsid` may return: one it declares, or
+    /// one common to every Labyrinth endpoint.
+    #[allow(dead_code)]
+    pub fn declares_error(&self, nsid: &str, name: &str) -> bool {
+        const COMMON: &[&str] = &[
+            "NotAuthorized",
+            "AccountSessionExpired",
+            "DeviceRevoked",
+            "RateLimited",
+            "InvalidRequest",
+            "PayloadTooLarge",
+            "QuotaExceeded",
+        ];
+        COMMON.contains(&name)
+            || self.def(nsid, "main").is_ok_and(|m| {
+                m["errors"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|e| e["name"] == name)
+            })
     }
 
     fn def(&self, nsid: &str, name: &str) -> Result<&Value, String> {
@@ -149,6 +223,14 @@ impl Lexicons {
                 self.value(&n, target, v, path)
             }
             "object" => self.object(nsid, def, v, path, false),
+            "unknown" => {
+                let t = v
+                    .get("$type")
+                    .and_then(Value::as_str)
+                    .ok_or(format!("{path}: unknown value needs $type"))?;
+                self.validate_record(t, v)
+                    .map_err(|e| format!("{path}: {e}"))
+            }
             "union" => {
                 let t = v
                     .get("$type")
