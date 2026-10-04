@@ -21,6 +21,14 @@ pub enum Error {
     Conflict,
     #[error("not found: {0}")]
     NotFound(&'static str),
+    #[error("not a recipient of this MEK")]
+    NotRecipient,
+    #[error("MEK roster hash does not match its recipients")]
+    RosterMismatch,
+    #[error("epoch does not match the one the record names")]
+    WrongEpoch,
+    #[error("MEK id does not match the MEK")]
+    MekMismatch,
     #[error("randomness unavailable")]
     Rng,
 }

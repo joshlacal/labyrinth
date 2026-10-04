@@ -41,5 +41,12 @@ This log records choices where the Labyrinth whitepaper is silent, or where it's
 | CB-20 | batches of up to 256 messages per record | PDS rate limit, 1 MB cap, export ceiling | tune the size |
 | CB-21 | MEK distribution is one record in the sender's repo in the conversation Space | Space owner-only writes | — |
 | CB-22 | on leave, re-archive into one's own mailbox | Space removal also removes read access to the conversation's history | — |
-| CB-23 | the opener encrypts entropy to itself; an invalid continuing device aborts rotation instead of being dropped | self-recovery for the opener's other installs; a silent drop would be an unannounced revocation | drop the self-entry; skip invalid devices |
-| CB-24 | OTC payload is a fixed big-endian binary layout, not CBOR | avoids a CBOR dependency for one five-field struct | switch to CBOR (bump the format byte) |
+| CB-23 | a transport MEK is reusable only by the device that minted it | it is authenticated by no epoch key, so reuse rule 2 (p.38–39) never holds for its readers; the minting device is its authenticator | let readers reuse transport MEKs too |
+| CB-24 | both MEK distribution AADs end with `;thread_id=hex(threadId)` | the paper's AADs don't bind the thread, so a backend could move a MEK record between threads | drop the field (restores the paper's AAD bytes) |
+| CB-25 | the opener encrypts entropy to itself; an invalid continuing device aborts rotation instead of being dropped | self-recovery for the opener's other installs; a silent drop would be an unannounced revocation | drop the self-entry; skip invalid devices |
+| CB-26 | OTC payload is a fixed big-endian binary layout, not CBOR | avoids a CBOR dependency for one five-field struct | switch to CBOR (bump the format byte) |
+
+## 2026-10-04 · labyrinth · MEK and message layer
+Chose: bind the thread id into MEK AADs ([CB-24]) and restrict transport-MEK reuse to its minting device ([CB-23]) (provisional). Because: a MEK record's `threadId` was otherwise unauthenticated, and the reuse rule's "authenticated to the latest epoch keys" has no epoch to point at for a transport MEK. Rejected: paper-exact AAD plus an equality check against the caller's thread (a backend could still rewrite both consistently); letting any reader reuse a transport MEK (rule 2 would be vacuous).
+Owner-mode records still leave `messageId` and `timestamp` unauthenticated, as in the paper (SPEC §7.1).
+Reversible until: merge of `labyrinth-1.1`. Override by: deleting the `;thread_id=` suffix in `src/mek/distribute.rs::aad`, and changing `Mek::reusable_for`.
