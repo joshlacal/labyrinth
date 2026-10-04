@@ -29,10 +29,10 @@ The whitepapers leave many choices open and are written around Facebook identiti
 | `src/recovery_code.rs`, `src/virtual_device/`, `src/otc.rs` | Recovery codes with typo correction, recovery bundles, passkey wrap, CPace one-time codes |
 | `src/mek/`, `src/message.rs` | MEK distribution and opening; owner-mode and sender-mode message encryption |
 | `src/records/` | atproto record types for every lexicon, with lossless conversions to the protocol structs |
-| `src/store/` | Synchronous storage traits (`MailboxStore`, `ThreadStore`, `MailboxDirectory`) and an in-memory backend |
-| `src/client/` | `Labyrinth`: the high-level client a chat app calls (initialize, sync, revoke, recover, enroll, archive, load, export and restore its state) |
-| `lexicons/blue/catbird/labyrinth/` | Draft `blue.catbird.labyrinth.*` lexicons |
-| `docs/SPEC.md`, `docs/DECISIONS.md` | The protocol profile and the decision log |
+| `src/store/` | Synchronous storage traits (`MailboxStore`, `ThreadStore`, `MailboxDirectory`, `KeyPublisher`, `OrfServer`), the chat-key vouching rule, an in-memory backend, and (feature `xrpc`) stores over the mls-ds `blue.catbird.labyrinth.*` endpoints with a memory-backed reference server |
+| `src/client/` | `Labyrinth`: the high-level client a chat app calls (initialize, sync, revoke, recover, enroll, archive, load, export and restore its state), and `CompositeDirectory`, which cross-checks the PDS and mls-ds epoch heads |
+| `lexicons/blue/catbird/labyrinth/` | Draft `blue.catbird.labyrinth.*` record lexicons and the mls-ds XRPC queries and procedures |
+| `docs/SPEC.md`, `docs/DECISIONS.md`, `docs/MLSDS_BACKEND.md` | The protocol profile, the decision log, and the mls-ds backend design |
 
 The protocol layers do no I/O. The client talks to storage only through the `store` traits, which are synchronous so the crate needs no async runtime.
 
@@ -64,24 +64,25 @@ let history = alice.load_thread("conv-1", TimeRange::ALL)?;
 ## Running the tests
 
 ```bash
-cargo test --release      # release mode keeps the ML-KEM and recovery-code tests fast
-cargo clippy --all-targets -- -D warnings
+cargo test --release                  # release mode keeps the ML-KEM and recovery-code tests fast
+cargo test --release --all-features   # adds the xrpc stores and their e2e run
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-answer vectors for HPKE, ORF and recovery codes, a lexicon validator that checks every emitted record against `lexicons/`, and an end-to-end lifecycle on the memory backend: multi-device accounts, revocation, recovery from a typo'd code, members leaving and joining, and malicious-backend checks. `tests/review_regressions.rs` pins the fixes from the 2026-10-04 security review (revocation, epoch pinning, messageId collisions, state persistence, removed chat keys).
+The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-answer vectors for HPKE, ORF and recovery codes, a lexicon validator that checks every emitted record against `lexicons/`, and an end-to-end lifecycle on the memory backend: multi-device accounts, revocation, recovery from a typo'd code, members leaving and joining, and malicious-backend checks. `tests/review_regressions.rs` pins the fixes from the 2026-10-04 security review (revocation, epoch pinning, messageId collisions, state persistence, removed chat keys, with and without server order). `tests/directory_and_orf.rs` covers the PDS × mls-ds directory cross-check and the client's ORF calls; `tests/e2e_xrpc.rs` runs the lifecycle over the XRPC stores with every call validated against the lexicons.
 
 ## Security caveats and limitations
 
 - **Unaudited draft.** The profile choices ([CB-n]) are provisional until the `labyrinth-1.1` bookmark merges and atproto Spaces reach GA.
 - **Limitations kept from the paper** (SPEC §10): a backend that controls both the mailbox and the directory can hide newer epochs; membership can be enumerated; entropy distribution between devices stays classical X25519, so post-quantum protection is partial.
-- **Epoch truncation** is detected only when the `MailboxDirectory` (public `mailboxKeys`, later the mls-ds roster view) is independent of the mailbox store ([CB-28]).
+- **Epoch truncation** is detected only when the `MailboxDirectory` is independent of the mailbox store ([CB-28]). `CompositeDirectory` cross-checks the PDS and mls-ds, so truncation needs the mailbox host and the other directory to collude.
 - **Public enrollment signal.** Publishing `mailboxKeys` in the public repo reveals that an account uses Labyrinth and when it rotates epochs ([CB-19]).
 - **Owner-mode records** (v1.0 compatibility and re-archive on leave) authenticate the thread and epoch but not `messageId` or `timestamp`, as in the paper, and carry no sender DID.
-- **History reads trust removed devices, up to their removal.** Messages and MEKs signed by a chat device that has since been removed still verify if they are timestamped before its removal ([CB-27]). Timestamps are the sender's claim, so a removed (e.g. stolen) device can backdate; server-side ordering in mls-ds is the planned fix. Addressing a new MEK requires a current device.
-- **First contact is trust-on-first-use.** Senders pin each peer's newest epoch and refuse rollbacks afterwards ([CB-29]), but the first epoch a sender sees for a DID is accepted if a current chat device attested it. Carrying latest heads in MLS-authenticated group state is the long-term fix.
+- **History reads trust removed devices, up to their removal.** Messages and MEKs signed by a chat device that has since been removed still verify if they were written before its removal ([CB-27]). With mls-ds that is decided by the server's stamp (receive time and conversation sequence), so a removed device cannot backdate; records in a Space carry no stamp, so there the sender's timestamp decides and a removed device can backdate. Addressing a new MEK requires a current device.
+- **First contact.** Senders pin each peer's newest epoch and refuse rollbacks afterwards ([CB-29]). With `CompositeDirectory` the first epoch must also agree between the peer's PDS and mls-ds; with a single directory it is trust-on-first-use. Carrying latest heads in MLS-authenticated group state is the long-term fix.
 - **Client state is secret.** `Labyrinth::export_state()` returns the device's private keys, epoch roots, MEKs, revoked set and pins ([CB-30]). Store it only in the platform keychain or SQLCipher; flush pending batches first, since they are not included.
-- **Not yet provided:** the atproto Space and mls-ds store implementations, the ORF server role and attachment references (SPEC §8), and a UniFFI surface.
+- **Not yet provided:** the atproto Space store, the mls-ds server side of the Labyrinth endpoints (the client stores exist behind the `xrpc` feature), client wrappers for attachment references (SPEC §8), and a UniFFI surface.
 
 ## References
 
