@@ -202,12 +202,17 @@ encEntropy[d] = labyrinth_hpke(d.epochStorageKeyPub, self.authPub, self.authPriv
   - The paper says "any four columns" of the 4×38 matrix `G` are invertible. **That can't hold at length 38.** Such columns would form an arc in PG(3,32), and the largest arc there has q+1 = 33 points (Segre).
   - What the paper actually promises is correcting **three** errors. That needs only any **three** columns to be independent, i.e. columns that form a cap with no three points collinear.
   - Construction: we take the columns from the elliptic quadric `x₁ = a² + ab + c·b²` in PG(3,32):
-    - column j = `(1, a²+ab+c·b², a, b)`;
-    - `(a, b)` runs over the first 38 pairs in lexicographic order, skipping `(0,0)`;
-    - `c` is the smallest field element that makes `X²+X+c` irreducible.
+    - `c` is the smallest field element that makes `X²+X+c` irreducible. That is `c = 1`.
+    - Let `ω` be a root of `X²+X+1`, so GF(1024) = GF(32)[ω] and `ω² = ω + 1`. Then `a² + ab + b²` is the norm of `a + bω`.
+    - Let `γ = 6 + ω`, where `6` is the field element x²+x. It is the primitive element `t + ω` of GF(1024) with the smallest `t` (as an integer).
+    - For j = 0..37, write `γʲ = a_j + b_j·ω`. Column j is `(1, a_j² + a_j·b_j + b_j², a_j, b_j)`.
+    - Why not take `(a, b)` in lexicographic order? Every point with the same `a` lies on the plane `x₂ = a·x₀`. So the first 38 pairs make the four ECC columns (34..37) coplanar, and encoding would have no unique solution. Powers of `γ` spread the points out. ECC columns 34..37 are independent, and only 2,091 of the C(38,4) four-column sets are singular, against 31,770 for lexicographic order.
+    - The matrix is hard-coded in `src/recovery_code.rs`, and a unit test regenerates it from this rule.
   - `tests/` checks all C(38,3) triples exhaustively.
   - Encoding solves `G·(entropy||ecc) = 0` for the 4 ECC symbols (columns 34..37, which tests also check are independent).
   - Decoding brute-forces up to 3 erasures, solves the overdetermined system, and accepts a candidate only if it is consistent and the derived `vdeviceId` exists on the backend.
+    - A typo'd code yields a few hundred triple-erasure candidates, because each 3-erasure set passes the single redundant equation with probability about 1/32.
+    - A character outside the alphabet (after the homoglyph mapping) counts as a known erasure.
 - Derivation:
 
 ```
@@ -251,8 +256,11 @@ A PIN vault (HSM or Juicebox) is out of scope for the first release.
 ### 6.5 One-time code (p.44–45)
 
 - **CPace** runs over Ristretto255 / SHA-512, using the 6-digit code as the password **[CB-14]**:
+  - we follow draft-irtf-cfrg-cpace-21, and `tests/vectors/cpace_ristretto255.json` holds its Appendix B.3 vectors;
+  - PRS = the 6 ASCII digits;
   - session id = 16 random bytes from the requesting device;
-  - CI = `"catbird.labyrinth.otc.v1" || did`.
+  - CI = `"catbird.labyrinth.otc.v1" || did`;
+  - the requesting (new) device is the initiator, and the ISK uses `transcript_ir`. ADa and ADb are optional caller data.
 - `otc_secret` is the CPace ISK.
 - The payload is `{tempOrfClientState, mailboxRootSalt, epochRootKey, epochID, epochSequenceID}`, CBOR-encoded and sealed with `encrypt(kdf(ISK, MINOS_SALT, "catbird.labyrinth.otc.payload"), "otc_payload", …)`.
 - A code allows 3 attempts.
