@@ -1,0 +1,98 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.virtualDevice",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A recovery bundle (SPEC \u00a76.2). rkey = hex(vdeviceId). Every secret field is AEAD-sealed under vdeviceDecryptionKey with the paper's AAD strings.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "deviceKeyPubkey",
+          "epochStorageKeyPubkey",
+          "epochStorageKeySig",
+          "encryptedDeviceKeyPriv",
+          "encryptedEpochStorageKeyPriv",
+          "encryptedOrfClientState",
+          "encryptedMailboxRootSalt",
+          "encryptedEpochRootKey",
+          "encryptedEpochNumber",
+          "createdAt"
+        ],
+        "properties": {
+          "encryptedDeviceKeyPriv": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 256
+          },
+          "encryptedEpochStorageKeyPriv": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 256
+          },
+          "encryptedOrfClientState": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 256
+          },
+          "encryptedMailboxRootSalt": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 256
+          },
+          "encryptedEpochRootKey": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 256
+          },
+          "encryptedEpochNumber": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 256
+          },
+          "deviceKeyPubkey": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 32
+          },
+          "epochStorageKeyPubkey": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 32
+          },
+          "epochStorageKeySig": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 64
+          },
+          "mechanism": {
+            "type": "string",
+            "description": "Recovery mechanism this bundle backs.",
+            "knownValues": [
+              "code",
+              "passkey",
+              "keychain",
+              "otc"
+            ]
+          },
+          "passkeyWrappedCode": {
+            "type": "bytes",
+            "description": "[CB-13] Recovery code sealed under a WebAuthn PRF-derived key.",
+            "maxLength": 256
+          },
+          "passkeyCredentialId": {
+            "type": "bytes",
+            "description": "WebAuthn credential id for the PRF wrap.",
+            "maxLength": 1024
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

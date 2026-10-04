@@ -165,6 +165,12 @@ prev_sig = XEdDSA(prevSigPriv, "minos.unstructured_signature.epoch_prev:" || epo
 
 - **[CB-10]** `epochHead` is the raw 32-byte digest. In the `+` concatenation above it is used as raw bytes.
 - A mailbox created by this crate always has a head from epoch 0 on. We have no v1.0 mailboxes to upgrade.
+- **[CB-18] Transport attestation.** The device that opens an epoch also signs the head with its chat transport key (Ed25519):
+  - `attestation = Ed25519(transportKey, "catbird.labyrinth.epoch_head_attest:" || did || ":" || epochHead)`.
+  - A sender accepts a recipient's head only if the attesting key belongs to one of that DID's devices in the MLS group.
+  - This anchors the head chain to MLS identity, so neither a storage backend nor mls-ds can substitute mailbox keys.
+- **[CB-19] Discovery.** The latest `epochPublic` is published as `blue.catbird.labyrinth.mailboxKeys/self` in the account's **public** repo, so any PDS works.
+  - Cost: it shows publicly that the account uses Labyrinth, and when it rotates epochs.
 
 ### 5.4 Epoch metadata and membership (p.28–29)
 
@@ -312,6 +318,8 @@ aad = "minos.hpke.mek_distribution_from_transport_v2:" || "mek_id=" || hex(mekId
 ct  = hawk_encrypt(recip.encPub, ephPriv, ephPub, aad, mek)
 ```
 
+- **[CB-21] Where MEKs live.** Under Spaces only the account owner can write its own repo. So the sender writes **one** `blue.catbird.labyrinth.mek` record per MEK into its own repo inside the conversation space, listing a ciphertext for every recipient. It does not write into each recipient's mailbox. Recipients read it with their conversation-space credential.
+- **[CB-22] Leaving a conversation.** After removal, Spaces no longer lets the user read the conversation space. Before that happens, the client re-archives the history it can read into its own mailbox as owner messages (§7.1). The mls-ds backend instead authorizes reads per MEK distribution, so no re-archive is needed there.
 - **The roster** is every Labyrinth-enrolled DID that is currently a member of the MLS group, the sender included **[CB-16]**.
   - Any roster change, such as an add, a remove, or a member opening a new epoch, invalidates the cached MEK.
   - That is what stops a removed member from reading anything new, and stops a new member from reading anything older than their join.
@@ -340,9 +348,11 @@ The protocol core does no I/O. It defines `MetaStore` (devices, epochs, virtual 
 
 | Backend | Where | Writes | Reads | CAS |
 |---|---|---|---|---|
-| **atproto Space** | Mailbox: a personal Space on the user's PDS, `spaceType = blue.catbird.labyrinth.mailbox`, authority = the user's DID. Sender records: a conversation Space whose authority is mls-ds's service DID; each sender writes into their own repo | OAuth `com.atproto.space.applyWrites` | the owner uses `read_self`; other members use space credentials | `swapRecord` on `blue.catbird.labyrinth.head/self` |
+| **atproto Space** | Mailbox: a personal Space on the user's PDS, `spaceType = blue.catbird.labyrinth.mailbox`, authority = the user's DID. Sender records: a conversation Space whose authority is mls-ds's service DID; each sender writes into their own repo | OAuth `com.atproto.space.applyWrites` | the owner uses `read_self`; other members use space credentials | Space writes have no `swapRecord`. Instead, `#create` on an existing rkey fails with `RecordAlreadyExists` (reference `actor-store/space/transactor.ts:202`), and epoch rkeys are the zero-padded sequence number, so a create-if-absent on rkey acts as the guard |
 | **mls-ds** | `blue.catbird.labyrinth.*` XRPC procedures on the delivery service | DPoP-authenticated chat device | same | row version |
 | **memory** | tests | – | – | – |
+
+**[CB-20] Batching.** Messages are batched, up to 256 per `batch`/`ownerBatch` record. This keeps us within the reference PDS's per-account write budget (about 1.7k creates/hour), the 1 MB write cap, and the current ~60k-record export ceiling.
 
 The record lexicons are in `lexicons/blue/catbird/labyrinth/`. They are drafts until the Spaces GA in mid-November 2026.
 

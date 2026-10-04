@@ -1,0 +1,104 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.mek",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A Message Encryption Key distribution (SPEC \u00a77.3), written by the sender into its own repo inside the conversation space ([CB-15], [CB-21]). rkey = hex(mekId). One record carries the MEK for every roster member.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "threadId",
+          "mekId",
+          "rosterHash",
+          "sender",
+          "recipients",
+          "createdAt"
+        ],
+        "properties": {
+          "threadId": {
+            "type": "string",
+            "description": "Conversation id.",
+            "maxLength": 256
+          },
+          "mekId": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 12
+          },
+          "rosterHash": {
+            "type": "bytes",
+            "description": "",
+            "maxLength": 32
+          },
+          "sender": {
+            "type": "union",
+            "refs": [
+              "#labyrinthSender",
+              "#transportSender"
+            ],
+            "closed": true
+          },
+          "recipients": {
+            "type": "array",
+            "maxLength": 700,
+            "items": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.defs#mekRecipient"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "",
+            "format": "datetime"
+          }
+        }
+      }
+    },
+    "labyrinthSender": {
+      "type": "object",
+      "required": [
+        "did",
+        "senderEpochHead"
+      ],
+      "properties": {
+        "did": {
+          "type": "string",
+          "description": "",
+          "format": "did"
+        },
+        "senderEpochHead": {
+          "type": "bytes",
+          "description": "",
+          "maxLength": 32
+        }
+      }
+    },
+    "transportSender": {
+      "type": "object",
+      "required": [
+        "transportPubkey",
+        "ephemeralAuthPubkey",
+        "sig"
+      ],
+      "properties": {
+        "transportPubkey": {
+          "type": "bytes",
+          "description": "",
+          "maxLength": 32
+        },
+        "ephemeralAuthPubkey": {
+          "type": "bytes",
+          "description": "",
+          "maxLength": 32
+        },
+        "sig": {
+          "type": "bytes",
+          "description": "Ed25519 over 'minos.structured_signature.mek_distribution.ephemeral_auth:k=<hex>;mek_id=<hex>'.",
+          "maxLength": 64
+        }
+      }
+    }
+  }
+}

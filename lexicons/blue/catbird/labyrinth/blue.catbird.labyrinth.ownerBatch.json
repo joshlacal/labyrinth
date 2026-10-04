@@ -1,0 +1,33 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.ownerBatch",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Owner-encrypted (v1.0 mode) messages, batched to respect repo rate limits ([CB-20]). Personal mailbox space. rkey = TID.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": [
+          "items",
+          "createdAt"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxLength": 256,
+            "items": {
+              "type": "ref",
+              "ref": "blue.catbird.labyrinth.defs#ownerMessage"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

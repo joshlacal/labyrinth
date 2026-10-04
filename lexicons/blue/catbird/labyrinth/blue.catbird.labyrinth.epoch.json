@@ -1,0 +1,44 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.epoch",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "One mailbox epoch (SPEC \u00a75). rkey = epochNumber zero-padded to 12 digits; creating an existing rkey fails with RecordAlreadyExists, which is the race guard between devices ([CB-9]). Immutable once written.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "public",
+          "createdAt"
+        ],
+        "properties": {
+          "public": {
+            "type": "ref",
+            "ref": "blue.catbird.labyrinth.defs#epochPublic"
+          },
+          "encryptedPreviousEpochNumber": {
+            "type": "bytes",
+            "description": "encrypt(epochDataStorageKey, 'epoch_data_metadata', decimal(prev seq)).",
+            "maxLength": 128
+          },
+          "encryptedPreviousEpochRootKey": {
+            "type": "bytes",
+            "description": "encrypt(epochDataStorageKey, 'epoch_data_metadata', prev root).",
+            "maxLength": 128
+          },
+          "openedBy": {
+            "type": "bytes",
+            "description": "deviceKeyPubkey of the device that opened the epoch (its epochStorageAuthKey authenticates the entropy).",
+            "maxLength": 32
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

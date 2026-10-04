@@ -1,0 +1,37 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.mailboxKeys",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Published in the account's PUBLIC repo so any sender can address MEKs to the account's latest Labyrinth epoch ([CB-19]). Works on every PDS, with or without Spaces.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "required": [
+          "current",
+          "updatedAt"
+        ],
+        "properties": {
+          "current": {
+            "type": "ref",
+            "ref": "blue.catbird.labyrinth.defs#epochPublic"
+          },
+          "backend": {
+            "type": "string",
+            "description": "Where the mailbox lives.",
+            "knownValues": [
+              "space",
+              "mlsDs"
+            ]
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

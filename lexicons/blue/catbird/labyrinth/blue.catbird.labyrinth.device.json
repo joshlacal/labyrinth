@@ -1,0 +1,61 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.device",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A device enrolled in the mailbox (SPEC \u00a74). Personal mailbox space.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "deviceKeyPubkey",
+          "epochStorageKeyPubkey",
+          "epochStorageKeySig",
+          "createdAt"
+        ],
+        "properties": {
+          "deviceKeyPubkey": {
+            "type": "bytes",
+            "description": "XEdDSA device key (X25519 form).",
+            "maxLength": 32
+          },
+          "epochStorageKeyPubkey": {
+            "type": "bytes",
+            "description": "Labyrinth HPKE encryption key.",
+            "maxLength": 32
+          },
+          "epochStorageKeySig": {
+            "type": "bytes",
+            "description": "pk_sign(deviceKey, 0x30, epochStorageKeyPubkey).",
+            "maxLength": 64
+          },
+          "epochStorageAuthKeyPubkey": {
+            "type": "bytes",
+            "description": "Labyrinth HPKE auth key; absent for virtual devices.",
+            "maxLength": 32
+          },
+          "epochStorageAuthKeySig": {
+            "type": "bytes",
+            "description": "pk_sign(deviceKey, 0x31, epochStorageAuthKeyPubkey).",
+            "maxLength": 64
+          },
+          "virtual": {
+            "type": "boolean",
+            "description": "True for a recovery (virtual) device."
+          },
+          "revokedAt": {
+            "type": "string",
+            "description": "Set when the device is revoked; a new epoch excludes it.",
+            "format": "datetime"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}
