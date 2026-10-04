@@ -1,6 +1,8 @@
 //! Mailbox lifecycle: genesis, forward/backward chaining, revocation and
 //! the epoch-integrity check (SPEC §5, §10).
 
+use std::collections::BTreeSet;
+
 use super::{Backends, Labyrinth};
 use crate::device::{DevicePublic, DeviceSecrets};
 use crate::encoding::random;
@@ -19,6 +21,11 @@ use crate::{Error, Result};
 pub struct SyncReport {
     pub from: u64,
     pub to: u64,
+    /// Devices this client revoked that are nevertheless members of the
+    /// epoch it reached (a sibling re-admitted them, or a revocation's
+    /// rotation never completed). Call [`Labyrinth::revoke_device`] again
+    /// for each.
+    pub readmitted: Vec<XVerifyingKey>,
 }
 
 /// Result of [`Labyrinth::revoke_device`].
@@ -179,9 +186,24 @@ impl Labyrinth {
             self.epochs.insert(e.seq, e);
         }
         self.check_epoch_integrity()?;
+        let readmitted = if self.revoked.is_empty() {
+            Vec::new()
+        } else {
+            self.b
+                .mailbox
+                .list_epoch_members(self.latest)?
+                .iter()
+                .map(EpochMember::to_record)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .map(|m| m.device_key_pub)
+                .filter(|k| self.revoked.contains(&k.0))
+                .collect()
+        };
         Ok(SyncReport {
             from,
             to: self.latest,
+            readmitted,
         })
     }
 
@@ -200,15 +222,22 @@ impl Labyrinth {
         if let Some(e) = self.epochs.get(&seq) {
             return Ok(e.clone());
         }
+        let next = seq
+            .checked_add(1)
+            .ok_or(Error::Malformed("epoch sequence overflow"))?;
         let mut cur = self
             .epochs
-            .range(seq + 1..)
+            .range(next..)
             .next()
             .map(|(_, e)| e.clone())
             .ok_or(Error::NotFound("epoch"))?;
         while cur.seq > seq {
             let (_, record) = self.epoch_record(cur.seq)?;
-            let (prev_id, prev_record) = self.epoch_record(cur.seq - 1)?;
+            let prev_seq = cur
+                .seq
+                .checked_sub(1)
+                .ok_or(Error::Malformed("epoch 0 has no predecessor"))?;
+            let (prev_id, prev_record) = self.epoch_record(prev_seq)?;
             let prev = backward_chain(&cur, &record, &prev_id)?;
             verify_public(&prev, &prev_record.public)?;
             self.epochs.insert(prev.seq, prev.clone());
@@ -217,17 +246,26 @@ impl Labyrinth {
         Ok(cur)
     }
 
-    /// Revoke a device: mark it revoked, then open a new epoch that carries
+    /// Revoke a device: record it in this client's local revoked set,
+    /// mark it revoked in the store, then open a new epoch that carries
     /// over every other unrevoked member ([CB-11], [CB-25]) and publish its
     /// keys. Retries if a sibling device opens the same epoch first.
+    ///
+    /// The exclusion comes from the local revoked set, not from the
+    /// store's `revokedAt` (which a malicious or buggy store can drop), and
+    /// every later rotation by this client excludes the whole set. Success
+    /// is reported only after checking that the new epoch neither lists
+    /// the target as a member nor encrypts entropy to it.
     pub fn revoke_device(&mut self, target: &XVerifyingKey) -> Result<RotationReport> {
         if *target == self.device.public().device_key_pub {
             return Err(Error::Malformed("a device cannot revoke itself"));
         }
+        self.revoked.insert(target.0);
         self.sync_epochs()?;
         self.b.mailbox.set_device_revoked(target, &self.now())?;
         for _ in 0..ROTATE_ATTEMPTS {
-            match self.rotate() {
+            let exclude = self.revoked.clone();
+            match self.rotate(&exclude) {
                 Err(Error::Conflict) => {
                     self.sync_epochs()?;
                 }
@@ -243,9 +281,18 @@ impl Labyrinth {
         Err(Error::Conflict)
     }
 
-    /// Open the epoch after `self.latest`, carrying over every unrevoked
-    /// device with a valid MAC in it.
-    fn rotate(&mut self) -> Result<u64> {
+    /// Devices this client has revoked. Part of the persisted client state
+    /// ([`Labyrinth::export_state`]).
+    pub fn revoked_devices(&self) -> impl Iterator<Item = XVerifyingKey> + '_ {
+        self.revoked.iter().map(|k| XVerifyingKey(*k))
+    }
+
+    /// Open the epoch after `self.latest`, carrying over every member of
+    /// the previous epoch except this device (the opener is added by
+    /// [`open_next`]), the devices in `exclude`, and devices the store
+    /// reports as revoked. A carried-over device whose MAC fails aborts the
+    /// rotation ([CB-25]).
+    fn rotate(&mut self, exclude: &BTreeSet<[u8; 32]>) -> Result<u64> {
         let prev = self.epoch_secret(self.latest)?;
         let mb = self.b.mailbox.as_ref();
         let (_, prev_record) = epoch_record(mb, prev.seq)?;
@@ -257,15 +304,18 @@ impl Labyrinth {
         let me = self.device.public().device_key_pub;
         let mut continuing = Vec::new();
         for m in &prev_members {
-            if m.device_key_pub == me || verify_member(&prev, m).is_err() {
+            if m.device_key_pub == me || exclude.contains(&m.device_key_pub.0) {
                 continue;
             }
             let rec = mb
                 .get_device(&m.device_key_pub)?
                 .ok_or(Error::NotFound("device"))?;
-            if rec.revoked_at.is_none() {
-                continuing.push(rec.to_public()?);
+            if rec.revoked_at.is_some() {
+                continue;
             }
+            verify_member(&prev, m)
+                .map_err(|_| Error::Malformed("continuing device has an invalid epoch MAC"))?;
+            continuing.push(rec.to_public()?);
         }
         let (pending, new) = open_next(
             &self.did,
@@ -276,6 +326,13 @@ impl Labyrinth {
             &self.device,
             self.transport.as_ref(),
         )?;
+        if new
+            .members
+            .iter()
+            .any(|m| exclude.contains(&m.device_key_pub.0))
+        {
+            return Err(Error::Malformed("rotation would re-admit a revoked device"));
+        }
         let now = self.now();
         let members: Vec<_> = new
             .members

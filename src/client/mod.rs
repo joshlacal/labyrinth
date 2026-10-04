@@ -26,7 +26,7 @@ pub mod epochs;
 pub mod read;
 pub mod send;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
 pub use epochs::{RotationReport, SyncReport};
@@ -83,6 +83,9 @@ pub struct Labyrinth {
     latest: u64,
     /// My epoch heads → sequence numbers (filled lazily from the store).
     heads: HashMap<[u8; 32], u64>,
+    /// `deviceKeyPub`s this client revoked; every rotation excludes them,
+    /// whatever the store says about `revokedAt`.
+    revoked: BTreeSet<[u8; 32]>,
     /// MEKs minted or opened here, per thread, newest last.
     meks: HashMap<String, Vec<Mek>>,
     outbox: BTreeMap<String, Vec<SealedMessage>>,
@@ -121,6 +124,7 @@ impl Labyrinth {
             epochs,
             latest,
             heads: HashMap::new(),
+            revoked: BTreeSet::new(),
             meks: HashMap::new(),
             outbox: BTreeMap::new(),
             owner_outbox: BTreeMap::new(),
