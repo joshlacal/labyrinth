@@ -10,6 +10,7 @@ pub mod encoding;
 pub mod epoch;
 pub mod error;
 pub mod hpke;
+pub mod mailbox;
 pub mod mek;
 pub mod message;
 pub mod orf;
