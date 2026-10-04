@@ -154,7 +154,8 @@ pub trait MailboxDirectory {
     fn device_transport_keys(&self, did: &str) -> Result<Vec<[u8; 32]>>;
     /// Every chat transport key the DID has registered, including removed
     /// devices. Used when reading history, whose MEKs and messages may be
-    /// signed by devices that have since left. Defaults to the current set.
+    /// signed by devices that have since left ([CB-27]). Defaults to the
+    /// current set.
     fn historical_transport_keys(&self, did: &str) -> Result<Vec<[u8; 32]>> {
         self.device_transport_keys(did)
     }

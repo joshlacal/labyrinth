@@ -5,6 +5,7 @@
 //! records; [`store`] defines where those records live.
 
 pub mod aead;
+pub mod client;
 pub mod device;
 pub mod encoding;
 pub mod epoch;

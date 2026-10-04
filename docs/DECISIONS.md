@@ -45,6 +45,8 @@ This log records choices where the Labyrinth whitepaper is silent, or where it's
 | CB-24 | both MEK distribution AADs end with `;thread_id=hex(threadId)` | the paper's AADs don't bind the thread, so a backend could move a MEK record between threads | drop the field (restores the paper's AAD bytes) |
 | CB-25 | the opener encrypts entropy to itself; an invalid continuing device aborts rotation instead of being dropped | self-recovery for the opener's other installs; a silent drop would be an unannounced revocation | drop the self-entry; skip invalid devices |
 | CB-26 | OTC payload is a fixed big-endian binary layout, not CBOR | avoids a CBOR dependency for one five-field struct | switch to CBOR (bump the format byte) |
+| CB-27 | history reads accept MEK attestations and message signatures from any chat key the DID ever registered; addressing a MEK requires a *current* chat device | a revoked or lost device signed real history; only new MEKs need a live device | require current devices for reads too (old history becomes unreadable after device loss) |
+| CB-28 | epoch-integrity check: a device compares the newest epoch it reached with the directory's published latest epoch and fails with `EpochTruncated` if the directory is ahead | the SPEC §10 mitigation; the directory (public `mailboxKeys` / mls-ds roster view) is independent of the mailbox store | drop the check (truncation becomes silent) |
 
 ## 2026-10-04 · labyrinth · MEK and message layer
 Chose: bind the thread id into MEK AADs ([CB-24]) and restrict transport-MEK reuse to its minting device ([CB-23]) (provisional). Because: a MEK record's `threadId` was otherwise unauthenticated, and the reuse rule's "authenticated to the latest epoch keys" has no epoch to point at for a transport MEK. Rejected: paper-exact AAD plus an equality check against the caller's thread (a backend could still rewrite both consistently); letting any reader reuse a transport MEK (rule 2 would be vacuous).
@@ -63,3 +65,13 @@ Reversible until: merge of `labyrinth-1.1` / Spaces GA. Override by: editing `le
 
 ## 2026-10-04 · labyrinth · Storage traits are synchronous
 Chose (provisional): `store::{MailboxStore, ThreadStore, MailboxDirectory}` are plain synchronous traits returning `Result`; a store handle is bound to one authenticated DID; epochs are created atomically with their initial members (`create_epoch(epoch, members)`, one `applyWrites`). Because: the crate stays runtime-free, and a crash between "epoch created" and "members written" would otherwise brick the mailbox. Rejected: `async fn` in traits (forces a runtime choice on UniFFI/WASM consumers and is not object-safe without boxing). Reversible until: merge of `labyrinth-1.1`. Override by: adding async twins of the traits; the client logic is unchanged.
+
+## 2026-10-04 · labyrinth · High-level client (`src/client`)
+Chose (provisional):
+- Revocation marks the device `revokedAt` *before* rotating, and every rotation carries over all unrevoked devices with a valid MAC (virtual devices included), so a crash mid-revoke still excludes the device next time. On `Conflict` (a sibling opened the same epoch first) the client syncs and retries, up to 3 times.
+- History reads use the directory's *historical* chat keys ([CB-27]); the [CB-18] check for addressing uses *current* keys. A MEK record whose Labyrinth sender DID differs from the repo it was read from is rejected.
+- `initialize` creates epoch 0 before the device record (the epoch create is the race guard); restore and OTC enrollment run the [CB-28] integrity check before writing anything.
+- A conversation space that refuses reads (`Forbidden`) degrades `load_thread` to the owner archive (`space_readable = false`). Owner records carry no sender DID, so re-archived messages lose sender attribution unless the frame carries it.
+- The client does not persist device secrets or the epoch cache; that is left to the embedding app (deferred).
+Because: these are the behaviours `tests/e2e_memory.rs` pins. Rejected: rotating before marking revoked (a crash leaves the lost device in the next epoch); a single "current keys" set for reads (losing a phone would make its history unreadable).
+Reversible until: merge of `labyrinth-1.1`. Override by: editing `src/client/epochs.rs` (rotation) or `src/client/read.rs` (read checks).

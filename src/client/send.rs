@@ -1,0 +1,179 @@
+//! Sender path: MEK reuse or minting, sealing, batching (SPEC §7.2–7.3,
+//! [CB-15], [CB-16], [CB-20]).
+
+use super::Labyrinth;
+use crate::Result;
+use crate::mailbox::EpochPublic;
+use crate::mek::{self, Mek, MekRecord};
+use crate::message::seal_sender;
+use crate::records::defs::SealedMessageDef;
+use crate::records::{BATCH_BYTE_BUDGET, Batch, MAX_BATCH_ITEMS, MekDistribution, OwnerBatch};
+
+/// A batch record written to a store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlushedBatch {
+    pub thread_id: String,
+    pub rkey: String,
+    pub count: usize,
+    /// True for an `ownerBatch` in the personal mailbox, false for a
+    /// sender `batch` in the conversation space.
+    pub owner: bool,
+}
+
+/// What [`Labyrinth::archive_outgoing`] wrote.
+#[derive(Clone, Debug, Default)]
+pub struct ArchiveOutcome {
+    /// The MEK distribution written because no cached MEK was reusable.
+    pub mek_written: Option<MekRecord>,
+    /// A batch flushed because it reached the size limits.
+    pub flushed: Option<FlushedBatch>,
+}
+
+impl Labyrinth {
+    /// The roster ([CB-16]) for a conversation whose MLS members are
+    /// `member_dids`: each enrolled member's latest published epoch,
+    /// verified and attested by one of its current chat devices ([CB-18]),
+    /// plus this account's own latest epoch. Members with no `mailboxKeys`
+    /// are not enrolled and are left out.
+    pub fn resolve_roster(&self, member_dids: &[&str]) -> Result<Vec<(String, EpochPublic)>> {
+        let mut roster = Vec::with_capacity(member_dids.len() + 1);
+        for did in member_dids.iter().filter(|d| **d != self.did) {
+            if let Some(epoch) = self.b.directory.latest(did)? {
+                self.check_attested(did, &epoch, false)?;
+                roster.push(((*did).to_owned(), epoch));
+            }
+        }
+        roster.push((self.did.clone(), self.latest_public()?));
+        Ok(roster)
+    }
+
+    /// Archive one outgoing MLS application frame for `thread_id`.
+    ///
+    /// `roster` lists the other enrolled members and their latest epochs
+    /// (see [`resolve_roster`](Self::resolve_roster)); any entry for this
+    /// account is replaced by its own latest epoch. Every other entry is
+    /// verified and must be attested by a current chat device of its DID
+    /// ([CB-18]) or the call fails with [`crate::Error::Unattested`].
+    ///
+    /// A cached MEK is reused only under the reuse rules (p.38–39,
+    /// [CB-23]); otherwise a fresh MEK is distributed to the roster and its
+    /// record written first. The sealed message is buffered and flushed as
+    /// a `batch` record at [`MAX_BATCH_ITEMS`] items or
+    /// [`BATCH_BYTE_BUDGET`] bytes, or on [`flush`](Self::flush).
+    pub fn archive_outgoing(
+        &mut self,
+        thread_id: &str,
+        roster: &[(String, EpochPublic)],
+        message_id: &str,
+        timestamp: u64,
+        frame: &[u8],
+    ) -> Result<ArchiveOutcome> {
+        let me_public = self.latest_public()?;
+        let mut full = Vec::with_capacity(roster.len() + 1);
+        for (did, epoch) in roster.iter().filter(|(d, _)| *d != self.did) {
+            self.check_attested(did, epoch, false)?;
+            full.push((did.clone(), epoch.clone()));
+        }
+        full.push((self.did.clone(), me_public.clone()));
+        let heads: Vec<[u8; 32]> = full.iter().map(|(_, e)| e.head).collect();
+
+        let mut out = ArchiveOutcome::default();
+        let cached = self
+            .meks
+            .get(thread_id)
+            .and_then(|v| v.iter().rev().find(|m| m.reusable_for(&heads)).cloned());
+        let mek = match cached {
+            Some(m) => m,
+            None => {
+                let (_, keys) = self.my_keys(self.latest)?;
+                let mut m = Mek::generate(&heads)?;
+                let rec = mek::distribute_labyrinth(
+                    thread_id, &mut m, &self.did, &me_public, &keys, &full,
+                )?;
+                let wire = MekDistribution::from_record(&rec, Some(&me_public), self.now())?;
+                self.b.threads.create_mek(&wire)?;
+                self.meks
+                    .entry(thread_id.to_owned())
+                    .or_default()
+                    .push(m.clone());
+                out.mek_written = Some(rec);
+                m
+            }
+        };
+        let sealed = seal_sender(
+            &mek,
+            thread_id,
+            message_id,
+            timestamp,
+            frame,
+            self.transport.as_ref(),
+        )?;
+
+        let pending = self.outbox.get(thread_id).map_or(0, |v| {
+            v.iter()
+                .map(SealedMessageDef::approx_json_len)
+                .sum::<usize>()
+        });
+        if pending > 0 && pending + SealedMessageDef::approx_json_len(&sealed) > BATCH_BYTE_BUDGET {
+            out.flushed = self.flush_sender(thread_id)?;
+        }
+        let queue = self.outbox.entry(thread_id.to_owned()).or_default();
+        queue.push(sealed);
+        if queue.len() >= MAX_BATCH_ITEMS {
+            out.flushed = self.flush_sender(thread_id)?;
+        }
+        Ok(out)
+    }
+
+    /// Write every buffered sender and owner batch.
+    pub fn flush(&mut self) -> Result<Vec<FlushedBatch>> {
+        let mut out = Vec::new();
+        let threads: Vec<String> = self.outbox.keys().cloned().collect();
+        for t in threads {
+            out.extend(self.flush_sender(&t)?);
+        }
+        let threads: Vec<String> = self.owner_outbox.keys().cloned().collect();
+        for t in threads {
+            out.extend(self.flush_owner(&t)?);
+        }
+        Ok(out)
+    }
+
+    /// Messages buffered for `thread_id` but not yet written.
+    pub fn pending(&self, thread_id: &str) -> usize {
+        self.outbox.get(thread_id).map_or(0, Vec::len)
+            + self.owner_outbox.get(thread_id).map_or(0, Vec::len)
+    }
+
+    /// Writes the sender buffer of one thread; on error the buffer is kept.
+    pub(super) fn flush_sender(&mut self, thread_id: &str) -> Result<Option<FlushedBatch>> {
+        let Some(items) = self.outbox.get(thread_id).filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        let batch = Batch::from_messages(thread_id, items, self.now())?;
+        let rkey = self.b.threads.append_batch(&batch)?;
+        let count = self.outbox.remove(thread_id).map_or(0, |v| v.len());
+        Ok(Some(FlushedBatch {
+            thread_id: thread_id.to_owned(),
+            rkey,
+            count,
+            owner: false,
+        }))
+    }
+
+    /// Writes the owner buffer of one thread; on error the buffer is kept.
+    pub(super) fn flush_owner(&mut self, thread_id: &str) -> Result<Option<FlushedBatch>> {
+        let Some(items) = self.owner_outbox.get(thread_id).filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        let batch = OwnerBatch::from_messages(items, self.now())?;
+        let rkey = self.b.mailbox.append_owner_batch(&batch)?;
+        let count = self.owner_outbox.remove(thread_id).map_or(0, |v| v.len());
+        Ok(Some(FlushedBatch {
+            thread_id: thread_id.to_owned(),
+            rkey,
+            count,
+            owner: true,
+        }))
+    }
+}

@@ -1,7 +1,7 @@
 //! Crate error type.
 
 /// Every fallible operation in the crate returns this error.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Error {
     #[error("authentication failed")]
     Decrypt,
