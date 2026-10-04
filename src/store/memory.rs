@@ -28,9 +28,13 @@ use crate::sign::XVerifyingKey;
 use crate::{Error, Result};
 
 mod directory;
+mod heads;
+mod orf;
 mod threads;
 
 pub use directory::MemoryDirectory;
+pub use heads::{MemoryDsDirectory, MemoryDsPublisher, MemoryPdsPublisher};
+pub use orf::MemoryOrf;
 pub use threads::MemoryThreads;
 
 #[derive(Default)]
@@ -81,6 +85,10 @@ struct State {
     stamping: bool,
     /// The server clock for stamps (ms), set by tests.
     server_now: u64,
+    /// mls-ds `labyrinth.epoch_heads`, by DID and epoch number.
+    ds_heads: HashMap<String, BTreeMap<u64, crate::mailbox::EpochPublic>>,
+    /// ORF server states by (owner DID, device key).
+    orf: HashMap<(String, [u8; 32]), crate::orf::OrfServerState>,
 }
 
 impl State {
@@ -92,6 +100,21 @@ impl State {
             .rev()
             .map(|i| S32[((self.tid >> (5 * i)) & 31) as usize] as char)
             .collect()
+    }
+
+    /// Writes `did`'s public `mailboxKeys` (`self` and the per-epoch copy).
+    fn publish_pds(&mut self, did: &str, record: &MailboxKeysRecord) -> Result<()> {
+        let seq = record.current.epoch_number;
+        let history = self.public_history.entry(did.to_owned()).or_default();
+        if history
+            .get(&seq)
+            .is_some_and(|r| r.current != record.current)
+        {
+            return Err(Error::Conflict);
+        }
+        history.insert(seq, record.clone());
+        self.public_keys.insert(did.to_owned(), record.clone());
+        Ok(())
     }
 
     /// The server stamp for a write into `thread_id` (`None` unless
@@ -142,6 +165,29 @@ impl MemoryBackend {
     /// Public `mailboxKeys` records plus the MLS device view.
     pub fn directory(&self) -> MemoryDirectory {
         MemoryDirectory::new(self.clone())
+    }
+
+    /// The mls-ds epoch-head directory ([CB-28], [CB-29]): heads recorded
+    /// by [`ds_publisher`](Self::ds_publisher), plus the MLS device view.
+    pub fn ds_directory(&self) -> MemoryDsDirectory {
+        MemoryDsDirectory::new(self.clone())
+    }
+
+    /// Publishes `did`'s heads to the mls-ds directory, with its
+    /// server-side checks (`publishEpochHead`).
+    pub fn ds_publisher(&self, did: &str) -> MemoryDsPublisher {
+        MemoryDsPublisher::new(did, self.clone())
+    }
+
+    /// Publishes `did`'s public `mailboxKeys` records (what a Space
+    /// mailbox does in [`MailboxStore::publish_mailbox_keys`]).
+    pub fn pds_publisher(&self, did: &str) -> MemoryPdsPublisher {
+        MemoryPdsPublisher::new(did, self.clone())
+    }
+
+    /// The ORF server, as `did` sees it.
+    pub fn orf(&self, did: &str) -> MemoryOrf {
+        MemoryOrf::new(did, self.clone())
     }
 
     /// From now on, stamp every MEK, batch and owner batch with a
@@ -420,18 +466,7 @@ impl MailboxStore for MemoryMailbox {
     }
 
     fn publish_mailbox_keys(&self, record: &MailboxKeysRecord) -> Result<()> {
-        let mut s = self.backend.lock();
-        let seq = record.current.epoch_number;
-        let history = s.public_history.entry(self.did.clone()).or_default();
-        if history
-            .get(&seq)
-            .is_some_and(|r| r.current != record.current)
-        {
-            return Err(Error::Conflict);
-        }
-        history.insert(seq, record.clone());
-        s.public_keys.insert(self.did.clone(), record.clone());
-        Ok(())
+        self.backend.lock().publish_pds(&self.did, record)
     }
 }
 

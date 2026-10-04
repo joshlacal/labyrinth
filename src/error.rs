@@ -27,6 +27,10 @@ pub enum Error {
     EpochTruncated { published: u64, reached: u64 },
     #[error("peer epoch rolled back or forked: pinned epoch {pinned}, offered {offered}")]
     EpochRollback { pinned: u64, offered: u64 },
+    #[error(
+        "directories disagree on the account's epoch chain: PDS epoch {pds}, mls-ds epoch {ds}"
+    )]
+    DirectoryFork { pds: u64, ds: u64 },
     #[error("epoch is not attested by one of the account's chat devices")]
     Unattested,
     #[error("not found: {0}")]

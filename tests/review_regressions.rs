@@ -109,6 +109,8 @@ fn backends(
         mailbox: mb,
         threads: Box::new(net.threads(did)),
         directory: Box::new(net.directory()),
+        orf: Box::new(net.orf(did)),
+        publishers: vec![],
         clock: Box::new(clock.clone()),
     }
 }
@@ -272,6 +274,8 @@ fn stale_head_replay_after_contact_is_rejected() {
             old: old.clone(),
             active: active.clone(),
         }),
+        orf: Box::new(net.orf(B)),
+        publishers: vec![],
         clock: Box::new(clock.clone()),
     };
     let mut bob = Labyrinth::initialize(B, Box::new(signer(3)), bb).unwrap();
@@ -396,6 +400,8 @@ fn pins_reject_rollback_and_advance_only_through_a_verified_chain() {
             inner: net.directory(),
             hidden: hidden.clone(),
         }),
+        orf: Box::new(net.orf(B)),
+        publishers: vec![],
         clock: Box::new(clock.clone()),
     };
     let mut bob = Labyrinth::initialize(B, Box::new(signer(3)), bob_backends(&hidden)).unwrap();
@@ -731,6 +737,8 @@ fn restarted_client_still_enforces_peer_pins() {
             old: old.clone(),
             active: active.clone(),
         }),
+        orf: Box::new(net.orf(B)),
+        publishers: vec![],
         clock: Box::new(clock.clone()),
     };
     let mut bob = Labyrinth::initialize(B, Box::new(signer(3)), bob_backends()).unwrap();

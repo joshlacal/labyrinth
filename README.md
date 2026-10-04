@@ -47,6 +47,8 @@ let backends = |did: &str| Backends {
     mailbox: Box::new(net.mailbox(did)),
     threads: Box::new(net.threads(did)),
     directory: Box::new(net.directory()),
+    orf: Box::new(net.orf(did)),
+    publishers: vec![],
     clock: Box::new(SystemClock),
 };
 // `transport` is the device's MLS chat key, registered with the directory.

@@ -33,8 +33,8 @@ pub struct SyncReport {
 pub struct RotationReport {
     /// The epoch opened without the revoked device.
     pub new_epoch: u64,
-    /// The caller must now ask the ORF server (mls-ds, [CB-17]) to delete
-    /// this device's ORF server state (SPEC §5.6).
+    /// The revoked device. Its ORF server state ([CB-17]) has already
+    /// been deleted through [`super::Backends::orf`] (SPEC §5.6).
     pub revoked: XVerifyingKey,
 }
 
@@ -149,6 +149,7 @@ impl Labyrinth {
             .create_epoch(&Epoch::from_record(&new.record, now.clone()), &members)?;
         b.mailbox
             .create_device(&Device::from_public(device.public(), now))?;
+        b.orf.register(&device.public().device_key_pub, None)?;
         let mut salt = [0u8; 32];
         random(&mut salt)?;
         let me = Self::assemble(did, device, transport, b, salt, [pending.assign_id(id)])?;
@@ -160,10 +161,18 @@ impl Labyrinth {
         epoch_record(self.b.mailbox.as_ref(), seq)
     }
 
+    /// Publishes a new epoch to the mailbox and every extra publisher.
+    /// Every destination is tried; the first failure is returned.
     pub(super) fn publish_keys(&self, public: &crate::mailbox::EpochPublic) -> Result<()> {
-        self.b
-            .mailbox
-            .publish_mailbox_keys(&MailboxKeysRecord::from_public(public, None, self.now()))
+        let record = MailboxKeysRecord::from_public(public, None, self.now());
+        let mut result = self.b.mailbox.publish_mailbox_keys(&record);
+        for p in &self.b.publishers {
+            let r = p.publish(&record);
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        result
     }
 
     /// Forward-chain into every epoch opened since this device last synced
@@ -247,7 +256,8 @@ impl Labyrinth {
     }
 
     /// Revoke a device: record it in this client's local revoked set,
-    /// mark it revoked in the store, then open a new epoch that carries
+    /// mark it revoked in the store, delete its ORF server state, then open
+    /// a new epoch that carries
     /// over every other unrevoked member ([CB-11], [CB-25]) and publish its
     /// keys. Retries if a sibling device opens the same epoch first.
     ///
@@ -263,6 +273,7 @@ impl Labyrinth {
         self.revoked.insert(target.0);
         self.sync_epochs()?;
         self.b.mailbox.set_device_revoked(target, &self.now())?;
+        self.b.orf.delete(target)?;
         for _ in 0..ROTATE_ATTEMPTS {
             let exclude = self.revoked.clone();
             match self.rotate(&exclude) {

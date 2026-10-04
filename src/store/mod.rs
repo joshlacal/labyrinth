@@ -8,6 +8,10 @@
 //!   distributions and sender batches into its own repo ([CB-15], [CB-21]).
 //! - [`MailboxDirectory`]: read-only discovery of other accounts' latest
 //!   epoch and their MLS chat device keys ([CB-18], [CB-19]).
+//! - [`KeyPublisher`]: another place a new epoch head is published (the
+//!   PDS `mailboxKeys` record, or the mls-ds directory), so two
+//!   independent directories can be cross-checked ([CB-28], [CB-29]).
+//! - [`OrfServer`]: the server half of the ORF, always on mls-ds ([CB-17]).
 //!
 //! **The traits are synchronous** and return [`crate::Result`]. That keeps
 //! the crate free of any async runtime: an async client (the catbird-mls
@@ -38,6 +42,7 @@ pub use keys::{
 
 use crate::Result;
 use crate::mailbox::EpochPublic;
+use crate::orf::{EvolveToken, ObliviousId};
 use crate::records::{
     Batch, Device, Epoch, EpochMember, MailboxKeysRecord, MekDistribution, OwnerBatch,
     VirtualDevice,
@@ -187,4 +192,37 @@ pub trait MailboxDirectory {
         let _ = (thread_id, did);
         Ok(None)
     }
+}
+
+/// Another destination for a newly opened epoch's public keys, besides the
+/// mailbox's own [`MailboxStore::publish_mailbox_keys`]: the PDS
+/// `mailboxKeys` record when the mailbox lives in mls-ds, or the mls-ds
+/// directory (`publishEpochHead`) when it lives in a Space.
+pub trait KeyPublisher {
+    /// Publishes `record` (the epoch in `record.current`). Re-publishing
+    /// identical bytes succeeds; a different epoch under a published
+    /// number fails with [`crate::Error::Conflict`].
+    fn publish(&self, record: &MailboxKeysRecord) -> Result<()>;
+}
+
+/// The ORF server role ([CB-17], SPEC §3.6, §8): one server state per
+/// device of the handle's DID. The server computes every step itself and
+/// never reveals a state.
+pub trait OrfServer {
+    /// Registers `device_key`'s server state: a fresh one
+    /// (`orf_server_init`) without a parent, else
+    /// `orf_server_evolve(parent state, token)`. Fails with
+    /// [`crate::Error::Conflict`] if the device already has a state and
+    /// with [`crate::Error::NotFound`] if the parent has none.
+    fn register(
+        &self,
+        device_key: &XVerifyingKey,
+        parent: Option<(&XVerifyingKey, &EvolveToken)>,
+    ) -> Result<()>;
+    /// `orf_server_map(state of device_key, domain, id)`. mls-ds applies
+    /// this only inside its attachment-reference endpoints and exposes no
+    /// raw map, so the XRPC implementation refuses it.
+    fn map(&self, device_key: &XVerifyingKey, domain: &[u8], id: &ObliviousId) -> Result<[u8; 32]>;
+    /// Deletes `device_key`'s state (revocation, SPEC §5.6). Idempotent.
+    fn delete(&self, device_key: &XVerifyingKey) -> Result<()>;
 }

@@ -76,6 +76,8 @@ impl World {
             mailbox,
             threads: Box::new(self.net.threads(did)),
             directory,
+            orf: Box::new(self.net.orf(did)),
+            publishers: vec![],
             clock: Box::new(self.clock.clone()),
         }
     }

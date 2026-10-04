@@ -16,20 +16,33 @@ use crate::virtual_device::{self, Mechanism, OtcPayload, passkey};
 use crate::{Error, Result};
 
 /// A new recovery bundle. Show `code` to the user (or store it in the
-/// keychain), send `evolve_token` to the ORF server
-/// (`vdeviceServerState = orf_server_evolve(token, parent state)`), then
-/// drop both.
+/// keychain), then drop it. The client has already registered the bundle's
+/// ORF state with [`Backends::orf`]
+/// (`vdeviceServerState = orf_server_evolve(token, parent state)`);
+/// `evolve_token` is returned only for callers that mirror ORF state.
 pub struct RecoverySetup {
     pub code: RecoveryCode,
     pub vdevice_id: [u8; 16],
     pub evolve_token: EvolveToken,
 }
 
-/// A device enrolled by restore or one-time code. Send `evolve_token` to
-/// the ORF server for `device_key`.
+/// A device enrolled by restore or one-time code. The client has already
+/// registered `device_key`'s ORF state with [`Backends::orf`];
+/// `evolve_token` is returned only for callers that mirror ORF state.
 pub struct Enrollment {
     pub device_key: XVerifyingKey,
     pub evolve_token: EvolveToken,
+}
+
+/// The id under which a one-time-code transfer's temporary ORF server
+/// state is registered: both devices derive it from the CPace session
+/// key, so only they can name it. The responder registers the temporary
+/// state under it; the new device evolves its own state from it and then
+/// deletes it.
+fn otc_temp_orf_id(isk: &crate::otc::Isk) -> XVerifyingKey {
+    let mut input = b"catbird.labyrinth.otc_temp_orf:".to_vec();
+    input.extend_from_slice(isk.as_bytes());
+    XVerifyingKey(crate::encoding::sha256(&input))
 }
 
 /// What the enrolled device sends back in a one-time-code transfer.
@@ -37,7 +50,8 @@ pub struct OtcResponse {
     pub message: ResponderMessage,
     /// [`OtcPayload`] sealed under the CPace session key.
     pub sealed_payload: Vec<u8>,
-    /// Evolve token for the temporary ORF state handed to the new device.
+    /// Evolve token for the temporary ORF state handed to the new device,
+    /// already registered with [`Backends::orf`].
     pub evolve_token: EvolveToken,
 }
 
@@ -108,6 +122,10 @@ impl Labyrinth {
         ))?;
         mb.create_device(&Device::from_public(&rec.public, now.clone()))?;
         mb.create_epoch_member(&EpochMember::from_record(&member, now))?;
+        self.b.orf.register(
+            &rec.public.device_key_pub,
+            Some((&self.device.public().device_key_pub, &evolve_token)),
+        )?;
         Ok(RecoverySetup {
             code,
             vdevice_id: rec.vdevice_id,
@@ -198,6 +216,10 @@ impl Labyrinth {
             .create_device(&Device::from_public(&public, now.clone()))?;
         b.mailbox
             .create_epoch_member(&EpochMember::from_record(&member, now))?;
+        b.orf.register(
+            &public.device_key_pub,
+            Some((&restored.device.public().device_key_pub, &evolve_token)),
+        )?;
         let me = Self::assemble(
             did,
             device,
@@ -233,6 +255,10 @@ impl Labyrinth {
         let epoch = self.epoch_secret(self.latest)?;
         let (payload, evolve_token) =
             OtcPayload::create(&self.device, &epoch, &self.mailbox_root_salt)?;
+        self.b.orf.register(
+            &otc_temp_orf_id(&isk),
+            Some((&self.device.public().device_key_pub, &evolve_token)),
+        )?;
         Ok(OtcResponse {
             message,
             sealed_payload: payload.seal(&isk)?,
@@ -273,6 +299,10 @@ impl Labyrinth {
             .create_device(&Device::from_public(&public, now.clone()))?;
         b.mailbox
             .create_epoch_member(&EpochMember::from_record(&member, now))?;
+        let temp = otc_temp_orf_id(&isk);
+        b.orf
+            .register(&public.device_key_pub, Some((&temp, &evolve_token)))?;
+        b.orf.delete(&temp)?;
         let me = Self::assemble(
             did,
             device,
