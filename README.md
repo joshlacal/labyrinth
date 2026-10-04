@@ -14,7 +14,8 @@ The whitepapers leave many choices open and are written around Facebook identiti
 - Each epoch head is also signed by a chat device key ([CB-18]), so neither a storage backend nor the delivery service can substitute someone's mailbox keys.
 - Sender-encrypted messages are stored once per conversation, in the sender's own repo, instead of once per recipient ([CB-15]).
 - MEK (message encryption key) distributions bind the thread id ([CB-24]).
-- Revoking a device always opens a new epoch ([CB-11]).
+- Revoking a device always opens a new epoch ([CB-11]), excluding every device the client has revoked even if the store forgets `revokedAt`.
+- Senders pin each peer's epoch head and only move forward along its signed chain ([CB-29]).
 - Hawk HPKE byte layout, the recovery-code error-correcting code and the one-time-code payload are our own definitions.
 
 **We do not claim wire compatibility with Messenger.** Meta publishes no test vectors; ours are in `tests/vectors/`.
@@ -29,7 +30,7 @@ The whitepapers leave many choices open and are written around Facebook identiti
 | `src/mek/`, `src/message.rs` | MEK distribution and opening; owner-mode and sender-mode message encryption |
 | `src/records/` | atproto record types for every lexicon, with lossless conversions to the protocol structs |
 | `src/store/` | Synchronous storage traits (`MailboxStore`, `ThreadStore`, `MailboxDirectory`) and an in-memory backend |
-| `src/client/` | `Labyrinth`: the high-level client a chat app calls (initialize, sync, revoke, recover, enroll, archive, load) |
+| `src/client/` | `Labyrinth`: the high-level client a chat app calls (initialize, sync, revoke, recover, enroll, archive, load, export and restore its state) |
 | `lexicons/blue/catbird/labyrinth/` | Draft `blue.catbird.labyrinth.*` lexicons |
 | `docs/SPEC.md`, `docs/DECISIONS.md` | The protocol profile and the decision log |
 
@@ -66,7 +67,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-answer vectors for HPKE, ORF and recovery codes, a lexicon validator that checks every emitted record against `lexicons/`, and an end-to-end lifecycle on the memory backend: multi-device accounts, revocation, recovery from a typo'd code, members leaving and joining, and malicious-backend checks.
+The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-answer vectors for HPKE, ORF and recovery codes, a lexicon validator that checks every emitted record against `lexicons/`, and an end-to-end lifecycle on the memory backend: multi-device accounts, revocation, recovery from a typo'd code, members leaving and joining, and malicious-backend checks. `tests/review_regressions.rs` pins the fixes from the 2026-10-04 security review (revocation, epoch pinning, messageId collisions, state persistence, removed chat keys).
 
 ## Security caveats and limitations
 
@@ -75,8 +76,10 @@ The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-an
 - **Epoch truncation** is detected only when the `MailboxDirectory` (public `mailboxKeys`, later the mls-ds roster view) is independent of the mailbox store ([CB-28]).
 - **Public enrollment signal.** Publishing `mailboxKeys` in the public repo reveals that an account uses Labyrinth and when it rotates epochs ([CB-19]).
 - **Owner-mode records** (v1.0 compatibility and re-archive on leave) authenticate the thread and epoch but not `messageId` or `timestamp`, as in the paper, and carry no sender DID.
-- **History reads trust removed devices.** Messages and MEKs signed by a chat device that has since been removed still verify ([CB-27]); addressing a new MEK requires a current device.
-- **Not yet provided:** persistence of device secrets and the epoch cache, the atproto Space and mls-ds store implementations, the ORF server role and attachment references (SPEC §8), and a UniFFI surface.
+- **History reads trust removed devices, up to their removal.** Messages and MEKs signed by a chat device that has since been removed still verify if they are timestamped before its removal ([CB-27]). Timestamps are the sender's claim, so a removed (e.g. stolen) device can backdate; server-side ordering in mls-ds is the planned fix. Addressing a new MEK requires a current device.
+- **First contact is trust-on-first-use.** Senders pin each peer's newest epoch and refuse rollbacks afterwards ([CB-29]), but the first epoch a sender sees for a DID is accepted if a current chat device attested it. Carrying latest heads in MLS-authenticated group state is the long-term fix.
+- **Client state is secret.** `Labyrinth::export_state()` returns the device's private keys, epoch roots, MEKs, revoked set and pins ([CB-30]). Store it only in the platform keychain or SQLCipher; flush pending batches first, since they are not included.
+- **Not yet provided:** the atproto Space and mls-ds store implementations, the ORF server role and attachment references (SPEC §8), and a UniFFI surface.
 
 ## References
 

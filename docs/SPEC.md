@@ -52,6 +52,7 @@ Whitepaper page numbers below refer to the v1.1 paper, e.g. "(p.27)". Every plac
   - `subkey = HChaCha20(key, nonce[0..16])` and `subnonce = nonce[16..28]`, then AES-256-GCM.
   - The output is `nonce(28) || ct || tag`.
 - Each ciphertext starts with a one-byte **suite id** that selects the AEAD: `0x01` = AES-GCM-Extended, `0x02` = DNDK-GCM **[CB-6]**.
+- **Suite pinning.** Every object this profile seals on a v1.1 path must use `0x02`, and readers refuse anything else before using the key (`aead::decrypt_suite`): sender messages (§7.2), the encrypted epoch back-link (§5.4), every virtual-device bundle field (§6.2), the passkey wrap (§6.4) and the one-time-code payload (§6.5). Only owner messages (§7.1), which may come from a Labyrinth 1.0 writer, still dispatch on the suite byte. Without the pin, a backend could relabel a v1.1 object as the weaker v1.0 construction.
 
 ### 3.2 Padding (p.15)
 
@@ -170,7 +171,13 @@ prev_sig = XEdDSA(prevSigPriv, "minos.unstructured_signature.epoch_prev:" || epo
   - A sender accepts a recipient's head only if the attesting key belongs to one of that DID's devices in the MLS group.
   - This anchors the head chain to MLS identity, so neither a storage backend nor mls-ds can substitute mailbox keys.
 - **[CB-19] Discovery.** The latest `epochPublic` is published as `blue.catbird.labyrinth.mailboxKeys/self` in the account's **public** repo, so any PDS works.
+  - Every published epoch is also kept, immutable, at `mailboxKeys/<12-digit epochNumber>`, so a sender can walk the `prev_sig` chain ([CB-29]).
   - Cost: it shows publicly that the account uses Labyrinth, and when it rotates epochs.
+- **[CB-29] Peer epoch pinning.** A sender pins, per DID it addresses, the newest `(epochNumber, epochHead, signingPubkey)` it has accepted, and keeps the pin in its persisted state (§9.3):
+  - an offered epoch older than the pin, or with the pinned number but another head, fails with `EpochRollback`. This stops the peer's PDS from replaying an older, still-attested `mailboxKeys` record, which would make senders encrypt to keys a revoked device still holds;
+  - a newer epoch is accepted only if the `prev_sig` chain from the pinned head verifies through every intermediate epoch, fetched with `MailboxDirectory::epoch(did, seq)`; the client walks at most 4096 epochs per advance;
+  - first contact is trust-on-first-use, anchored by the [CB-18] attestation (a current chat device of the DID). A backend that replays an old epoch to a sender who has never addressed that DID is not detected;
+  - **long-term plan:** carry each member's latest epoch head in MLS-authenticated group state (mls-ds roster / group context), so first contact is authenticated too and the directory is only a cache.
 
 ### 5.4 Epoch metadata and membership (p.28–29)
 
@@ -194,6 +201,7 @@ encEntropy[d] = labyrinth_hpke(d.epochStorageKeyPub, self.authPub, self.authPriv
 ### 5.6 Revocation (p.36)
 
 - Revoking a device opens a new epoch that excludes it.
+- **Local revoked set.** The revoking client records the device in its own revoked set (persisted, §9.3) before touching the store, and every rotation it performs excludes the whole set, whatever the store says about `revokedAt`. It reports success only after checking that the new epoch neither lists an excluded device nor encrypts entropy to one. A store that drops `revokedAt` therefore cannot re-admit the device. `sync_epochs` reports locally revoked devices that are still members of the reached epoch (a sibling re-admitted them, or a rotation never completed) so the caller can revoke again.
 - **[CB-25] Rotation rules.**
   - The opener carries itself over and encrypts the entropy to its own storage key too, so any install holding its keys can forward-chain.
   - A device listed as continuing whose previous-epoch MAC or `sig_0x30`/`sig_0x31` fails aborts the rotation with an error. It is never dropped silently, because a silent drop would be an unannounced revocation.
@@ -382,8 +390,10 @@ ct  = hawk_encrypt(recip.encPub, ephPriv, ephPub, aad, mek)
 To read a message:
 1. Find the MEK by `mekId` in the conversation's MEK records ([CB-21]) and open it under the mailbox encryption key of the epoch it was addressed to (§7.3).
 2. Check the AAD fields against the record.
-3. Verify `sig` and that the sender key is one of the sender's MLS devices.
+3. Verify `sig` and that the sender key is one of the sender's MLS devices: a current one, or one removed *after* the message's timestamp ([CB-27]). The same bound applies to the key that attests a MEK's sender epoch (or signs a transport MEK), at the timestamp of the first message that needed the MEK.
 4. Decrypt the message and remove the padding.
+
+**Duplicates [CB-31].** A thread can hold several copies of one `messageId`: a sender copy, my owner-archive copy, or a different member reusing the id. Copies are merged only when they are provably the same message: sender copies on `(author DID, messageId)` with a byte-equal frame; an owner copy only when its frame is byte-equal to a loaded copy with that `messageId`. Every other copy is returned with `conflict = true`, so a member cannot suppress someone else's message by reusing its id. Re-archiving on leave ([CB-22]) keeps every distinct `(messageId, frame)`.
 
 ## 8. Attachments (p.41–43)
 
@@ -407,9 +417,11 @@ Every record is a `blue.catbird.labyrinth.*` lexicon in `lexicons/blue/catbird/l
 | `epochMember` | personal mailbox | `<12-digit seq>-<hex deviceKeyPubkey>` | immutable |
 | `virtualDevice` | personal mailbox | `hex(vdeviceId)` | immutable |
 | `ownerBatch` | personal mailbox | TID | append-only, one thread per batch |
-| `mailboxKeys` | **public** repo | `self` | overwritten on each rotation ([CB-19]) |
+| `mailboxKeys` | **public** repo | `self`, plus `<12-digit epochNumber>` per epoch | `self` is overwritten on each rotation; per-epoch copies are immutable ([CB-19], [CB-29]) |
 | `mek` | conversation space, sender's repo | `hex(mekId)` | immutable ([CB-21]) |
 | `batch` | conversation space, sender's repo | TID | append-only ([CB-15]) |
+
+Every `epochNumber` is bounded at 2⁴⁰ (lexicon `maximum`, checked again when records convert to protocol structs), so store-supplied epoch numbers stay far from `u64` overflow.
 
 `mek#labyrinthSender` embeds the sender's full `epochPublic`, because the public `mailboxKeys` record only shows a sender's *latest* epoch and readers need the auth key of the epoch that sealed an older MEK. The embedded copy is self-authenticating (head, self signature, [CB-18] attestation).
 
@@ -417,7 +429,7 @@ Every record is a `blue.catbird.labyrinth.*` lexicon in `lexicons/blue/catbird/l
 
 - `MailboxStore`: the caller's own mailbox (devices, epochs, epoch members, virtual devices, owner batches) plus publishing `mailboxKeys`.
 - `ThreadStore`: the conversation spaces. Writes go to the caller's repo; reads see every member's repo.
-- `MailboxDirectory`: other accounts' latest `epochPublic` and their MLS chat device keys, current and historical ([CB-27]).
+- `MailboxDirectory`: other accounts' latest `epochPublic`, every published `epochPublic` by number (`epoch(did, seq)`, [CB-29]), and their MLS chat device keys, each with an optional `removed_at` ([CB-27]).
 
 The traits are **synchronous** and return `Result`, so the crate needs no async runtime. A handle is bound to one authenticated DID. Every backend must provide:
 
@@ -436,16 +448,19 @@ The traits are **synchronous** and return `Result`, so the crate needs no async 
 
 ### 9.3 Client
 
-`client::Labyrinth` is one enrolled device. It holds the device secrets and an epoch-secret cache in memory only; persisting them is the embedding app's job.
+`client::Labyrinth` is one enrolled device. It holds the device secrets, the epoch-secret cache, its revoked-device set, its peer pins ([CB-29]) and its MEK cache.
 
-- **Lifecycle:** `initialize` (epoch 0, device, `mailboxKeys`), `sync_epochs` (forward-chain into epochs opened by sibling devices, then the [CB-28] integrity check), `revoke_device` (mark revoked, open the next epoch without it, publish `mailboxKeys`; retries on `Conflict`).
+- **Persistence [CB-30]:** `export_state()` returns a versioned binary encoding of all of that (magic `LBYS`, version 1, big-endian, length-prefixed; layout in `src/client/state.rs`) in a buffer that zeroizes on drop; `from_state(bytes, did, transport, backends)` rebuilds the client after checking the DID, the transport key, the device secrets against their public record and the newest epoch against the store. **The bytes are secret**: the embedding app stores them only in the platform keychain or SQLCipher. Unflushed batches are not included; flush first.
+- **Lifecycle:** `initialize` (epoch 0, device, `mailboxKeys`), `sync_epochs` (forward-chain into epochs opened by sibling devices, then the [CB-28] integrity check, and report re-admitted revoked devices), `revoke_device` (add to the local revoked set, mark revoked, open the next epoch without any locally revoked device, publish `mailboxKeys`; retries on `Conflict`).
 - **Enrollment:** `create_recovery_code`, `create_passkey_recovery`, `restore_with_recovery_code` (typo correction, forward-chaining with the virtual device, integrity check, then enrollment in the newest epoch), `restore_with_passkey`, and one-time codes (`otc_offer`/`otc_respond` on the existing device, `otc_start`/`enroll_via_otc` on the new one).
-- **Sending:** `resolve_roster` and `archive_outgoing` check every recipient epoch against the DID's current chat devices ([CB-18]), reuse a cached MEK under the reuse rules or distribute a new one, and buffer the sealed message; `flush` writes batches.
-- **Reading:** `load_thread` opens sender batches through any MEK addressed to any of the caller's epochs (backward-chaining as needed) plus owner batches, and reports what it could not open (for example `NotRecipient` before a join or after a leave). `archive_owner` writes v1.0 owner messages; `rearchive_thread_before_leave` implements [CB-22].
+- **Sending:** `resolve_roster` and `archive_outgoing` check every recipient epoch against the DID's current chat devices ([CB-18]) and its pin ([CB-29]), reuse a cached MEK under the reuse rules or distribute a new one, and buffer the sealed message; `flush` writes batches.
+- **Reading:** `load_thread` opens sender batches through any MEK addressed to any of the caller's epochs (backward-chaining as needed) plus owner batches, merges only provably identical copies (§7.4), and reports what it could not open (for example `NotRecipient` before a join or after a leave). `archive_owner` writes v1.0 owner messages; `rearchive_thread_before_leave` implements [CB-22].
 
 ## 10. Known limitations we keep from the paper (p.47)
 
 - **Epoch truncation by a malicious backend.**
   - Mitigation **[CB-28]**: a device compares the newest epoch it reached (on sync, restore and one-time-code enrollment) with the latest epoch the `MailboxDirectory` publishes for its own DID, and fails with `EpochTruncated` if the directory is ahead or its head forks. This only helps if the directory is independent of the mailbox store; the planned source is `mls-ds` publishing each member's latest epoch head in the MLS roster view. A backend that controls both can still truncate.
+- **First contact is trust-on-first-use** ([CB-29]): a sender who has never addressed a DID accepts any epoch attested by one of its current chat devices, including a replayed older one. Pins protect every later send.
+- **Removed chat keys and timestamps** ([CB-27]): a removed device's key vouches only for history timestamped before its removal, but the timestamp is chosen by the sender, so a removed (e.g. stolen) device can backdate messages. Ordering by mls-ds is the real fix.
 - **Membership enumeration.**
 - **Only partial post-quantum security.** Entropy distribution stays classical X25519, as in the paper.

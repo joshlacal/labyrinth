@@ -10,6 +10,8 @@
 //! | recovery codes, passkey wrap, one-time-code enrollment | [`enroll`] |
 //! | [`Labyrinth::archive_outgoing`], [`Labyrinth::flush`] | [`send`] |
 //! | [`Labyrinth::load_thread`], [`Labyrinth::archive_owner`], [`Labyrinth::rearchive_thread_before_leave`] | [`read`] |
+//! | [`Labyrinth::peer_pin`] (epoch pinning, [CB-29]) | [`pins`] |
+//! | [`Labyrinth::export_state`], [`Labyrinth::from_state`] | [`state`] |
 //!
 //! The client is synchronous and holds no locks; callers serialize access
 //! to one instance (the store traits explain why). Its state (device
