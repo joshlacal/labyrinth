@@ -55,6 +55,8 @@ struct ChatDevices {
 struct State {
     mailboxes: HashMap<String, Mailbox>,
     public_keys: HashMap<String, MailboxKeysRecord>,
+    /// Every published `mailboxKeys`, by DID and epoch number ([CB-29]).
+    public_history: HashMap<String, BTreeMap<u64, MailboxKeysRecord>>,
     threads: HashMap<String, ThreadSpace>,
     chat_devices: HashMap<String, ChatDevices>,
     tid: u64,
@@ -293,6 +295,15 @@ impl MailboxStore for MemoryMailbox {
 
     fn publish_mailbox_keys(&self, record: &MailboxKeysRecord) -> Result<()> {
         let mut s = self.backend.lock();
+        let seq = record.current.epoch_number;
+        let history = s.public_history.entry(self.did.clone()).or_default();
+        if history
+            .get(&seq)
+            .is_some_and(|r| r.current != record.current)
+        {
+            return Err(Error::Conflict);
+        }
+        history.insert(seq, record.clone());
         s.public_keys.insert(self.did.clone(), record.clone());
         Ok(())
     }
@@ -397,6 +408,15 @@ impl MailboxDirectory for MemoryDirectory {
     fn latest(&self, did: &str) -> Result<Option<EpochPublic>> {
         let s = self.backend.lock();
         s.public_keys.get(did).map(|r| r.to_public()).transpose()
+    }
+
+    fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>> {
+        let s = self.backend.lock();
+        s.public_history
+            .get(did)
+            .and_then(|h| h.get(&seq))
+            .map(|r| r.to_public())
+            .transpose()
     }
 
     fn device_transport_keys(&self, did: &str) -> Result<Vec<[u8; 32]>> {

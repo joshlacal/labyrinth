@@ -35,11 +35,17 @@ impl Labyrinth {
     /// verified and attested by one of its current chat devices ([CB-18]),
     /// plus this account's own latest epoch. Members with no `mailboxKeys`
     /// are not enrolled and are left out.
-    pub fn resolve_roster(&self, member_dids: &[&str]) -> Result<Vec<(String, EpochPublic)>> {
+    ///
+    /// Each member's epoch must also pass its [CB-29] pin: it may not be
+    /// older than (or fork from) the newest epoch this client already
+    /// accepted for that DID, and a newer one must chain to it
+    /// ([`crate::Error::EpochRollback`] otherwise).
+    pub fn resolve_roster(&mut self, member_dids: &[&str]) -> Result<Vec<(String, EpochPublic)>> {
         let mut roster = Vec::with_capacity(member_dids.len() + 1);
-        for did in member_dids.iter().filter(|d| **d != self.did) {
+        let me = self.did.clone();
+        for did in member_dids.iter().filter(|d| **d != me) {
             if let Some(epoch) = self.b.directory.latest(did)? {
-                self.check_attested(did, &epoch, false)?;
+                self.accept_for_addressing(did, &epoch)?;
                 roster.push(((*did).to_owned(), epoch));
             }
         }
@@ -53,7 +59,8 @@ impl Labyrinth {
     /// (see [`resolve_roster`](Self::resolve_roster)); any entry for this
     /// account is replaced by its own latest epoch. Every other entry is
     /// verified and must be attested by a current chat device of its DID
-    /// ([CB-18]) or the call fails with [`crate::Error::Unattested`].
+    /// ([CB-18]) or the call fails with [`crate::Error::Unattested`], and
+    /// must pass the DID's [CB-29] pin ([`crate::Error::EpochRollback`]).
     ///
     /// A cached MEK is reused only under the reuse rules (p.38–39,
     /// [CB-23]); otherwise a fresh MEK is distributed to the roster and its
@@ -70,8 +77,9 @@ impl Labyrinth {
     ) -> Result<ArchiveOutcome> {
         let me_public = self.latest_public()?;
         let mut full = Vec::with_capacity(roster.len() + 1);
-        for (did, epoch) in roster.iter().filter(|(d, _)| *d != self.did) {
-            self.check_attested(did, epoch, false)?;
+        let me = self.did.clone();
+        for (did, epoch) in roster.iter().filter(|(d, _)| *d != me) {
+            self.accept_for_addressing(did, epoch)?;
             full.push((did.clone(), epoch.clone()));
         }
         full.push((self.did.clone(), me_public.clone()));

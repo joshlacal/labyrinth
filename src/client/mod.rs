@@ -23,6 +23,7 @@
 
 pub mod enroll;
 pub mod epochs;
+pub mod pins;
 pub mod read;
 pub mod send;
 
@@ -30,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
 pub use epochs::{RotationReport, SyncReport};
+pub use pins::PeerPin;
 pub use read::{LoadedMessage, MessageSource, ThreadHistory, Undecryptable};
 pub use send::{ArchiveOutcome, FlushedBatch};
 
@@ -86,6 +88,8 @@ pub struct Labyrinth {
     /// `deviceKeyPub`s this client revoked; every rotation excludes them,
     /// whatever the store says about `revokedAt`.
     revoked: BTreeSet<[u8; 32]>,
+    /// Newest accepted epoch of every peer this client addressed ([CB-29]).
+    pins: BTreeMap<String, PeerPin>,
     /// MEKs minted or opened here, per thread, newest last.
     meks: HashMap<String, Vec<Mek>>,
     outbox: BTreeMap<String, Vec<SealedMessage>>,
@@ -125,6 +129,7 @@ impl Labyrinth {
             latest,
             heads: HashMap::new(),
             revoked: BTreeSet::new(),
+            pins: BTreeMap::new(),
             meks: HashMap::new(),
             outbox: BTreeMap::new(),
             owner_outbox: BTreeMap::new(),
@@ -174,6 +179,14 @@ impl Labyrinth {
         } else {
             Err(Error::Unattested)
         }
+    }
+
+    /// [`check_attested`](Self::check_attested) against the DID's
+    /// *current* chat devices, then the [CB-29] pin: the epoch a MEK is
+    /// about to be addressed to.
+    fn accept_for_addressing(&mut self, did: &str, epoch: &EpochPublic) -> Result<()> {
+        self.check_attested(did, epoch, false)?;
+        self.pin_peer(did, epoch)
     }
 
     /// My epoch `seq` (backward-chained if needed) and its mailbox keys.

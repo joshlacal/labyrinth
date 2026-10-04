@@ -216,6 +216,9 @@ impl MailboxDirectory for Substituting {
         }
         self.inner.latest(did)
     }
+    fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
+        self.inner.epoch(did, seq)
+    }
     fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<[u8; 32]>> {
         self.inner.device_transport_keys(did)
     }

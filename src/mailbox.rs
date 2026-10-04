@@ -177,16 +177,30 @@ impl EpochPublic {
             }
             return Ok(());
         }
-        let prev_sig = self.prev_sig.ok_or(Error::Malformed("missing prev_sig"))?;
+        if self.prev_sig.is_none() {
+            return Err(Error::Malformed("missing prev_sig"));
+        }
         if let Some(prev) = previous {
-            if prev.seq + 1 != self.seq || Some(prev.head) != self.prev_head {
-                return Err(Error::Malformed("epoch chain broken"));
-            }
-            prev.keys
-                .sig
-                .verify(&prefixed(PREV_SIG_PREFIX, &self.head), &prev_sig)?;
+            self.verify_link(prev.seq, &prev.head, &prev.keys.sig)?;
         }
         Ok(())
+    }
+
+    /// Check only the chain link to the previous epoch, given the parts of
+    /// it that matter: its sequence number, its head, and its mailbox
+    /// signing key (which made `prev_sig`). Does not verify `self`; call
+    /// [`verify`](Self::verify) as well.
+    pub fn verify_link(
+        &self,
+        prev_seq: u64,
+        prev_head: &[u8; 32],
+        prev_sig_key: &XVerifyingKey,
+    ) -> Result<()> {
+        let prev_sig = self.prev_sig.ok_or(Error::Malformed("missing prev_sig"))?;
+        if prev_seq.checked_add(1) != Some(self.seq) || Some(*prev_head) != self.prev_head {
+            return Err(Error::Malformed("epoch chain broken"));
+        }
+        prev_sig_key.verify(&prefixed(PREV_SIG_PREFIX, &self.head), &prev_sig)
     }
 }
 

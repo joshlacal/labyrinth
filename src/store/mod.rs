@@ -115,7 +115,9 @@ pub trait MailboxStore {
         range: TimeRange,
     ) -> Result<Vec<Stored<OwnerBatch>>>;
 
-    /// Writes `mailboxKeys/self` in the owner's PUBLIC repo ([CB-19]).
+    /// Writes `mailboxKeys/self` in the owner's PUBLIC repo ([CB-19]), and
+    /// the immutable per-epoch copy `mailboxKeys/<12-digit epochNumber>`
+    /// that [`MailboxDirectory::epoch`] serves ([CB-29]).
     fn publish_mailbox_keys(&self, record: &MailboxKeysRecord) -> Result<()>;
 }
 
@@ -149,6 +151,11 @@ pub trait MailboxDirectory {
     /// The DID's published latest epoch (`mailboxKeys/self`), unverified;
     /// `None` if the account is not enrolled in Labyrinth.
     fn latest(&self, did: &str) -> Result<Option<EpochPublic>>;
+    /// The DID's published epoch `seq` (`mailboxKeys/<12-digit seq>`),
+    /// unverified; `None` if it was never published. Clients walk these to
+    /// verify the `prev_sig` chain from a pinned head to a newer one
+    /// ([CB-29]).
+    fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>>;
     /// The DID's current MLS chat device transport keys ([CB-3]). Used to
     /// accept an epoch before addressing a MEK to it ([CB-18]).
     fn device_transport_keys(&self, did: &str) -> Result<Vec<[u8; 32]>>;
