@@ -66,7 +66,9 @@ impl Labyrinth {
     /// [CB-23]); otherwise a fresh MEK is distributed to the roster and its
     /// record written first. The sealed message is buffered and flushed as
     /// a `batch` record at [`MAX_BATCH_ITEMS`] items or
-    /// [`BATCH_BYTE_BUDGET`] bytes, or on [`flush`](Self::flush).
+    /// [`BATCH_BYTE_BUDGET`] bytes, or on [`flush`](Self::flush). Every
+    /// batch holds messages under a single MEK: a message under a new MEK
+    /// first flushes the buffered ones (mls-ds rejects mixed-MEK batches).
     pub fn archive_outgoing(
         &mut self,
         thread_id: &str,
@@ -117,6 +119,16 @@ impl Labyrinth {
             self.transport.as_ref(),
         )?;
 
+        // Y4: a batch holds messages under one MEK only, so a server can
+        // authorize reads per MEK with a row filter.
+        let mek_changed = self
+            .outbox
+            .get(thread_id)
+            .and_then(|v| v.last())
+            .is_some_and(|m| m.mek_id != sealed.mek_id);
+        if mek_changed {
+            out.flushed = self.flush_sender(thread_id)?;
+        }
         let pending = self.outbox.get(thread_id).map_or(0, |v| {
             v.iter()
                 .map(SealedMessageDef::approx_json_len)
