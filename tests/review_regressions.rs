@@ -32,8 +32,15 @@ fn tpub(seed: u8) -> [u8; 32] {
     signer(seed).0.verifying_key().to_bytes()
 }
 
-/// Mailbox that silently ignores revocation (malicious / buggy backend).
-struct IgnoresRevoke(MemoryMailbox);
+/// Mailbox that silently ignores revocation (malicious / buggy backend),
+/// and fails every epoch create while `fail_epochs` is set (a crash or
+/// outage in the middle of a revocation).
+struct IgnoresRevoke(MemoryMailbox, Arc<AtomicBool>);
+impl IgnoresRevoke {
+    fn new(m: MemoryMailbox) -> Self {
+        Self(m, Arc::new(AtomicBool::new(false)))
+    }
+}
 impl MailboxStore for IgnoresRevoke {
     fn owner(&self) -> &str {
         self.0.owner()
@@ -51,6 +58,9 @@ impl MailboxStore for IgnoresRevoke {
         self.0.list_devices()
     }
     fn create_epoch(&self, e: &Epoch, m: &[EpochMember]) -> labyrinth::Result<String> {
+        if self.1.load(Ordering::Relaxed) {
+            return Err(Error::Backend("injected outage".into()));
+        }
         self.0.create_epoch(e, m)
     }
     fn get_epoch(&self, s: u64) -> labyrinth::Result<Option<Stored<Epoch>>> {
@@ -147,7 +157,7 @@ fn revoked_device_is_excluded_even_when_store_drops_revoked_at() {
         &clock,
         &mut phone,
         2,
-        Box::new(IgnoresRevoke(net.mailbox(A))),
+        Box::new(IgnoresRevoke::new(net.mailbox(A))),
     );
     let phone_key = phone.device_public().device_key_pub;
     let rot = laptop.revoke_device(&phone_key).unwrap();
@@ -470,4 +480,183 @@ fn removed_chat_key_is_accepted_only_before_its_removal() {
     assert_eq!(h.undecryptable.len(), 1);
     assert_eq!(h.undecryptable[0].message_id, "late");
     assert_eq!(h.undecryptable[0].error, Error::BadPublicKey);
+}
+
+// ---- Finding 7: client state persistence ----
+
+#[test]
+fn state_round_trips_and_a_restarted_client_keeps_working() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    net.register_chat_device(B, tpub(3));
+    let mut alice = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let mut bob = Labyrinth::initialize(
+        B,
+        Box::new(signer(3)),
+        backends(&net, &clock, B, Box::new(net.mailbox(B))),
+    )
+    .unwrap();
+    let roster = alice.resolve_roster(&[A, B]).unwrap();
+    alice
+        .archive_outgoing("t", &roster, "a1", 10, b"one")
+        .unwrap();
+    alice.flush().unwrap();
+    let state = alice.export_state().unwrap();
+    drop(alice);
+
+    let mut alice = Labyrinth::from_state(
+        &state,
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    assert_eq!(*alice.export_state().unwrap(), *state);
+    assert_eq!(alice.peer_pin(B).unwrap().seq, 0);
+    // The MEK cache survived: the next message reuses the MEK.
+    let roster = alice.resolve_roster(&[A, B]).unwrap();
+    let out = alice
+        .archive_outgoing("t", &roster, "a2", 20, b"two")
+        .unwrap();
+    assert!(out.mek_written.is_none());
+    alice.flush().unwrap();
+    let h = bob.load_thread("t", TimeRange::ALL).unwrap();
+    assert_eq!(h.messages.len(), 2);
+    assert_eq!(
+        alice
+            .load_thread("t", TimeRange::ALL)
+            .unwrap()
+            .messages
+            .len(),
+        2
+    );
+
+    // Wrong identity, corruption and trailing bytes are refused.
+    let restore = |bytes: &[u8], did: &str, seed: u8| {
+        Labyrinth::from_state(
+            bytes,
+            did,
+            Box::new(signer(seed)),
+            backends(&net, &clock, did, Box::new(net.mailbox(did))),
+        )
+        .map(|_| ())
+    };
+    assert!(restore(&state, B, 1).is_err());
+    assert!(restore(&state, A, 9).is_err());
+    assert!(restore(&state[..state.len() - 1], A, 1).is_err());
+    let mut long = state.to_vec();
+    long.push(0);
+    assert!(restore(&long, A, 1).is_err());
+    let mut v2 = state.to_vec();
+    v2[4] = 2;
+    assert_eq!(restore(&v2, A, 1), Err(Error::Unsupported(2)));
+    let mut bad_key = state.to_vec();
+    let at = 4 + 1 + 2 + A.len() + 32 + 1; // second byte of deviceKey (byte 0 is clamped)
+    bad_key[at] ^= 1;
+    assert!(restore(&bad_key, A, 1).is_err());
+}
+
+#[test]
+fn restarted_client_still_enforces_the_revoked_set() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let flaky = IgnoresRevoke::new(net.mailbox(A));
+    let outage = flaky.1.clone();
+    let mut laptop = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(flaky));
+    let tablet = enroll_sibling(&net, &clock, &mut phone, 4, Box::new(net.mailbox(A)));
+
+    // The revocation is recorded locally, but its rotation never happens.
+    outage.store(true, Ordering::Relaxed);
+    let phone_key = phone.device_public().device_key_pub;
+    assert!(matches!(
+        laptop.revoke_device(&phone_key),
+        Err(Error::Backend(_))
+    ));
+    let state = laptop.export_state().unwrap();
+    drop(laptop);
+
+    // After a restart (on a store that never recorded revokedAt), the
+    // laptop still knows the phone is revoked ...
+    let mut laptop = Labyrinth::from_state(
+        &state,
+        A,
+        Box::new(signer(2)),
+        backends(
+            &net,
+            &clock,
+            A,
+            Box::new(IgnoresRevoke::new(net.mailbox(A))),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        laptop.revoked_devices().collect::<Vec<_>>(),
+        vec![phone_key]
+    );
+    assert_eq!(laptop.sync_epochs().unwrap().readmitted, vec![phone_key]);
+    // ... and its next rotation, for another device, excludes it too.
+    laptop
+        .revoke_device(&tablet.device_public().device_key_pub)
+        .unwrap();
+    assert_eq!(phone.sync_epochs().unwrap_err(), Error::NotEpochMember);
+    assert!(laptop.sync_epochs().unwrap().readmitted.is_empty());
+}
+
+#[test]
+fn restarted_client_still_enforces_peer_pins() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    net.register_chat_device(B, tpub(3));
+    let mut laptop = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let phone = enroll_sibling(&net, &clock, &mut laptop, 2, Box::new(net.mailbox(A)));
+    let old = laptop.latest_public().unwrap();
+    laptop
+        .revoke_device(&phone.device_public().device_key_pub)
+        .unwrap();
+    let active = Arc::new(AtomicBool::new(false));
+    let bob_backends = || Backends {
+        mailbox: Box::new(net.mailbox(B)),
+        threads: Box::new(net.threads(B)),
+        directory: Box::new(Stale {
+            inner: net.directory(),
+            victim: A.into(),
+            old: old.clone(),
+            active: active.clone(),
+        }),
+        clock: Box::new(clock.clone()),
+    };
+    let mut bob = Labyrinth::initialize(B, Box::new(signer(3)), bob_backends()).unwrap();
+    bob.resolve_roster(&[A, B]).unwrap();
+    assert_eq!(bob.peer_pin(A).unwrap().seq, 1);
+    let state = bob.export_state().unwrap();
+    drop(bob);
+
+    active.store(true, Ordering::Relaxed);
+    let mut bob = Labyrinth::from_state(&state, B, Box::new(signer(3)), bob_backends()).unwrap();
+    assert_eq!(
+        bob.resolve_roster(&[A, B]).unwrap_err(),
+        Error::EpochRollback {
+            pinned: 1,
+            offered: 0
+        }
+    );
 }

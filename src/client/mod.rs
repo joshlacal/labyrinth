@@ -12,10 +12,11 @@
 //! | [`Labyrinth::load_thread`], [`Labyrinth::archive_owner`], [`Labyrinth::rearchive_thread_before_leave`] | [`read`] |
 //!
 //! The client is synchronous and holds no locks; callers serialize access
-//! to one instance (the store traits explain why). It does **not** persist
-//! device secrets: a client that restarts re-enrolls (one-time code or
-//! recovery code). Persisting [`crate::device::DeviceSecrets`] and the
-//! epoch cache is the embedding app's job and is not yet provided here.
+//! to one instance (the store traits explain why). Its state (device
+//! secrets, epoch cache, revoked set, peer pins, MEK cache) survives a
+//! restart through [`Labyrinth::export_state`] / [`Labyrinth::from_state`]
+//! ([`state`]); the exported bytes are secret and belong in the keychain or
+//! SQLCipher.
 //!
 //! Before using anyone's epoch keys the client checks [CB-18]: the
 //! epoch's attestation key must be one of that DID's chat devices as the
@@ -26,6 +27,7 @@ pub mod epochs;
 pub mod pins;
 pub mod read;
 pub mod send;
+pub mod state;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
