@@ -1,0 +1,28 @@
+//! Crate error type.
+
+/// Every fallible operation in the crate returns this error.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum Error {
+    #[error("authentication failed")]
+    Decrypt,
+    #[error("invalid signature")]
+    BadSignature,
+    #[error("invalid public key")]
+    BadPublicKey,
+    #[error("malformed input: {0}")]
+    Malformed(&'static str),
+    #[error("device is not a member of this epoch")]
+    NotEpochMember,
+    #[error("recovery code is invalid or uncorrectable")]
+    BadRecoveryCode,
+    #[error("unsupported version or suite: {0}")]
+    Unsupported(u8),
+    #[error("store conflict: expected head changed")]
+    Conflict,
+    #[error("not found: {0}")]
+    NotFound(&'static str),
+    #[error("randomness unavailable")]
+    Rng,
+}
+
+pub type Result<T> = core::result::Result<T, Error>;
