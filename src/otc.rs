@@ -142,7 +142,7 @@ pub fn channel_identifier(did: &str) -> Vec<u8> {
 
 /// `payload_key = kdf(ISK, MINOS_SALT, "catbird.labyrinth.otc.payload")`.
 ///
-/// The caller seals the CBOR payload with
+/// [`crate::virtual_device::OtcPayload`] seals its binary encoding with
 /// `crate::aead::encrypt(payload_key, PAYLOAD_AAD, payload)`.
 pub fn payload_key(isk: &Isk) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(hkdf32(isk.as_bytes(), &minos_salt(), PAYLOAD_KDF_INFO))

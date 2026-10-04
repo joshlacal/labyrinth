@@ -194,6 +194,10 @@ encEntropy[d] = labyrinth_hpke(d.epochStorageKeyPub, self.authPub, self.authPriv
 ### 5.6 Revocation (p.36)
 
 - Revoking a device opens a new epoch that excludes it.
+- **[CB-23] Rotation rules.**
+  - The opener carries itself over and encrypts the entropy to its own storage key too, so any install holding its keys can forward-chain.
+  - A device listed as continuing whose previous-epoch MAC or `sig_0x30`/`sig_0x31` fails aborts the rotation with an error. It is never dropped silently, because a silent drop would be an unannounced revocation.
+  - Forward chaining checks, in order: the opener's record verifies, is physical, matches `openedBy`, and holds a valid MAC in the previous epoch; the entropy decrypts; the derived mailbox keys equal the published `epochPublic`, whose head, self signature, attestation and `prev_sig` link verify; the reader's own MAC verifies under the new epoch; and the encrypted back-link decrypts to the previous sequence number and root.
 - The backend then deletes the device's ORF server state.
 - **[CB-11]** The rotation is **mandatory**: unlike Messenger, the client library always rotates when it revokes.
 
@@ -242,19 +246,21 @@ The bundle is AEAD-sealed under `vdeviceKey`. Each field uses the AAD strings fr
 
 The bundle also publishes the device public record, the `evolveToken`, and the device MAC.
 
+The bundle seals the epoch's sequence number but not its `epochID`, as in the paper. A restoring device looks the id up on the backend by sequence number (in the Space backend it is `space_epoch_id(seq)`).
+
 ### 6.3 Enrolling from a recovery code (p.35)
 
 1. Fetch the bundle by `vdeviceId` and decrypt it.
 2. Generate fresh device keys.
 3. Evolve ORF.
-4. Publish the MAC.
+4. Publish the MAC. We publish it in the newest epoch the device reaches by forward chaining with the virtual device (step 5), not in the bundle's epoch, so the new device is a member of the current epoch.
 5. Back-chain through the `encPrevRoot` links, and forward-chain through the `encEntropy` addressed to the virtual device's storage key.
 6. Delete the recovery code and all virtual-device secrets.
 
 ### 6.4 Recovery storage (p.43–46)
 
 Each recovery mechanism gets its own virtual device. This crate provides helpers for two of them:
-- **Passkey PRF.** `wrapKey = kdf(prf_output, MINOS_SALT, "catbird.labyrinth.passkey_wrap.v1")`, and the code is stored AEAD-sealed next to the bundle **[CB-13]**.
+- **Passkey PRF.** `wrapKey = kdf(prf_output, MINOS_SALT, "catbird.labyrinth.passkey_wrap.v1")`, and the code is stored AEAD-sealed next to the bundle **[CB-13]**: `encrypt(wrapKey, "catbird.labyrinth.passkey_wrapped_code", code40)`, where `code40` is the canonical 40-character ASCII code.
 - **Platform keychain.** The code is stored raw, for iCloud Keychain or Android Auto Backup.
 
 A PIN vault (HSM or Juicebox) is out of scope for the first release.
@@ -268,7 +274,18 @@ A PIN vault (HSM or Juicebox) is out of scope for the first release.
   - CI = `"catbird.labyrinth.otc.v1" || did`;
   - the requesting (new) device is the initiator, and the ISK uses `transcript_ir`. ADa and ADb are optional caller data.
 - `otc_secret` is the CPace ISK.
-- The payload is `{tempOrfClientState, mailboxRootSalt, epochRootKey, epochID, epochSequenceID}`, CBOR-encoded and sealed with `encrypt(kdf(ISK, MINOS_SALT, "catbird.labyrinth.otc.payload"), "otc_payload", …)`.
+- The payload is `{tempOrfClientState, mailboxRootSalt, epochRootKey, epochID, epochSequenceID}`, sealed with `encrypt(kdf(ISK, MINOS_SALT, "catbird.labyrinth.otc.payload"), "otc_payload", …)`.
+- **[CB-24] Payload encoding.** We use a fixed binary layout instead of CBOR, to avoid a CBOR dependency for one five-field struct. Integers are big-endian, and the decoder rejects trailing bytes:
+
+```
+0x01                     format version
+tempOrfClientState (32)
+mailboxRootSalt    (32)
+epochRootKey       (32)
+epochSequenceID    (u64, 8)
+len(epochID)       (u16, 2)    at most 512
+epochID            (UTF-8)
+```
 - A code allows 3 attempts.
 
 ## 7. Messages

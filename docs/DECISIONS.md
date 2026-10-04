@@ -41,3 +41,5 @@ This log records choices where the Labyrinth whitepaper is silent, or where it's
 | CB-20 | batches of up to 256 messages per record | PDS rate limit, 1 MB cap, export ceiling | tune the size |
 | CB-21 | MEK distribution is one record in the sender's repo in the conversation Space | Space owner-only writes | — |
 | CB-22 | on leave, re-archive into one's own mailbox | Space removal also removes read access to the conversation's history | — |
+| CB-23 | the opener encrypts entropy to itself; an invalid continuing device aborts rotation instead of being dropped | self-recovery for the opener's other installs; a silent drop would be an unannounced revocation | drop the self-entry; skip invalid devices |
+| CB-24 | OTC payload is a fixed big-endian binary layout, not CBOR | avoids a CBOR dependency for one five-field struct | switch to CBOR (bump the format byte) |
