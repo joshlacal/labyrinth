@@ -112,7 +112,12 @@ impl OtcPayload {
 
     /// Open on the new device.
     pub fn open(isk: &Isk, ct: &[u8]) -> Result<Self> {
-        let pt = Zeroizing::new(aead::decrypt(&payload_key(isk), PAYLOAD_AAD, ct)?);
+        let pt = Zeroizing::new(aead::decrypt_suite(
+            aead::Suite::DndkGcm,
+            &payload_key(isk),
+            PAYLOAD_AAD,
+            ct,
+        )?);
         Self::from_bytes(&pt)
     }
 
@@ -145,6 +150,30 @@ mod tests {
         assert_eq!(
             OtcPayload::from_bytes(&v).err(),
             Some(Error::Unsupported(2))
+        );
+    }
+
+    #[test]
+    fn payload_refuses_the_v10_suite() {
+        use crate::otc::{Initiator, Responder};
+        let did = "did:plc:otc";
+        let mut r = Responder::generate(did).unwrap();
+        let (_init, hello) = Initiator::start(r.code(), did, b"").unwrap();
+        let (_, isk) = r.respond(&hello, b"").unwrap();
+        let me = DeviceSecrets::generate().unwrap();
+        let epoch = EpochSecret::from_parts(7, "000000000007", [3u8; 32]);
+        let (p, _) = OtcPayload::create(&me, &epoch, &[9u8; 32]).unwrap();
+        assert!(OtcPayload::open(&isk, &p.seal(&isk).unwrap()).is_ok());
+        let ct = aead::encrypt(
+            aead::Suite::GcmExtended,
+            &payload_key(&isk),
+            PAYLOAD_AAD,
+            &p.to_bytes().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            OtcPayload::open(&isk, &ct).err(),
+            Some(Error::Unsupported(0x01))
         );
     }
 }

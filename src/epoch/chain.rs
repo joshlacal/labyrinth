@@ -6,7 +6,7 @@ use super::{
     EpochKeys, EpochMemberRecord, EpochRecord, EpochSecret, METADATA_AAD, PendingEpoch,
     entropy_aad, parse_seq, root_from_entropy, verify_member, verify_public,
 };
-use crate::aead;
+use crate::aead::{self, Suite};
 use crate::device::DevicePublic;
 use crate::hpke::labyrinth::{self as lhpke, X25519Secret};
 use crate::mailbox::EpochPublic;
@@ -121,11 +121,59 @@ fn decrypt_back_link(
         return Err(Error::Malformed("epoch has no back-link"));
     };
     let key = epoch.data_key();
-    let seq = parse_seq(&aead::decrypt(&key, METADATA_AAD, enc_seq)?)?;
-    let pt = Zeroizing::new(aead::decrypt(&key, METADATA_AAD, enc_root)?);
+    let seq = parse_seq(&aead::decrypt_suite(
+        Suite::DndkGcm,
+        &key,
+        METADATA_AAD,
+        enc_seq,
+    )?)?;
+    let pt = Zeroizing::new(aead::decrypt_suite(
+        Suite::DndkGcm,
+        &key,
+        METADATA_AAD,
+        enc_root,
+    )?);
     let root: [u8; 32] = pt
         .as_slice()
         .try_into()
         .map_err(|_| Error::Malformed("previous root length"))?;
     Ok((seq, Zeroizing::new(root)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::DeviceSecrets;
+    use crate::epoch::{open_genesis, open_next};
+    use crate::sign::Ed25519Transport;
+
+    #[test]
+    fn back_link_refuses_the_v10_suite() {
+        let did = "did:plc:chain";
+        let t = Ed25519Transport(ed25519_dalek::SigningKey::from_bytes(&[5; 32]));
+        let me = DeviceSecrets::generate().unwrap();
+        let (p0, n0) = open_genesis(did, &me, &t).unwrap();
+        let e0 = p0.assign_id("000000000000");
+        let (p1, n1) = open_next(did, &e0, &n0.record.public, &n0.members, &[], &me, &t).unwrap();
+        let e1 = p1.assign_id("000000000001");
+        assert_eq!(
+            backward_chain(&e1, &n1.record, "000000000000").unwrap().seq,
+            0
+        );
+        let mut bad = n1.record.clone();
+        bad.encrypted_prev_root = Some(
+            aead::encrypt(Suite::GcmExtended, &e1.data_key(), METADATA_AAD, e0.root()).unwrap(),
+        );
+        assert_eq!(
+            backward_chain(&e1, &bad, "000000000000").err(),
+            Some(Error::Unsupported(0x01))
+        );
+        let mut bad = n1.record.clone();
+        bad.encrypted_prev_seq =
+            Some(aead::encrypt(Suite::GcmExtended, &e1.data_key(), METADATA_AAD, b"0").unwrap());
+        assert_eq!(
+            backward_chain(&e1, &bad, "000000000000").err(),
+            Some(Error::Unsupported(0x01))
+        );
+    }
 }

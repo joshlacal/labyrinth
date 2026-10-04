@@ -9,7 +9,7 @@
 
 use zeroize::Zeroizing;
 
-use crate::aead;
+use crate::aead::{self, Suite};
 use crate::encoding::{hex, kdf32, minos_salt};
 use crate::mek::Mek;
 use crate::padding::{pad, unpad};
@@ -195,7 +195,7 @@ pub fn open_sender(sealed: &SealedMessage, thread_id: &str, mek: &Mek) -> Result
         thread_id,
         sealed.timestamp,
     );
-    let padded = Zeroizing::new(aead::decrypt(&key, &aad, ct)?);
+    let padded = Zeroizing::new(aead::decrypt_suite(Suite::DndkGcm, &key, &aad, ct)?);
     unpad(&padded)
 }
 
@@ -267,5 +267,37 @@ mod tests {
         let k = sender_message_key(&mek, "ab", "m1", 42);
         let info = b"minos.kdf.mek.single_message_key:;message_id=m1;thread_id=6162;timestamp=42";
         assert_eq!(*k, kdf32(mek.secret(), Some(&minos_salt()), info));
+    }
+
+    #[test]
+    fn sender_messages_refuse_the_v10_suite() {
+        let t = crate::sign::Ed25519Transport(ed25519_dalek::SigningKey::from_bytes(&[3; 32]));
+        let mek = Mek::generate(&[[1; 32]]).unwrap();
+        let sealed = seal_sender(&mek, "t", "m", 5, b"hi", &t).unwrap();
+        assert_eq!(open_sender(&sealed, "t", &mek).unwrap(), b"hi");
+        // Same key, AAD and a valid signature, but sealed under suite 0x01.
+        let key = sender_message_key(&mek, "t", "m", 5);
+        let aad = sender_aad(mek.id(), "m", &sealed.sender_transport_pub, "t", 5);
+        let ct = aead::encrypt(Suite::GcmExtended, &key, &aad, &pad(b"hi")).unwrap();
+        let sig = t.sign_transport(&[MESSAGE_SIG_PREFIX, &ct].concat());
+        let mut down = sealed.clone();
+        down.signed_enc_message = [sig.as_slice(), &ct].concat();
+        assert_eq!(open_sender(&down, "t", &mek), Err(Error::Unsupported(0x01)));
+    }
+
+    #[test]
+    fn legacy_owner_messages_still_accept_the_v10_suite() {
+        let root = [5u8; 32];
+        let key = owner_message_key(&root, 2, "th");
+        let m = OwnerMessage {
+            thread_id: "th".into(),
+            message_id: "m".into(),
+            timestamp: 1,
+            epoch_seq: 2,
+            version: 3,
+            encrypted: aead::encrypt(Suite::GcmExtended, &key, &owner_aad("th"), &pad(b"old"))
+                .unwrap(),
+        };
+        assert_eq!(open_owner(&root, &m).unwrap(), b"old");
     }
 }

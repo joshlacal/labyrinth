@@ -29,7 +29,12 @@ pub fn wrap_code(prf_output: &[u8], code: &RecoveryCode) -> Result<Vec<u8>> {
 
 /// Inverse of [`wrap_code`]; the result is parsed strictly (valid ECC).
 pub fn unwrap_code(prf_output: &[u8], wrapped: &[u8]) -> Result<RecoveryCode> {
-    let pt = Zeroizing::new(aead::decrypt(&wrap_key(prf_output), WRAP_AAD, wrapped)?);
+    let pt = Zeroizing::new(aead::decrypt_suite(
+        aead::Suite::DndkGcm,
+        &wrap_key(prf_output),
+        WRAP_AAD,
+        wrapped,
+    )?);
     let s = core::str::from_utf8(&pt).map_err(|_| crate::Error::BadRecoveryCode)?;
     RecoveryCode::parse(s)
 }
@@ -47,5 +52,21 @@ mod tests {
         let mut bad = w.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert!(unwrap_code(&[1u8; 32], &bad).is_err());
+    }
+
+    #[test]
+    fn wrap_refuses_the_v10_suite() {
+        let code = RecoveryCode::generate().unwrap();
+        let w = aead::encrypt(
+            aead::Suite::GcmExtended,
+            &wrap_key(&[1u8; 32]),
+            WRAP_AAD,
+            code.as_str().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            unwrap_code(&[1u8; 32], &w).err(),
+            Some(crate::Error::Unsupported(0x01))
+        );
     }
 }

@@ -16,7 +16,7 @@ pub use otc_payload::OtcPayload;
 use base64::Engine as _;
 use zeroize::Zeroizing;
 
-use crate::aead;
+use crate::aead::{self, Suite};
 use crate::device::{DevicePublic, DeviceSecrets};
 use crate::encoding::b64_decimal;
 use crate::epoch::{
@@ -156,7 +156,7 @@ pub fn find_code(
 }
 
 fn open32(key: &[u8; 32], aad: &[u8], ct: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-    let pt = Zeroizing::new(aead::decrypt(key, aad, ct)?);
+    let pt = Zeroizing::new(aead::decrypt_suite(Suite::DndkGcm, key, aad, ct)?);
     let mut out = Zeroizing::new([0u8; 32]);
     if pt.len() != 32 {
         return Err(Error::Malformed("virtual device field length"));
@@ -195,7 +195,8 @@ pub fn open(record: &VirtualDeviceRecord, code: &RecoveryCode, did: &str) -> Res
         &record.encrypted_mailbox_root_salt,
     )?;
     let root = open32(&key, aad::EPOCH_ROOT, &record.encrypted_epoch_root_key)?;
-    let seq_b64 = Zeroizing::new(aead::decrypt(
+    let seq_b64 = Zeroizing::new(aead::decrypt_suite(
+        Suite::DndkGcm,
         &key,
         aad::EPOCH_SEQ,
         &record.encrypted_epoch_number,
@@ -311,5 +312,26 @@ mod tests {
         public.verify().unwrap();
         verify_member(&r.epoch, &member).unwrap();
         assert_ne!(dev.orf.to_bytes(), r.device.orf.to_bytes());
+    }
+
+    #[test]
+    fn bundle_fields_refuse_the_v10_suite() {
+        let did = "did:plc:vdev";
+        let (me, epoch, code) = setup();
+        let (rec, _, _) = create(did, &code, &me, &epoch, &[6u8; 32], Mechanism::Code).unwrap();
+        let (_, key) = code.derive(did);
+        let mut bad = rec.clone();
+        bad.encrypted_device_key_priv = aead::encrypt(
+            Suite::GcmExtended,
+            &key,
+            aad::DEVICE_KEY,
+            &me.device_key.to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(open(&bad, &code, did).err(), Some(Error::Unsupported(0x01)));
+        let mut bad = rec.clone();
+        bad.encrypted_epoch_number =
+            aead::encrypt(Suite::GcmExtended, &key, aad::EPOCH_SEQ, b"Mg==").unwrap();
+        assert_eq!(open(&bad, &code, did).err(), Some(Error::Unsupported(0x01)));
     }
 }

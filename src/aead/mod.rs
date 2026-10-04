@@ -66,11 +66,34 @@ pub fn seal(key: &[u8; 32], aad: &[u8], pt: &[u8]) -> crate::Result<Vec<u8>> {
 }
 
 /// Decrypt any supported suite, dispatching on the first byte.
+///
+/// Only Labyrinth 1.0 owner messages may legitimately carry
+/// [`Suite::GcmExtended`]; every object this crate seals on a v1.1 path
+/// must be opened with [`decrypt_suite`] so a ciphertext relabelled to the
+/// weaker suite is refused.
 pub fn decrypt(key: &[u8; 32], aad: &[u8], ct: &[u8]) -> crate::Result<Vec<u8>> {
-    let (&suite, rest) = ct
-        .split_first()
-        .ok_or(Error::Malformed("empty ciphertext"))?;
-    match Suite::from_byte(suite)? {
+    let suite = *ct.first().ok_or(Error::Malformed("empty ciphertext"))?;
+    decrypt_as(Suite::from_byte(suite)?, key, aad, ct)
+}
+
+/// Decrypt a ciphertext that must use `expected`; any other suite byte
+/// fails with [`Error::Unsupported`] before any key is used.
+pub fn decrypt_suite(
+    expected: Suite,
+    key: &[u8; 32],
+    aad: &[u8],
+    ct: &[u8],
+) -> crate::Result<Vec<u8>> {
+    let suite = *ct.first().ok_or(Error::Malformed("empty ciphertext"))?;
+    if suite != expected as u8 {
+        return Err(Error::Unsupported(suite));
+    }
+    decrypt_as(expected, key, aad, ct)
+}
+
+fn decrypt_as(suite: Suite, key: &[u8; 32], aad: &[u8], ct: &[u8]) -> crate::Result<Vec<u8>> {
+    let rest = &ct[1..];
+    match suite {
         Suite::GcmExtended => {
             let (nonce, body) = rest
                 .split_first_chunk::<{ gcm_extended::NONCE_LEN }>()
@@ -155,6 +178,25 @@ mod tests {
         let mut ext = encrypt(Suite::GcmExtended, &KEY, b"", b"x").unwrap();
         ext[0] = 0x02;
         assert!(decrypt(&KEY, b"", &ext).is_err());
+    }
+
+    #[test]
+    fn decrypt_suite_pins_the_suite() {
+        let ext = encrypt(Suite::GcmExtended, &KEY, b"a", b"x").unwrap();
+        let dndk = seal(&KEY, b"a", b"x").unwrap();
+        assert_eq!(
+            decrypt_suite(Suite::DndkGcm, &KEY, b"a", &ext),
+            Err(Error::Unsupported(0x01))
+        );
+        assert_eq!(
+            decrypt_suite(Suite::DndkGcm, &KEY, b"a", &dndk).unwrap(),
+            b"x"
+        );
+        assert_eq!(
+            decrypt_suite(Suite::GcmExtended, &KEY, b"a", &dndk),
+            Err(Error::Unsupported(0x02))
+        );
+        assert!(decrypt_suite(Suite::DndkGcm, &KEY, b"a", &[]).is_err());
     }
 
     #[test]
