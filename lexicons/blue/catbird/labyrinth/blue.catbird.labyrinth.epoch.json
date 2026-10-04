@@ -10,6 +10,7 @@
         "type": "object",
         "required": [
           "public",
+          "openedBy",
           "createdAt"
         ],
         "properties": {
@@ -19,22 +20,22 @@
           },
           "encryptedPreviousEpochNumber": {
             "type": "bytes",
-            "description": "encrypt(epochDataStorageKey, 'epoch_data_metadata', decimal(prev seq)).",
+            "description": "encrypt(epochDataStorageKey, 'epoch_data_metadata', decimal(prev seq)). Absent for epoch 0.",
             "maxLength": 128
           },
           "encryptedPreviousEpochRootKey": {
             "type": "bytes",
-            "description": "encrypt(epochDataStorageKey, 'epoch_data_metadata', prev root).",
+            "description": "encrypt(epochDataStorageKey, 'epoch_data_metadata', prev root). Absent for epoch 0.",
             "maxLength": 128
           },
           "openedBy": {
             "type": "bytes",
             "description": "deviceKeyPubkey of the device that opened the epoch (its epochStorageAuthKey authenticates the entropy).",
-            "maxLength": 32
+            "maxLength": 32,
+            "minLength": 32
           },
           "createdAt": {
             "type": "string",
-            "description": "",
             "format": "datetime"
           }
         }

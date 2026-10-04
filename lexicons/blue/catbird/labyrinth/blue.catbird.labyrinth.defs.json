@@ -23,37 +23,44 @@
         "authPubkey": {
           "type": "bytes",
           "description": "Hawk auth public key (X25519, 32 bytes).",
-          "maxLength": 32
+          "maxLength": 32,
+          "minLength": 32
         },
         "encryptionPubkey": {
           "type": "bytes",
           "description": "Hawk encryption public key: X25519(32) || ML-KEM-768 ek(1184).",
-          "maxLength": 1216
+          "maxLength": 1216,
+          "minLength": 1216
         },
         "signingPubkey": {
           "type": "bytes",
           "description": "XEdDSA mailbox signing public key (32 bytes).",
-          "maxLength": 32
+          "maxLength": 32,
+          "minLength": 32
         },
         "previousEpochHead": {
           "type": "bytes",
           "description": "Head of epoch N-1; absent for epoch 0.",
-          "maxLength": 32
+          "maxLength": 32,
+          "minLength": 32
         },
         "epochHead": {
           "type": "bytes",
           "description": "sha256 epoch head (SPEC \u00a75.3).",
-          "maxLength": 32
+          "maxLength": 32,
+          "minLength": 32
         },
         "selfSig": {
           "type": "bytes",
           "description": "XEdDSA by this epoch's signing key over 'minos.unstructured_signature.epoch_self:' || head.",
-          "maxLength": 64
+          "maxLength": 64,
+          "minLength": 64
         },
         "prevSig": {
           "type": "bytes",
           "description": "XEdDSA by the previous epoch's signing key over 'minos.unstructured_signature.epoch_prev:' || head.",
-          "maxLength": 64
+          "maxLength": 64,
+          "minLength": 64
         },
         "attestation": {
           "type": "ref",
@@ -72,12 +79,14 @@
         "transportPubkey": {
           "type": "bytes",
           "description": "Ed25519 public key of the attesting chat device.",
-          "maxLength": 32
+          "maxLength": 32,
+          "minLength": 32
         },
         "sig": {
           "type": "bytes",
           "description": "Ed25519 signature.",
-          "maxLength": 64
+          "maxLength": 64,
+          "minLength": 64
         }
       }
     },
@@ -105,17 +114,20 @@
         "mekId": {
           "type": "bytes",
           "description": "12-byte MEK id.",
-          "maxLength": 12
+          "maxLength": 12,
+          "minLength": 12
         },
         "senderTransportPubkey": {
           "type": "bytes",
           "description": "Sender chat device Ed25519 key.",
-          "maxLength": 32
+          "maxLength": 32,
+          "minLength": 32
         },
         "signedEncMessage": {
           "type": "bytes",
           "description": "Ed25519 sig(64) || suite-tagged AEAD ciphertext of the padded frame.",
-          "maxLength": 262144
+          "maxLength": 262144,
+          "minLength": 64
         }
       }
     },
@@ -153,8 +165,9 @@
         },
         "version": {
           "type": "integer",
-          "description": "Cipher version; 3.",
-          "minimum": 3
+          "description": "Cipher version. Writers use 3; readers also accept 0, 2 and 4 (SPEC \u00a77.1).",
+          "minimum": 0,
+          "maximum": 4
         },
         "encrypted": {
           "type": "bytes",
@@ -179,7 +192,8 @@
         "recipientEpochHead": {
           "type": "bytes",
           "description": "Head of the recipient epoch the MEK is encrypted to.",
-          "maxLength": 32
+          "maxLength": 32,
+          "minLength": 32
         },
         "ciphertext": {
           "type": "bytes",

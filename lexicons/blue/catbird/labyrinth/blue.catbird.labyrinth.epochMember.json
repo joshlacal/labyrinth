@@ -4,7 +4,7 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "Membership of one device in one epoch (SPEC \u00a75.4-5.5). rkey = '<12-digit epoch>-<hex deviceKeyPubkey>'. Separate from the epoch record so adding a device never rewrites shared state.",
+      "description": "Membership of one device in one epoch (SPEC \u00a75.4-5.5). rkey = '<12-digit epoch>-<hex deviceKeyPubkey>'. Separate from the epoch record so adding a device never rewrites shared state. Immutable.",
       "key": "any",
       "record": {
         "type": "object",
@@ -17,18 +17,20 @@
         "properties": {
           "epochNumber": {
             "type": "integer",
-            "description": "",
+            "description": "Sequence number of the epoch.",
             "minimum": 0
           },
           "deviceKeyPubkey": {
             "type": "bytes",
-            "description": "",
-            "maxLength": 32
+            "description": "The member device's deviceKeyPubkey.",
+            "maxLength": 32,
+            "minLength": 32
           },
           "deviceMac": {
             "type": "bytes",
             "description": "HMAC(epochDeviceMacKey, deviceKeyPubkey).",
-            "maxLength": 32
+            "maxLength": 32,
+            "minLength": 32
           },
           "encryptedEntropy": {
             "type": "bytes",
@@ -37,7 +39,6 @@
           },
           "createdAt": {
             "type": "string",
-            "description": "",
             "format": "datetime"
           }
         }

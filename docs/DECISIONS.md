@@ -50,3 +50,16 @@ This log records choices where the Labyrinth whitepaper is silent, or where it's
 Chose: bind the thread id into MEK AADs ([CB-24]) and restrict transport-MEK reuse to its minting device ([CB-23]) (provisional). Because: a MEK record's `threadId` was otherwise unauthenticated, and the reuse rule's "authenticated to the latest epoch keys" has no epoch to point at for a transport MEK. Rejected: paper-exact AAD plus an equality check against the caller's thread (a backend could still rewrite both consistently); letting any reader reuse a transport MEK (rule 2 would be vacuous).
 Owner-mode records still leave `messageId` and `timestamp` unauthenticated, as in the paper (SPEC §7.1).
 Reversible until: merge of `labyrinth-1.1`. Override by: deleting the `;thread_id=` suffix in `src/mek/distribute.rs::aad`, and changing `Mek::reusable_for`.
+
+## 2026-10-04 · labyrinth · Record layer and lexicon reconciliation
+Chose (provisional): reconcile the draft lexicons with the protocol structs so every record round-trips, and pin these record-shape choices:
+- `mek#labyrinthSender` carries the sender's full `senderEpoch` (`defs#epochPublic`). Readers need the sender's Hawk auth key for the epoch that sealed the MEK, and the public `mailboxKeys` record only shows the *latest* epoch; the embedded copy is self-authenticating (head, self signature, [CB-18] attestation). Cost: about 1.6 KB per MEK record.
+- `mek.recipients` max 512 (was 700): one recipient entry is about 1.65 KB of JSON, so 700 overran the 1 MB write cap.
+- `virtualDevice` gains a required `vdeviceId` (equal to its rkey) so the record is self-contained; `mechanism` is required. `device.virtual` and `epoch.openedBy` are required. `ownerBatch` gains a required top-level `threadId` (one thread per batch) so stores can list by thread.
+- `ownerMessage.version` accepts 0–4 (readers decrypt 0/2/4), fixed-size byte fields carry `minLength = maxLength`, and empty `description` strings are gone.
+- Bytes serialize as `{"$bytes": base64-no-pad}` under human-readable serializers and raw bytes otherwise (DAG-CBOR).
+Because: the round-trip test (`tests/lexicon_records.rs`) validates every emitted record against the lexicon JSON. Rejected: looking up historical sender epochs from the sender's personal mailbox (not readable by other members under Spaces); per-item thread ids only in owner batches (forces stores to scan every batch).
+Reversible until: merge of `labyrinth-1.1` / Spaces GA. Override by: editing `lexicons/` and `src/records/` together; the round-trip test pins them to each other.
+
+## 2026-10-04 · labyrinth · Storage traits are synchronous
+Chose (provisional): `store::{MailboxStore, ThreadStore, MailboxDirectory}` are plain synchronous traits returning `Result`; a store handle is bound to one authenticated DID; epochs are created atomically with their initial members (`create_epoch(epoch, members)`, one `applyWrites`). Because: the crate stays runtime-free, and a crash between "epoch created" and "members written" would otherwise brick the mailbox. Rejected: `async fn` in traits (forces a runtime choice on UniFFI/WASM consumers and is not object-safe without boxing). Reversible until: merge of `labyrinth-1.1`. Override by: adding async twins of the traits; the client logic is unchanged.

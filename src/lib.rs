@@ -16,6 +16,7 @@ pub mod message;
 pub mod orf;
 pub mod otc;
 pub mod padding;
+pub mod records;
 pub mod recovery_code;
 pub mod sign;
 pub mod store;

@@ -25,11 +25,11 @@
             "items": {
               "type": "ref",
               "ref": "blue.catbird.labyrinth.defs#sealedMessage"
-            }
+            },
+            "minLength": 1
           },
           "createdAt": {
             "type": "string",
-            "description": "",
             "format": "datetime"
           }
         }

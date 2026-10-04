@@ -17,8 +17,16 @@ pub enum Error {
     BadRecoveryCode,
     #[error("unsupported version or suite: {0}")]
     Unsupported(u8),
-    #[error("store conflict: expected head changed")]
+    #[error("store conflict: record already exists")]
     Conflict,
+    #[error("store refused access")]
+    Forbidden,
+    #[error("storage backend error: {0}")]
+    Backend(String),
+    #[error("epoch chain truncated: published epoch {published}, reached {reached}")]
+    EpochTruncated { published: u64, reached: u64 },
+    #[error("epoch is not attested by one of the account's chat devices")]
+    Unattested,
     #[error("not found: {0}")]
     NotFound(&'static str),
     #[error("not a recipient of this MEK")]

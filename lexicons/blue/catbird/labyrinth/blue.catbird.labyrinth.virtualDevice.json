@@ -4,11 +4,12 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "A recovery bundle (SPEC \u00a76.2). rkey = hex(vdeviceId). Every secret field is AEAD-sealed under vdeviceDecryptionKey with the paper's AAD strings.",
+      "description": "A recovery bundle (SPEC \u00a76.2). rkey = hex(vdeviceId). Every encrypted* field is AEAD-sealed under vdeviceDecryptionKey with the paper's AAD strings. Immutable.",
       "key": "any",
       "record": {
         "type": "object",
         "required": [
+          "vdeviceId",
           "deviceKeyPubkey",
           "epochStorageKeyPubkey",
           "epochStorageKeySig",
@@ -18,53 +19,63 @@
           "encryptedMailboxRootSalt",
           "encryptedEpochRootKey",
           "encryptedEpochNumber",
+          "mechanism",
           "createdAt"
         ],
         "properties": {
+          "vdeviceId": {
+            "type": "bytes",
+            "description": "First 16 bytes of the recovery-code KDF output; equals the rkey.",
+            "minLength": 16,
+            "maxLength": 16
+          },
           "encryptedDeviceKeyPriv": {
             "type": "bytes",
-            "description": "",
+            "description": "Sealed with AAD 'virtual_device:virtual_device_private_key'.",
             "maxLength": 256
           },
           "encryptedEpochStorageKeyPriv": {
             "type": "bytes",
-            "description": "",
+            "description": "Sealed with AAD 'virtual_device:epoch_storage_private_key'.",
             "maxLength": 256
           },
           "encryptedOrfClientState": {
             "type": "bytes",
-            "description": "",
+            "description": "Sealed with AAD 'virtual_device:ocmf_client_state'.",
             "maxLength": 256
           },
           "encryptedMailboxRootSalt": {
             "type": "bytes",
-            "description": "",
+            "description": "Sealed with AAD 'virtual_device:mailbox_root_key'.",
             "maxLength": 256
           },
           "encryptedEpochRootKey": {
             "type": "bytes",
-            "description": "",
+            "description": "Sealed with AAD 'virtual_device:epoch_root_key'.",
             "maxLength": 256
           },
           "encryptedEpochNumber": {
             "type": "bytes",
-            "description": "",
+            "description": "Sealed base64(decimal(epoch number)) with AAD 'virtual_device:epoch_anon_id'.",
             "maxLength": 256
           },
           "deviceKeyPubkey": {
             "type": "bytes",
-            "description": "",
-            "maxLength": 32
+            "description": "The virtual device's deviceKeyPubkey.",
+            "maxLength": 32,
+            "minLength": 32
           },
           "epochStorageKeyPubkey": {
             "type": "bytes",
-            "description": "",
-            "maxLength": 32
+            "description": "The virtual device's epochStorageKeyPubkey.",
+            "maxLength": 32,
+            "minLength": 32
           },
           "epochStorageKeySig": {
             "type": "bytes",
-            "description": "",
-            "maxLength": 64
+            "description": "pk_sign(deviceKey, 0x30, epochStorageKeyPubkey).",
+            "maxLength": 64,
+            "minLength": 64
           },
           "mechanism": {
             "type": "string",
@@ -78,7 +89,7 @@
           },
           "passkeyWrappedCode": {
             "type": "bytes",
-            "description": "[CB-13] Recovery code sealed under a WebAuthn PRF-derived key.",
+            "description": "[CB-13] Recovery code sealed under a WebAuthn PRF-derived key. Present iff passkeyCredentialId is.",
             "maxLength": 256
           },
           "passkeyCredentialId": {
@@ -88,7 +99,6 @@
           },
           "createdAt": {
             "type": "string",
-            "description": "",
             "format": "datetime"
           }
         }

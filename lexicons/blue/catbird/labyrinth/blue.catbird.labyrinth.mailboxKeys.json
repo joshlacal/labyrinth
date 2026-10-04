@@ -27,7 +27,6 @@
           },
           "updatedAt": {
             "type": "string",
-            "description": "",
             "format": "datetime"
           }
         }

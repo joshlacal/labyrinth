@@ -24,13 +24,15 @@
           },
           "mekId": {
             "type": "bytes",
-            "description": "",
-            "maxLength": 12
+            "description": "kdf(mek, MINOS_SALT, 'minos.kdf.mek.mek_id:recipient_roster_hash=' || hex(rosterHash), 12).",
+            "maxLength": 12,
+            "minLength": 12
           },
           "rosterHash": {
             "type": "bytes",
-            "description": "",
-            "maxLength": 32
+            "description": "sha256('mek_recipient_list:' || sorted hex recipient epoch heads).",
+            "maxLength": 32,
+            "minLength": 32
           },
           "sender": {
             "type": "union",
@@ -42,15 +44,15 @@
           },
           "recipients": {
             "type": "array",
-            "maxLength": 700,
+            "maxLength": 512,
             "items": {
               "type": "ref",
               "ref": "blue.catbird.labyrinth.defs#mekRecipient"
-            }
+            },
+            "description": "One entry per roster member, the sender included ([CB-16]). At most 512 so the record stays under the 1 MB write cap."
           },
           "createdAt": {
             "type": "string",
-            "description": "",
             "format": "datetime"
           }
         }
@@ -60,20 +62,28 @@
       "type": "object",
       "required": [
         "did",
-        "senderEpochHead"
+        "senderEpochHead",
+        "senderEpoch"
       ],
       "properties": {
         "did": {
           "type": "string",
-          "description": "",
+          "description": "Sender account; must be the DID of the repo holding this record.",
           "format": "did"
         },
         "senderEpochHead": {
           "type": "bytes",
-          "description": "",
-          "maxLength": 32
+          "description": "Head of the sender epoch whose auth key sealed the MEK.",
+          "maxLength": 32,
+          "minLength": 32
+        },
+        "senderEpoch": {
+          "type": "ref",
+          "ref": "blue.catbird.labyrinth.defs#epochPublic",
+          "description": "The sender's epoch public data (head = senderEpochHead), so readers can authenticate MEKs from epochs the sender has since rotated past."
         }
-      }
+      },
+      "description": "An enrolled sender, authenticated by its mailbox auth key."
     },
     "transportSender": {
       "type": "object",
@@ -85,20 +95,24 @@
       "properties": {
         "transportPubkey": {
           "type": "bytes",
-          "description": "",
-          "maxLength": 32
+          "description": "Sender chat device Ed25519 key.",
+          "maxLength": 32,
+          "minLength": 32
         },
         "ephemeralAuthPubkey": {
           "type": "bytes",
-          "description": "",
-          "maxLength": 32
+          "description": "Ephemeral Hawk auth key (X25519).",
+          "maxLength": 32,
+          "minLength": 32
         },
         "sig": {
           "type": "bytes",
           "description": "Ed25519 over 'minos.structured_signature.mek_distribution.ephemeral_auth:k=<hex>;mek_id=<hex>'.",
-          "maxLength": 64
+          "maxLength": 64,
+          "minLength": 64
         }
-      }
+      },
+      "description": "A sender that is not enrolled, authenticated by its chat transport key."
     }
   }
 }

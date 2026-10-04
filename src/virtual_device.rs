@@ -56,6 +56,17 @@ impl Mechanism {
             Self::Otc => "otc",
         }
     }
+
+    /// Inverse of [`as_str`](Self::as_str).
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "code" => Ok(Self::Code),
+            "passkey" => Ok(Self::Passkey),
+            "keychain" => Ok(Self::Keychain),
+            "otc" => Ok(Self::Otc),
+            _ => Err(Error::Malformed("unknown recovery mechanism")),
+        }
+    }
 }
 
 /// The published bundle (`blue.catbird.labyrinth.virtualDevice`, rkey =
