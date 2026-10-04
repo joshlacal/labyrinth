@@ -169,13 +169,19 @@ impl Labyrinth {
 
     /// SPEC §7.4: the sender key must be one of the author's chat devices,
     /// then the MEK opens and the signature and AEAD verify.
+    ///
+    /// A key of a device that has left the MLS group is accepted only for a
+    /// message timestamped before its removal ([CB-27]).
     fn open_sealed(&mut self, thread_id: &str, author: &str, s: &SealedMessage) -> Result<Vec<u8>> {
-        verify_sender_device(s, &self.b.directory.historical_transport_keys(author)?)?;
-        let mek = self.mek_for(thread_id, &s.mek_id)?;
+        verify_sender_device(s, &self.transport_keys(author, Some(s.timestamp))?)?;
+        let mek = self.mek_for(thread_id, &s.mek_id, s.timestamp)?;
         open_sender(s, thread_id, &mek)
     }
 
-    fn mek_for(&mut self, thread_id: &str, mek_id: &[u8; 12]) -> Result<Mek> {
+    /// The MEK `mek_id`, from the cache or opened from the thread's MEK
+    /// records. A MEK record's sender key must have been valid at `at_ms`,
+    /// the timestamp of the first message that needed it.
+    fn mek_for(&mut self, thread_id: &str, mek_id: &[u8; 12], at_ms: u64) -> Result<Mek> {
         if let Some(m) = self
             .meks
             .get(thread_id)
@@ -185,7 +191,7 @@ impl Labyrinth {
         }
         let mut err = Error::NotFound("mek");
         for c in self.b.threads.find_meks(thread_id, mek_id)? {
-            match self.open_mek_record(thread_id, &c) {
+            match self.open_mek_record(thread_id, &c, at_ms) {
                 Ok(m) => {
                     self.meks
                         .entry(thread_id.to_owned())
@@ -201,7 +207,12 @@ impl Labyrinth {
 
     /// Opens a MEK distribution under whichever of my epochs it names,
     /// after checking the record's author and [CB-18] for the sender.
-    fn open_mek_record(&mut self, thread_id: &str, c: &Stored<MekDistribution>) -> Result<Mek> {
+    fn open_mek_record(
+        &mut self,
+        thread_id: &str,
+        c: &Stored<MekDistribution>,
+        at_ms: u64,
+    ) -> Result<Mek> {
         let (rec, sender_epoch) = c.value.to_record()?;
         if rec.thread_id != thread_id {
             return Err(Error::Malformed("MEK filed under another thread"));
@@ -211,11 +222,13 @@ impl Labyrinth {
                 if *did != c.author {
                     return Err(Error::Malformed("MEK sender is not the record author"));
                 }
-                self.check_attested(did, epoch, true)?;
+                self.check_attested(did, epoch, Some(at_ms))?;
             }
             (MekSender::Transport { transport_pub, .. }, _) => {
-                let keys = self.b.directory.historical_transport_keys(&c.author)?;
-                if !keys.contains(transport_pub) {
+                if !self
+                    .transport_keys(&c.author, Some(at_ms))?
+                    .contains(transport_pub)
+                {
                     return Err(Error::Unattested);
                 }
             }

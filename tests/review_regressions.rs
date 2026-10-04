@@ -12,7 +12,7 @@ use labyrinth::records::{
 };
 use labyrinth::sign::{Ed25519Transport, XVerifyingKey};
 use labyrinth::store::memory::{MemoryBackend, MemoryDirectory, MemoryMailbox};
-use labyrinth::store::{MailboxDirectory, MailboxStore, Stored, TimeRange};
+use labyrinth::store::{ChatDeviceKey, MailboxDirectory, MailboxStore, Stored, TimeRange};
 
 const A: &str = "did:plc:alice";
 const B: &str = "did:plc:bob";
@@ -234,11 +234,8 @@ impl MailboxDirectory for Stale {
     fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
         self.inner.epoch(did, seq)
     }
-    fn device_transport_keys(&self, d: &str) -> labyrinth::Result<Vec<[u8; 32]>> {
+    fn device_transport_keys(&self, d: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
         self.inner.device_transport_keys(d)
-    }
-    fn historical_transport_keys(&self, d: &str) -> labyrinth::Result<Vec<[u8; 32]>> {
-        self.inner.historical_transport_keys(d)
     }
 }
 
@@ -275,7 +272,7 @@ fn stale_head_replay_after_contact_is_rejected() {
         .unwrap();
     bob.flush().unwrap();
     // ... then Alice's phone is stolen and revoked (epoch 1) ...
-    net.remove_chat_device(A, tpub(2));
+    net.remove_chat_device(A, tpub(2), 4400);
     laptop
         .revoke_device(&phone.device_public().device_key_pub)
         .unwrap();
@@ -362,11 +359,8 @@ impl MailboxDirectory for HidesEpoch {
         }
         self.inner.epoch(did, seq)
     }
-    fn device_transport_keys(&self, d: &str) -> labyrinth::Result<Vec<[u8; 32]>> {
+    fn device_transport_keys(&self, d: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
         self.inner.device_transport_keys(d)
-    }
-    fn historical_transport_keys(&self, d: &str) -> labyrinth::Result<Vec<[u8; 32]>> {
-        self.inner.historical_transport_keys(d)
     }
 }
 
@@ -434,4 +428,46 @@ fn pins_reject_rollback_and_advance_only_through_a_verified_chain() {
             offered: 0
         }
     );
+}
+
+// ---- Design note [CB-27]: removed chat keys only vouch for older history ----
+
+#[test]
+fn removed_chat_key_is_accepted_only_before_its_removal() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    const C: &str = "did:plc:carol";
+    net.register_chat_device(A, tpub(1));
+    net.register_chat_device(C, tpub(3));
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let mut carol = Labyrinth::initialize(
+        C,
+        Box::new(signer(3)),
+        backends(&net, &clock, C, Box::new(net.mailbox(C))),
+    )
+    .unwrap();
+    let roster = phone.resolve_roster(&[A, C]).unwrap();
+    phone
+        .archive_outgoing("t", &roster, "early", 1000, b"early")
+        .unwrap();
+    net.remove_chat_device(A, tpub(1), 2000);
+    phone
+        .archive_outgoing("t", &roster, "late", 3000, b"late")
+        .unwrap();
+    // Residual risk: the timestamp is the sender's claim.
+    phone
+        .archive_outgoing("t", &roster, "backdated", 1500, b"backdated")
+        .unwrap();
+    phone.flush().unwrap();
+    let h = carol.load_thread("t", TimeRange::ALL).unwrap();
+    let ids: Vec<_> = h.messages.iter().map(|m| m.message_id.as_str()).collect();
+    assert_eq!(ids, ["early", "backdated"]);
+    assert_eq!(h.undecryptable.len(), 1);
+    assert_eq!(h.undecryptable[0].message_id, "late");
+    assert_eq!(h.undecryptable[0].error, Error::BadPublicKey);
 }

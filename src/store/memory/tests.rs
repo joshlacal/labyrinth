@@ -4,6 +4,7 @@ use crate::epoch::open_genesis;
 use crate::message::seal_owner;
 use crate::records::datetime_from_ms;
 use crate::sign::Ed25519Transport;
+use crate::store::{ChatDeviceKey, keys_valid_at};
 
 const ALICE: &str = "did:plc:alice";
 const BOB: &str = "did:plc:bob";
@@ -145,12 +146,21 @@ fn directory_tracks_current_and_removed_devices() {
     let b = MemoryBackend::new();
     b.register_chat_device(ALICE, [1; 32]);
     b.register_chat_device(ALICE, [2; 32]);
-    b.remove_chat_device(ALICE, [1; 32]);
+    b.remove_chat_device(ALICE, [1; 32], 500);
     let d = b.directory();
-    assert_eq!(d.device_transport_keys(ALICE).unwrap(), vec![[2; 32]]);
+    let keys = d.device_transport_keys(ALICE).unwrap();
     assert_eq!(
-        d.historical_transport_keys(ALICE).unwrap(),
-        vec![[2; 32], [1; 32]]
+        keys,
+        vec![
+            ChatDeviceKey::current([2; 32]),
+            ChatDeviceKey {
+                key: [1; 32],
+                removed_at: Some(500)
+            }
+        ]
     );
+    assert_eq!(keys_valid_at(&keys, None), vec![[2; 32]]);
+    assert_eq!(keys_valid_at(&keys, Some(499)), vec![[2; 32], [1; 32]]);
+    assert_eq!(keys_valid_at(&keys, Some(500)), vec![[2; 32]]);
     assert!(d.latest(ALICE).unwrap().is_none());
 }

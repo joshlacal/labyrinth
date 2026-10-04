@@ -156,14 +156,48 @@ pub trait MailboxDirectory {
     /// verify the `prev_sig` chain from a pinned head to a newer one
     /// ([CB-29]).
     fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>>;
-    /// The DID's current MLS chat device transport keys ([CB-3]). Used to
-    /// accept an epoch before addressing a MEK to it ([CB-18]).
-    fn device_transport_keys(&self, did: &str) -> Result<Vec<[u8; 32]>>;
-    /// Every chat transport key the DID has registered, including removed
-    /// devices. Used when reading history, whose MEKs and messages may be
-    /// signed by devices that have since left ([CB-27]). Defaults to the
-    /// current set.
-    fn historical_transport_keys(&self, did: &str) -> Result<Vec<[u8; 32]>> {
-        self.device_transport_keys(did)
+    /// Every MLS chat device transport key ([CB-3]) the DID has
+    /// registered, each with the time it was removed (`None` while it is
+    /// still a current device).
+    ///
+    /// Addressing a MEK to an epoch requires its attestation key to be a
+    /// *current* device ([CB-18]). Reading history accepts a removed key
+    /// only for messages and MEKs timestamped before its removal ([CB-27]).
+    fn device_transport_keys(&self, did: &str) -> Result<Vec<ChatDeviceKey>>;
+}
+
+/// One chat device transport key in the MLS device view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatDeviceKey {
+    pub key: [u8; 32],
+    /// When the device left the MLS group (ms since the Unix epoch).
+    pub removed_at: Option<u64>,
+}
+
+impl ChatDeviceKey {
+    /// A current device.
+    pub fn current(key: [u8; 32]) -> Self {
+        Self {
+            key,
+            removed_at: None,
+        }
     }
+
+    pub fn is_current(&self) -> bool {
+        self.removed_at.is_none()
+    }
+
+    /// Whether this key may vouch for something timestamped `at_ms`:
+    /// always while current, otherwise only strictly before removal.
+    pub fn valid_at(&self, at_ms: u64) -> bool {
+        self.removed_at.is_none_or(|r| at_ms < r)
+    }
+}
+
+/// The keys of `keys` that are current (`at_ms = None`) or valid at `at_ms`.
+pub fn keys_valid_at(keys: &[ChatDeviceKey], at_ms: Option<u64>) -> Vec<[u8; 32]> {
+    keys.iter()
+        .filter(|k| at_ms.map_or(k.is_current(), |t| k.valid_at(t)))
+        .map(|k| k.key)
+        .collect()
 }

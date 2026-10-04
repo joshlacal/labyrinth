@@ -14,7 +14,7 @@ use labyrinth::records::{
 use labyrinth::recovery_code::ALPHABET;
 use labyrinth::sign::{Ed25519Transport, XVerifyingKey};
 use labyrinth::store::memory::{MemoryBackend, MemoryDirectory, MemoryMailbox};
-use labyrinth::store::{MailboxDirectory, MailboxStore, Stored, TimeRange};
+use labyrinth::store::{ChatDeviceKey, MailboxDirectory, MailboxStore, Stored, TimeRange};
 use labyrinth::virtual_device::Mechanism;
 
 const ALICE: &str = "did:plc:alice";
@@ -219,11 +219,8 @@ impl MailboxDirectory for Substituting {
     fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
         self.inner.epoch(did, seq)
     }
-    fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<[u8; 32]>> {
+    fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
         self.inner.device_transport_keys(did)
-    }
-    fn historical_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<[u8; 32]>> {
-        self.inner.historical_transport_keys(did)
     }
 }
 
@@ -267,7 +264,7 @@ fn full_lifecycle() {
     assert_eq!(got(&read(&mut carol)), w.expected(&before));
 
     // Alice's phone is lost: the laptop revokes it and rotates.
-    w.net.remove_chat_device(ALICE, transport_pub(1));
+    w.net.remove_chat_device(ALICE, transport_pub(1), w.ts + 1);
     let phone_key = phone.device_public().device_key_pub;
     let rot = laptop.revoke_device(&phone_key).unwrap();
     assert_eq!(rot.new_epoch, 1);

@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::{MailboxDirectory, MailboxStore, Stored, ThreadStore, TimeRange};
+use super::{ChatDeviceKey, MailboxDirectory, MailboxStore, Stored, ThreadStore, TimeRange};
 use crate::epoch::space_epoch_id;
 use crate::mailbox::EpochPublic;
 use crate::records::{
@@ -48,7 +48,8 @@ struct ThreadSpace {
 #[derive(Default)]
 struct ChatDevices {
     current: Vec<[u8; 32]>,
-    removed: Vec<[u8; 32]>,
+    /// Removed keys with their removal time (ms).
+    removed: Vec<([u8; 32], u64)>,
 }
 
 #[derive(Default)]
@@ -121,13 +122,14 @@ impl MemoryBackend {
         }
     }
 
-    /// Removes a chat device from the current MLS view (it stays historical).
-    pub fn remove_chat_device(&self, did: &str, transport_pub: [u8; 32]) {
+    /// Removes a chat device from the current MLS view at `removed_at_ms`
+    /// (it stays historical, valid for history before that time).
+    pub fn remove_chat_device(&self, did: &str, transport_pub: [u8; 32], removed_at_ms: u64) {
         let mut s = self.lock();
         let d = s.chat_devices.entry(did.to_owned()).or_default();
         d.current.retain(|k| *k != transport_pub);
-        if !d.removed.contains(&transport_pub) {
-            d.removed.push(transport_pub);
+        if !d.removed.iter().any(|(k, _)| *k == transport_pub) {
+            d.removed.push((transport_pub, removed_at_ms));
         }
     }
 
@@ -419,19 +421,20 @@ impl MailboxDirectory for MemoryDirectory {
             .transpose()
     }
 
-    fn device_transport_keys(&self, did: &str) -> Result<Vec<[u8; 32]>> {
+    fn device_transport_keys(&self, did: &str) -> Result<Vec<ChatDeviceKey>> {
         let s = self.backend.lock();
         Ok(s.chat_devices
             .get(did)
-            .map(|d| d.current.clone())
-            .unwrap_or_default())
-    }
-
-    fn historical_transport_keys(&self, did: &str) -> Result<Vec<[u8; 32]>> {
-        let s = self.backend.lock();
-        Ok(s.chat_devices
-            .get(did)
-            .map(|d| [d.current.as_slice(), &d.removed].concat())
+            .map(|d| {
+                d.current
+                    .iter()
+                    .map(|k| ChatDeviceKey::current(*k))
+                    .chain(d.removed.iter().map(|(k, at)| ChatDeviceKey {
+                        key: *k,
+                        removed_at: Some(*at),
+                    }))
+                    .collect()
+            })
             .unwrap_or_default())
     }
 }

@@ -42,7 +42,7 @@ use crate::mek::Mek;
 use crate::message::{OwnerMessage, SealedMessage};
 use crate::records::datetime_from_ms;
 use crate::sign::TransportSigner;
-use crate::store::{MailboxDirectory, MailboxStore, ThreadStore};
+use crate::store::{MailboxDirectory, MailboxStore, ThreadStore, keys_valid_at};
 use crate::{Error, Result};
 
 /// Wall-clock source (milliseconds since the Unix epoch) for `createdAt`.
@@ -166,14 +166,11 @@ impl Labyrinth {
     }
 
     /// Verifies `epoch` for `did` and checks [CB-18]: its attestation key is
-    /// one of the DID's chat devices (all ever registered if `historical`).
-    fn check_attested(&self, did: &str, epoch: &EpochPublic, historical: bool) -> Result<()> {
+    /// one of the DID's chat devices — a current one if `at_ms` is `None`,
+    /// otherwise one that had not been removed by `at_ms` ([CB-27]).
+    fn check_attested(&self, did: &str, epoch: &EpochPublic, at_ms: Option<u64>) -> Result<()> {
         epoch.verify(did, None)?;
-        let keys = if historical {
-            self.b.directory.historical_transport_keys(did)?
-        } else {
-            self.b.directory.device_transport_keys(did)?
-        };
+        let keys = self.transport_keys(did, at_ms)?;
         if keys.contains(&epoch.attestation.transport_public_key) {
             Ok(())
         } else {
@@ -181,11 +178,20 @@ impl Labyrinth {
         }
     }
 
+    /// `did`'s chat transport keys that are current (`at_ms = None`) or were
+    /// not yet removed at `at_ms` ([CB-27]).
+    fn transport_keys(&self, did: &str, at_ms: Option<u64>) -> Result<Vec<[u8; 32]>> {
+        Ok(keys_valid_at(
+            &self.b.directory.device_transport_keys(did)?,
+            at_ms,
+        ))
+    }
+
     /// [`check_attested`](Self::check_attested) against the DID's
     /// *current* chat devices, then the [CB-29] pin: the epoch a MEK is
     /// about to be addressed to.
     fn accept_for_addressing(&mut self, did: &str, epoch: &EpochPublic) -> Result<()> {
-        self.check_attested(did, epoch, false)?;
+        self.check_attested(did, epoch, None)?;
         self.pin_peer(did, epoch)
     }
 
