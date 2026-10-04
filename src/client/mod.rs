@@ -46,7 +46,7 @@ use crate::mek::Mek;
 use crate::message::{OwnerMessage, SealedMessage};
 use crate::records::datetime_from_ms;
 use crate::sign::TransportSigner;
-use crate::store::{MailboxDirectory, MailboxStore, ThreadStore, keys_valid_at};
+use crate::store::{MailboxDirectory, MailboxStore, ThreadStore, VouchAt, keys_valid_for};
 use crate::{Error, Result};
 
 /// Wall-clock source (milliseconds since the Unix epoch) for `createdAt`.
@@ -170,11 +170,12 @@ impl Labyrinth {
     }
 
     /// Verifies `epoch` for `did` and checks [CB-18]: its attestation key is
-    /// one of the DID's chat devices — a current one if `at_ms` is `None`,
-    /// otherwise one that had not been removed by `at_ms` ([CB-27]).
-    fn check_attested(&self, did: &str, epoch: &EpochPublic, at_ms: Option<u64>) -> Result<()> {
+    /// one of the DID's chat devices that may vouch at `at` — a current one
+    /// for [`VouchAt::Current`], otherwise one not yet revoked when the
+    /// record that carries the epoch was written ([CB-27]).
+    fn check_attested(&self, did: &str, epoch: &EpochPublic, at: VouchAt) -> Result<()> {
         epoch.verify(did, None)?;
-        let keys = self.transport_keys(did, at_ms)?;
+        let keys = self.transport_keys(did, None, at)?;
         if keys.contains(&epoch.attestation.transport_public_key) {
             Ok(())
         } else {
@@ -182,20 +183,29 @@ impl Labyrinth {
         }
     }
 
-    /// `did`'s chat transport keys that are current (`at_ms = None`) or were
-    /// not yet removed at `at_ms` ([CB-27]).
-    fn transport_keys(&self, did: &str, at_ms: Option<u64>) -> Result<Vec<[u8; 32]>> {
-        Ok(keys_valid_at(
-            &self.b.directory.device_transport_keys(did)?,
-            at_ms,
-        ))
+    /// `did`'s chat transport keys that may vouch for a record written at
+    /// `at` ([CB-27]). With `thread` set and a server stamp, the key must
+    /// also have had a leaf in that conversation at the stamp's chat seq
+    /// (when the directory reports the conversation's leaves).
+    fn transport_keys(
+        &self,
+        did: &str,
+        thread: Option<&str>,
+        at: VouchAt,
+    ) -> Result<Vec<[u8; 32]>> {
+        let keys = self.b.directory.device_transport_keys(did)?;
+        let leaves = match (thread, at) {
+            (Some(t), VouchAt::Server(_)) => self.b.directory.member_device_keys(t, did)?,
+            _ => None,
+        };
+        Ok(keys_valid_for(&keys, leaves.as_deref(), at))
     }
 
     /// [`check_attested`](Self::check_attested) against the DID's
     /// *current* chat devices, then the [CB-29] pin: the epoch a MEK is
     /// about to be addressed to.
     fn accept_for_addressing(&mut self, did: &str, epoch: &EpochPublic) -> Result<()> {
-        self.check_attested(did, epoch, None)?;
+        self.check_attested(did, epoch, VouchAt::Current)?;
         self.pin_peer(did, epoch)
     }
 

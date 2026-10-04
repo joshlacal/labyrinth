@@ -172,7 +172,6 @@ fn insider_message_id_collision_keeps_both_copies() {
     let net = MemoryBackend::new();
     let clock = TestClock::default();
     const M: &str = "did:plc:aaa-mallory"; // sorts before alice in this backend
-    const C: &str = "did:plc:carol";
     net.register_chat_device(A, tpub(1));
     net.register_chat_device(M, tpub(2));
     net.register_chat_device(C, tpub(3));
@@ -442,25 +441,31 @@ fn pins_reject_rollback_and_advance_only_through_a_verified_chain() {
 
 // ---- Design note [CB-27]: removed chat keys only vouch for older history ----
 
-#[test]
-fn removed_chat_key_is_accepted_only_before_its_removal() {
-    let net = MemoryBackend::new();
-    let clock = TestClock::default();
-    const C: &str = "did:plc:carol";
+/// Phone (Alice) and Carol on `net`; returns `(phone, carol)`.
+fn phone_and_carol(net: &MemoryBackend, clock: &TestClock) -> (Labyrinth, Labyrinth) {
     net.register_chat_device(A, tpub(1));
     net.register_chat_device(C, tpub(3));
-    let mut phone = Labyrinth::initialize(
-        A,
-        Box::new(signer(1)),
-        backends(&net, &clock, A, Box::new(net.mailbox(A))),
-    )
-    .unwrap();
-    let mut carol = Labyrinth::initialize(
-        C,
-        Box::new(signer(3)),
-        backends(&net, &clock, C, Box::new(net.mailbox(C))),
-    )
-    .unwrap();
+    let mk = |did: &str, seed: u8| {
+        Labyrinth::initialize(
+            did,
+            Box::new(signer(seed)),
+            backends(net, clock, did, Box::new(net.mailbox(did))),
+        )
+        .unwrap()
+    };
+    (mk(A, 1), mk(C, 3))
+}
+
+const C: &str = "did:plc:carol";
+
+/// Fallback without server order (the Space backend): the bound uses the
+/// sender's timestamp, so a removed device can still backdate. This is
+/// the residual risk SPEC §10 keeps for Space-stored threads.
+#[test]
+fn without_server_order_a_removed_key_is_bounded_by_sender_timestamps() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let (mut phone, mut carol) = phone_and_carol(&net, &clock);
     let roster = phone.resolve_roster(&[A, C]).unwrap();
     phone
         .archive_outgoing("t", &roster, "early", 1000, b"early")
@@ -479,6 +484,90 @@ fn removed_chat_key_is_accepted_only_before_its_removal() {
     assert_eq!(ids, ["early", "backdated"]);
     assert_eq!(h.undecryptable.len(), 1);
     assert_eq!(h.undecryptable[0].message_id, "late");
+    assert_eq!(h.undecryptable[0].error, Error::BadPublicKey);
+}
+
+/// With server order (mls-ds), the bound uses the server's receive time:
+/// the backdated message was received after the revocation and fails.
+#[test]
+fn with_server_order_a_removed_device_cannot_backdate() {
+    let net = MemoryBackend::new();
+    net.enable_server_order();
+    let clock = TestClock::default();
+    let (mut phone, mut carol) = phone_and_carol(&net, &clock);
+    let roster = phone.resolve_roster(&[A, C]).unwrap();
+    net.set_server_time(1000);
+    phone
+        .archive_outgoing("t", &roster, "early", 1000, b"early")
+        .unwrap();
+    phone.flush().unwrap();
+    net.remove_chat_device(A, tpub(1), 2000);
+    net.set_server_time(3000);
+    phone
+        .archive_outgoing("t", &roster, "late", 3000, b"late")
+        .unwrap();
+    phone
+        .archive_outgoing("t", &roster, "backdated", 1500, b"backdated")
+        .unwrap();
+    phone.flush().unwrap();
+    let h = carol.load_thread("t", TimeRange::ALL).unwrap();
+    let ids: Vec<_> = h.messages.iter().map(|m| m.message_id.as_str()).collect();
+    assert_eq!(ids, ["early"]);
+    let bad: Vec<_> = h
+        .undecryptable
+        .iter()
+        .map(|u| (u.message_id.as_str(), u.error.clone()))
+        .collect();
+    assert_eq!(
+        bad,
+        [
+            ("backdated", Error::BadPublicKey),
+            ("late", Error::BadPublicKey)
+        ]
+    );
+}
+
+/// A device removed from one conversation's MLS group (but not revoked
+/// account-wide) stops vouching there at the removal commit's chat seq.
+#[test]
+fn with_server_order_a_removed_leaf_stops_vouching_at_its_removal_commit() {
+    let net = MemoryBackend::new();
+    net.enable_server_order();
+    let clock = TestClock::default();
+    let (mut phone, mut carol) = phone_and_carol(&net, &clock);
+    for t in ["t", "u"] {
+        net.add_leaf(t, A, tpub(1));
+        net.add_leaf(t, C, tpub(3));
+    }
+    let roster = phone.resolve_roster(&[A, C]).unwrap();
+    for (t, id) in [("t", "in-group"), ("u", "other-thread")] {
+        phone.archive_outgoing(t, &roster, id, 10, b"x").unwrap();
+    }
+    phone.flush().unwrap();
+    net.remove_leaf("t", A, tpub(1));
+    for (t, id) in [("t", "after-removal"), ("u", "still-member")] {
+        phone.archive_outgoing(t, &roster, id, 5, b"y").unwrap();
+    }
+    phone.flush().unwrap();
+    let ids = |h: &labyrinth::client::ThreadHistory| -> Vec<String> {
+        h.messages.iter().map(|m| m.message_id.clone()).collect()
+    };
+    let h = carol.load_thread("t", TimeRange::ALL).unwrap();
+    assert_eq!(ids(&h), ["in-group"]);
+    assert_eq!(h.undecryptable.len(), 1);
+    assert_eq!(h.undecryptable[0].message_id, "after-removal");
+    assert_eq!(h.undecryptable[0].error, Error::BadPublicKey);
+    // The account-wide key is still current; another conversation is fine.
+    let h = carol.load_thread("u", TimeRange::ALL).unwrap();
+    assert_eq!(ids(&h), ["still-member", "other-thread"]);
+    // A device that never had a leaf in the conversation vouches for nothing.
+    net.add_leaf("v", C, tpub(3));
+    phone
+        .archive_outgoing("v", &roster, "no-leaf", 1, b"z")
+        .unwrap();
+    phone.flush().unwrap();
+    let h = carol.load_thread("v", TimeRange::ALL).unwrap();
+    assert!(h.messages.is_empty());
     assert_eq!(h.undecryptable[0].error, Error::BadPublicKey);
 }
 

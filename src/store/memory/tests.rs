@@ -3,8 +3,9 @@ use crate::device::DeviceSecrets;
 use crate::epoch::open_genesis;
 use crate::message::seal_owner;
 use crate::records::datetime_from_ms;
+use crate::records::{Batch, MekDistribution};
 use crate::sign::Ed25519Transport;
-use crate::store::{ChatDeviceKey, keys_valid_at};
+use crate::store::{ChatDeviceKey, MailboxDirectory, ThreadStore, keys_valid_at};
 
 const ALICE: &str = "did:plc:alice";
 const BOB: &str = "did:plc:bob";
@@ -163,4 +164,70 @@ fn directory_tracks_current_and_removed_devices() {
     assert_eq!(keys_valid_at(&keys, Some(499)), vec![[2; 32], [1; 32]]);
     assert_eq!(keys_valid_at(&keys, Some(500)), vec![[2; 32]]);
     assert!(d.latest(ALICE).unwrap().is_none());
+}
+
+#[test]
+fn server_order_stamps_writes_and_tracks_leaves() {
+    let b = MemoryBackend::new();
+    let t = b.threads(ALICE);
+    let mek = crate::mek::Mek::generate(&[[1u8; 32]]).unwrap();
+    let sealed = crate::message::seal_sender(&mek, "th", "m1", 5, b"hi", &transport()).unwrap();
+    let batch = Batch::from_messages("th", &[sealed], datetime_from_ms(5)).unwrap();
+    // Space mode: no stamps, no leaf view.
+    t.append_batch(&batch).unwrap();
+    assert!(
+        b.directory()
+            .member_device_keys("th", ALICE)
+            .unwrap()
+            .is_none()
+    );
+
+    b.enable_server_order();
+    b.set_server_time(700);
+    assert_eq!(b.add_leaf("th", ALICE, [9; 32]), 1);
+    b.append_chat_entry("th");
+    t.append_batch(&batch).unwrap();
+    assert_eq!(b.remove_leaf("th", ALICE, [9; 32]), 3);
+    let got = t.list_batches("th", None, TimeRange::ALL).unwrap();
+    assert_eq!(got[0].order, None);
+    assert_eq!(
+        got[1].order,
+        Some(ServerOrder {
+            labyrinth_seq: 1,
+            chat_seq: Some(2),
+            received_at_ms: 700
+        })
+    );
+    let leaves = b
+        .directory()
+        .member_device_keys("th", ALICE)
+        .unwrap()
+        .unwrap();
+    assert_eq!(leaves.len(), 1);
+    assert_eq!(
+        (leaves[0].joined_chat_seq, leaves[0].removed_chat_seq),
+        (1, Some(3))
+    );
+    assert_eq!(
+        b.directory().member_device_keys("th", BOB).unwrap(),
+        Some(vec![])
+    );
+
+    // MEKs are stamped too, and a conflicting create burns no seq.
+    let roster = [(ALICE.to_owned(), {
+        let d = DeviceSecrets::generate().unwrap();
+        open_genesis(ALICE, &d, &transport())
+            .unwrap()
+            .1
+            .record
+            .public
+    })];
+    let mut m = crate::mek::Mek::generate(&[roster[0].1.head]).unwrap();
+    let rec = crate::mek::distribute_transport("th", &mut m, &transport(), &roster).unwrap();
+    let wire = MekDistribution::from_record(&rec, None, datetime_from_ms(1)).unwrap();
+    t.create_mek(&wire).unwrap();
+    assert_eq!(t.create_mek(&wire), Err(Error::Conflict));
+    let found = t.find_meks("th", m.id()).unwrap();
+    assert_eq!(found[0].order.unwrap().labyrinth_seq, 2);
+    assert_eq!(found[0].order.unwrap().chat_seq, Some(3));
 }

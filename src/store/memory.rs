@@ -2,7 +2,7 @@
 //!
 //! One [`MemoryBackend`] plays every server at once: each DID's personal
 //! mailbox space and public repo, every conversation space, and the MLS
-//! device view the [`MailboxDirectory`] reports. Handles bound to a DID
+//! device view the [`super::MailboxDirectory`] reports. Handles bound to a DID
 //! ([`MemoryBackend::mailbox`], [`MemoryBackend::threads`]) can only write
 //! that DID's repos, as Spaces enforce.
 //!
@@ -10,19 +10,28 @@
 //! any thread, as a leaky or malicious backend would. Confidentiality must
 //! come from the cryptography. [`MemoryBackend::revoke_thread_access`]
 //! models a Space removing a member ([CB-22]).
+//!
+//! By default nothing carries server order, as on a Space.
+//! [`MemoryBackend::enable_server_order`] switches to mls-ds behaviour:
+//! every MEK, batch and owner batch is stamped with a [`ServerOrder`] from
+//! a test-controlled server clock and the thread's chat sequence, and
+//! [`MemoryBackend::add_leaf`] / [`MemoryBackend::remove_leaf`] model the
+//! per-conversation device view ([CB-27]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::{ChatDeviceKey, MailboxDirectory, MailboxStore, Stored, ThreadStore, TimeRange};
+use super::{ChatDeviceKey, MailboxStore, MemberDeviceKey, ServerOrder, Stored, TimeRange};
 use crate::epoch::space_epoch_id;
-use crate::mailbox::EpochPublic;
-use crate::records::{
-    Batch, Device, Epoch, EpochMember, MailboxKeysRecord, MekDistribution, OwnerBatch,
-    VirtualDevice,
-};
+use crate::records::{Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, VirtualDevice};
 use crate::sign::XVerifyingKey;
 use crate::{Error, Result};
+
+mod directory;
+mod threads;
+
+pub use directory::MemoryDirectory;
+pub use threads::MemoryThreads;
 
 #[derive(Default)]
 struct Mailbox {
@@ -30,19 +39,26 @@ struct Mailbox {
     epochs: BTreeMap<String, Epoch>,
     members: BTreeMap<String, EpochMember>,
     vdevices: BTreeMap<String, VirtualDevice>,
-    owner_batches: BTreeMap<String, OwnerBatch>,
+    owner_batches: BTreeMap<String, (OwnerBatch, Option<ServerOrder>)>,
+    next_seq: u64,
 }
 
 #[derive(Default)]
 struct Repo {
-    meks: BTreeMap<String, MekDistribution>,
-    batches: BTreeMap<String, Batch>,
+    meks: BTreeMap<String, (crate::records::MekDistribution, Option<ServerOrder>)>,
+    batches: BTreeMap<String, (crate::records::Batch, Option<ServerOrder>)>,
 }
 
 #[derive(Default)]
 struct ThreadSpace {
     repos: BTreeMap<String, Repo>,
     no_read: BTreeSet<String>,
+    /// Labyrinth write counter (server order).
+    next_seq: u64,
+    /// Seq of the conversation's last MLS chat entry.
+    chat_seq: u64,
+    /// Per-DID device leaves, once any leaf was recorded.
+    leaves: Option<BTreeMap<String, Vec<MemberDeviceKey>>>,
 }
 
 #[derive(Default)]
@@ -61,6 +77,10 @@ struct State {
     threads: HashMap<String, ThreadSpace>,
     chat_devices: HashMap<String, ChatDevices>,
     tid: u64,
+    /// Stamp writes with [`ServerOrder`] (mls-ds mode).
+    stamping: bool,
+    /// The server clock for stamps (ms), set by tests.
+    server_now: u64,
 }
 
 impl State {
@@ -72,6 +92,22 @@ impl State {
             .rev()
             .map(|i| S32[((self.tid >> (5 * i)) & 31) as usize] as char)
             .collect()
+    }
+
+    /// The server stamp for a write into `thread_id` (`None` unless
+    /// stamping).
+    fn stamp_thread(&mut self, thread_id: &str) -> Option<ServerOrder> {
+        if !self.stamping {
+            return None;
+        }
+        let now = self.server_now;
+        let t = self.threads.entry(thread_id.to_owned()).or_default();
+        t.next_seq += 1;
+        Some(ServerOrder {
+            labyrinth_seq: t.next_seq,
+            chat_seq: Some(t.chat_seq),
+            received_at_ms: now,
+        })
     }
 }
 
@@ -100,17 +136,70 @@ impl MemoryBackend {
 
     /// The conversation spaces, as `did` sees them.
     pub fn threads(&self, did: &str) -> MemoryThreads {
-        MemoryThreads {
-            did: did.to_owned(),
-            backend: self.clone(),
-        }
+        MemoryThreads::new(did, self.clone())
     }
 
     /// Public `mailboxKeys` records plus the MLS device view.
     pub fn directory(&self) -> MemoryDirectory {
-        MemoryDirectory {
-            backend: self.clone(),
+        MemoryDirectory::new(self.clone())
+    }
+
+    /// From now on, stamp every MEK, batch and owner batch with a
+    /// [`ServerOrder`] as mls-ds does ([CB-27]). Without this the backend
+    /// behaves like a Space: no server order.
+    pub fn enable_server_order(&self) {
+        self.lock().stamping = true;
+    }
+
+    /// Sets the server clock that stamps writes and that
+    /// [`remove_chat_device`](Self::remove_chat_device) times are read on.
+    pub fn set_server_time(&self, ms: u64) {
+        self.lock().server_now = ms;
+    }
+
+    /// Records one MLS chat entry in `thread_id`; returns its seq.
+    pub fn append_chat_entry(&self, thread_id: &str) -> u64 {
+        let mut s = self.lock();
+        let t = s.threads.entry(thread_id.to_owned()).or_default();
+        t.chat_seq += 1;
+        t.chat_seq
+    }
+
+    /// An MLS commit adds a leaf for `did`'s device `key` to `thread_id`
+    /// (one chat entry). Returns the commit's seq.
+    pub fn add_leaf(&self, thread_id: &str, did: &str, key: [u8; 32]) -> u64 {
+        let seq = self.append_chat_entry(thread_id);
+        let mut s = self.lock();
+        let t = s.threads.entry(thread_id.to_owned()).or_default();
+        t.leaves
+            .get_or_insert_default()
+            .entry(did.to_owned())
+            .or_default()
+            .push(MemberDeviceKey {
+                key,
+                joined_chat_seq: seq,
+                removed_chat_seq: None,
+            });
+        seq
+    }
+
+    /// An MLS commit removes `did`'s leaf `key` from `thread_id`. Returns
+    /// the commit's seq.
+    pub fn remove_leaf(&self, thread_id: &str, did: &str, key: [u8; 32]) -> u64 {
+        let seq = self.append_chat_entry(thread_id);
+        let mut s = self.lock();
+        let t = s.threads.entry(thread_id.to_owned()).or_default();
+        for l in t
+            .leaves
+            .get_or_insert_default()
+            .entry(did.to_owned())
+            .or_default()
+            .iter_mut()
+            .filter(|l| l.key == key && l.removed_chat_seq.is_none())
+        {
+            l.removed_chat_seq = Some(seq);
         }
+        seq
     }
 
     /// Records a chat device of `did` in the MLS view.
@@ -138,6 +227,29 @@ impl MemoryBackend {
         let mut s = self.lock();
         let t = s.threads.entry(thread_id.to_owned()).or_default();
         t.no_read.insert(did.to_owned());
+    }
+
+    fn member_keys(&self, thread_id: &str, did: &str) -> Option<Vec<MemberDeviceKey>> {
+        let s = self.lock();
+        let leaves = s.threads.get(thread_id)?.leaves.as_ref()?;
+        Some(leaves.get(did).cloned().unwrap_or_default())
+    }
+
+    fn chat_keys(&self, did: &str) -> Vec<ChatDeviceKey> {
+        let s = self.lock();
+        s.chat_devices
+            .get(did)
+            .map(|d| {
+                d.current
+                    .iter()
+                    .map(|k| ChatDeviceKey::current(*k))
+                    .chain(d.removed.iter().map(|(k, at)| ChatDeviceKey {
+                        key: *k,
+                        removed_at: Some(*at),
+                    }))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -218,6 +330,7 @@ impl MailboxStore for MemoryMailbox {
                 author: self.did.clone(),
                 rkey: id.clone(),
                 value: e.clone(),
+                order: None,
             }))
         })
     }
@@ -230,6 +343,7 @@ impl MailboxStore for MemoryMailbox {
                     author: self.did.clone(),
                     rkey: k.clone(),
                     value: e.clone(),
+                    order: None,
                 })
                 .collect())
         })
@@ -270,8 +384,17 @@ impl MailboxStore for MemoryMailbox {
     fn append_owner_batch(&self, batch: &OwnerBatch) -> Result<String> {
         let mut s = self.backend.lock();
         let tid = s.next_tid();
+        let (stamping, now) = (s.stamping, s.server_now);
         let m = s.mailboxes.entry(self.did.clone()).or_default();
-        create(&mut m.owner_batches, tid.clone(), batch)?;
+        let order = stamping.then(|| {
+            m.next_seq += 1;
+            ServerOrder {
+                labyrinth_seq: m.next_seq,
+                chat_seq: None,
+                received_at_ms: now,
+            }
+        });
+        create(&mut m.owner_batches, tid.clone(), &(batch.clone(), order))?;
         Ok(tid)
     }
 
@@ -283,13 +406,14 @@ impl MailboxStore for MemoryMailbox {
         self.with(|m| {
             Ok(m.owner_batches
                 .iter()
-                .filter(|(_, b)| {
+                .filter(|(_, (b, _))| {
                     b.thread_id == thread_id && b.items.iter().any(|i| range.contains(i.timestamp))
                 })
-                .map(|(k, b)| Stored {
+                .map(|(k, (b, order))| Stored {
                     author: self.did.clone(),
                     rkey: k.clone(),
                     value: b.clone(),
+                    order: *order,
                 })
                 .collect())
         })
@@ -308,134 +432,6 @@ impl MailboxStore for MemoryMailbox {
         history.insert(seq, record.clone());
         s.public_keys.insert(self.did.clone(), record.clone());
         Ok(())
-    }
-}
-
-/// [`ThreadStore`] handle bound to one DID.
-pub struct MemoryThreads {
-    did: String,
-    backend: MemoryBackend,
-}
-
-impl MemoryThreads {
-    fn space<T>(
-        &self,
-        thread_id: &str,
-        f: impl FnOnce(&mut ThreadSpace) -> Result<T>,
-    ) -> Result<T> {
-        let mut s = self.backend.lock();
-        let t = s.threads.entry(thread_id.to_owned()).or_default();
-        if t.no_read.contains(&self.did) {
-            return Err(Error::Forbidden);
-        }
-        f(t)
-    }
-}
-
-impl ThreadStore for MemoryThreads {
-    fn author(&self) -> &str {
-        &self.did
-    }
-
-    fn create_mek(&self, mek: &MekDistribution) -> Result<()> {
-        self.space(&mek.thread_id, |t| {
-            let repo = t.repos.entry(self.did.clone()).or_default();
-            create(&mut repo.meks, mek.rkey(), mek)
-        })
-    }
-
-    fn find_meks(
-        &self,
-        thread_id: &str,
-        mek_id: &[u8; 12],
-    ) -> Result<Vec<Stored<MekDistribution>>> {
-        let rkey = hex::encode(mek_id);
-        self.space(thread_id, |t| {
-            Ok(t.repos
-                .iter()
-                .filter_map(|(did, r)| {
-                    r.meks.get(&rkey).map(|m| Stored {
-                        author: did.clone(),
-                        rkey: rkey.clone(),
-                        value: m.clone(),
-                    })
-                })
-                .collect())
-        })
-    }
-
-    fn append_batch(&self, batch: &Batch) -> Result<String> {
-        let mut s = self.backend.lock();
-        let tid = s.next_tid();
-        let t = s.threads.entry(batch.thread_id.clone()).or_default();
-        if t.no_read.contains(&self.did) {
-            return Err(Error::Forbidden);
-        }
-        let repo = t.repos.entry(self.did.clone()).or_default();
-        create(&mut repo.batches, tid.clone(), batch)?;
-        Ok(tid)
-    }
-
-    fn list_batches(
-        &self,
-        thread_id: &str,
-        sender: Option<&str>,
-        range: TimeRange,
-    ) -> Result<Vec<Stored<Batch>>> {
-        self.space(thread_id, |t| {
-            Ok(t.repos
-                .iter()
-                .filter(|(did, _)| sender.is_none_or(|s| s == did.as_str()))
-                .flat_map(|(did, r)| {
-                    r.batches
-                        .iter()
-                        .filter(|(_, b)| b.items.iter().any(|i| range.contains(i.timestamp)))
-                        .map(|(k, b)| Stored {
-                            author: did.clone(),
-                            rkey: k.clone(),
-                            value: b.clone(),
-                        })
-                })
-                .collect())
-        })
-    }
-}
-
-/// [`MailboxDirectory`] over the backend's public repos and MLS view.
-pub struct MemoryDirectory {
-    backend: MemoryBackend,
-}
-
-impl MailboxDirectory for MemoryDirectory {
-    fn latest(&self, did: &str) -> Result<Option<EpochPublic>> {
-        let s = self.backend.lock();
-        s.public_keys.get(did).map(|r| r.to_public()).transpose()
-    }
-
-    fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>> {
-        let s = self.backend.lock();
-        s.public_history
-            .get(did)
-            .and_then(|h| h.get(&seq))
-            .map(|r| r.to_public())
-            .transpose()
-    }
-
-    fn device_transport_keys(&self, did: &str) -> Result<Vec<ChatDeviceKey>> {
-        let s = self.backend.lock();
-        Ok(s.chat_devices
-            .get(did)
-            .map(|d| {
-                d.current
-                    .iter()
-                    .map(|k| ChatDeviceKey::current(*k))
-                    .chain(d.removed.iter().map(|(k, at)| ChatDeviceKey {
-                        key: *k,
-                        removed_at: Some(*at),
-                    }))
-                    .collect()
-            })
-            .unwrap_or_default())
     }
 }
 

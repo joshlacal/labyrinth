@@ -29,7 +29,12 @@
 //! - [`crate::Error::Forbidden`] means the backend refused the read, e.g.
 //!   after removal from a conversation space ([CB-22]).
 
+pub mod keys;
 pub mod memory;
+
+pub use keys::{
+    ChatDeviceKey, MemberDeviceKey, ServerOrder, VouchAt, keys_valid_at, keys_valid_for,
+};
 
 use crate::Result;
 use crate::mailbox::EpochPublic;
@@ -46,6 +51,9 @@ pub struct Stored<T> {
     pub author: String,
     pub rkey: String,
     pub value: T,
+    /// The server's stamp, when the backend assigns one (mls-ds). Readers
+    /// prefer it to sender timestamps for the removed-key bound ([CB-27]).
+    pub order: Option<ServerOrder>,
 }
 
 /// A half-open message time window `[from_ms, until_ms)`; `None` is unbounded.
@@ -162,42 +170,21 @@ pub trait MailboxDirectory {
     ///
     /// Addressing a MEK to an epoch requires its attestation key to be a
     /// *current* device ([CB-18]). Reading history accepts a removed key
-    /// only for messages and MEKs timestamped before its removal ([CB-27]).
+    /// only for messages and MEKs written before its removal ([CB-27]):
+    /// by their [`ServerOrder`] when the store assigns one, else by the
+    /// sender's timestamp ([`keys_valid_for`]).
     fn device_transport_keys(&self, did: &str) -> Result<Vec<ChatDeviceKey>>;
-}
-
-/// One chat device transport key in the MLS device view.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChatDeviceKey {
-    pub key: [u8; 32],
-    /// When the device left the MLS group (ms since the Unix epoch).
-    pub removed_at: Option<u64>,
-}
-
-impl ChatDeviceKey {
-    /// A current device.
-    pub fn current(key: [u8; 32]) -> Self {
-        Self {
-            key,
-            removed_at: None,
-        }
+    /// The DID's device leaves in one conversation, with the chat seqs
+    /// that added and removed each ([`MemberDeviceKey`]); `None` when the
+    /// backend has no per-conversation view (the Space backend). With
+    /// server-ordered records, a key vouches for a message only while it
+    /// had a leaf in the message's conversation ([CB-27]).
+    fn member_device_keys(
+        &self,
+        thread_id: &str,
+        did: &str,
+    ) -> Result<Option<Vec<MemberDeviceKey>>> {
+        let _ = (thread_id, did);
+        Ok(None)
     }
-
-    pub fn is_current(&self) -> bool {
-        self.removed_at.is_none()
-    }
-
-    /// Whether this key may vouch for something timestamped `at_ms`:
-    /// always while current, otherwise only strictly before removal.
-    pub fn valid_at(&self, at_ms: u64) -> bool {
-        self.removed_at.is_none_or(|r| at_ms < r)
-    }
-}
-
-/// The keys of `keys` that are current (`at_ms = None`) or valid at `at_ms`.
-pub fn keys_valid_at(keys: &[ChatDeviceKey], at_ms: Option<u64>) -> Vec<[u8; 32]> {
-    keys.iter()
-        .filter(|k| at_ms.map_or(k.is_current(), |t| k.valid_at(t)))
-        .map(|k| k.key)
-        .collect()
 }

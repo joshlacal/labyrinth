@@ -8,7 +8,7 @@ use crate::epoch::EpochKeys as _;
 use crate::mek::{self, Mek, MekSender};
 use crate::message::{SealedMessage, open_owner, open_sender, seal_owner, verify_sender_device};
 use crate::records::{BATCH_BYTE_BUDGET, MAX_BATCH_ITEMS, MekDistribution};
-use crate::store::{Stored, TimeRange};
+use crate::store::{Stored, TimeRange, VouchAt};
 use crate::{Error, Result};
 
 /// Where a loaded message came from.
@@ -102,7 +102,8 @@ impl Labyrinth {
                 }
             };
             for s in items.iter().filter(|s| range.contains(s.timestamp)) {
-                match self.open_sealed(thread_id, &b.author, s) {
+                let at = VouchAt::of(b.order, s.timestamp);
+                match self.open_sealed(thread_id, &b.author, s, at) {
                     Ok(frame) => h.messages.push(LoadedMessage {
                         thread_id: thread_id.to_owned(),
                         message_id: s.message_id.clone(),
@@ -170,18 +171,27 @@ impl Labyrinth {
     /// SPEC §7.4: the sender key must be one of the author's chat devices,
     /// then the MEK opens and the signature and AEAD verify.
     ///
-    /// A key of a device that has left the MLS group is accepted only for a
-    /// message timestamped before its removal ([CB-27]).
-    fn open_sealed(&mut self, thread_id: &str, author: &str, s: &SealedMessage) -> Result<Vec<u8>> {
-        verify_sender_device(s, &self.transport_keys(author, Some(s.timestamp))?)?;
+    /// A key of a removed device vouches only for a message written before
+    /// its removal ([CB-27]): by the batch's server stamp when it has one
+    /// (`at`; received before the account revocation, and while the device
+    /// had a leaf in this conversation), else by the message timestamp.
+    fn open_sealed(
+        &mut self,
+        thread_id: &str,
+        author: &str,
+        s: &SealedMessage,
+        at: VouchAt,
+    ) -> Result<Vec<u8>> {
+        verify_sender_device(s, &self.transport_keys(author, Some(thread_id), at)?)?;
         let mek = self.mek_for(thread_id, &s.mek_id, s.timestamp)?;
         open_sender(s, thread_id, &mek)
     }
 
     /// The MEK `mek_id`, from the cache or opened from the thread's MEK
-    /// records. A MEK record's sender key must have been valid at `at_ms`,
-    /// the timestamp of the first message that needed it.
-    fn mek_for(&mut self, thread_id: &str, mek_id: &[u8; 12], at_ms: u64) -> Result<Mek> {
+    /// records. A MEK record's sender key must have been valid when the
+    /// record was written: at its server stamp, or without one at
+    /// `claim_ms`, the timestamp of the first message that needed it.
+    fn mek_for(&mut self, thread_id: &str, mek_id: &[u8; 12], claim_ms: u64) -> Result<Mek> {
         if let Some(m) = self
             .meks
             .get(thread_id)
@@ -191,7 +201,8 @@ impl Labyrinth {
         }
         let mut err = Error::NotFound("mek");
         for c in self.b.threads.find_meks(thread_id, mek_id)? {
-            match self.open_mek_record(thread_id, &c, at_ms) {
+            let at = VouchAt::of(c.order, claim_ms);
+            match self.open_mek_record(thread_id, &c, at) {
                 Ok(m) => {
                     self.meks
                         .entry(thread_id.to_owned())
@@ -211,7 +222,7 @@ impl Labyrinth {
         &mut self,
         thread_id: &str,
         c: &Stored<MekDistribution>,
-        at_ms: u64,
+        at: VouchAt,
     ) -> Result<Mek> {
         let (rec, sender_epoch) = c.value.to_record()?;
         if rec.thread_id != thread_id {
@@ -222,11 +233,11 @@ impl Labyrinth {
                 if *did != c.author {
                     return Err(Error::Malformed("MEK sender is not the record author"));
                 }
-                self.check_attested(did, epoch, Some(at_ms))?;
+                self.check_attested(did, epoch, at)?;
             }
             (MekSender::Transport { transport_pub, .. }, _) => {
                 if !self
-                    .transport_keys(&c.author, Some(at_ms))?
+                    .transport_keys(&c.author, Some(thread_id), at)?
                     .contains(transport_pub)
                 {
                     return Err(Error::Unattested);
