@@ -115,3 +115,20 @@ Where the build deviates from the design (each also provisional):
 
 Because: these are the pieces the design assigns to the crate, and the reference server lets the same e2e lifecycle run over XRPC with every request and response validated against the lexicons (`tests/e2e_xrpc.rs`). Rejected: putting the stores in catbird-mls (design §5); a raw ORF map endpoint (an oracle).
 Reversible until: merge of `labyrinth-1.1`. Override by: editing `docs/MLSDS_BACKEND.md` and the matching module (`src/store/keys.rs` for the vouching rule, `src/client/composite.rs`, `src/store/xrpc/`), then the lexicons; `tests/review_regressions.rs` and `tests/directory_and_orf.rs` pin the behaviour.
+
+## 2026-10-04 · mls-ds · Labyrinth backend server build (local bookmark `local/labyrinth-backend-20261004`)
+Chose (provisional): the server-build deviations from `docs/MLSDS_BACKEND.md` listed below. Because: each one keeps the frozen chat transcript and claim code untouched, or matches the test-database constraints. Reversible until: the first mls-ds push or merge carrying the bookmark. Override by: the alternative named in each item.
+1. Signed write bodies travel in the `catbird-labyrinth-write` and `catbird-labyrinth-write-signature` headers, under domain `CATBIRD-LABYRINTH-WRITE\0`. They are not a new chat signed-mutation kind, because that would touch the frozen transcript code. The client transport (catbird-mls) must add these headers. Alternative: a chat mutation kind.
+2. Idempotency uses its own `labyrinth.operations` table rather than `chat.operation_claims`.
+3. The ORF server domains are two fixed constants, `catbird.labyrinth.orf.attachment_index` and `catbird.labyrinth.orf.attachment_token`.
+4. Access rules:
+   - `getMemberDevices` answers only current and former participants; anyone else gets `ConversationNotFound`, so existence isn't leaked.
+   - `putAttachmentRef` requires participation plus an existing blob.
+   - MEK recipients must be current participants.
+5. `labyrinthHead` appears only on `getConversationState`, and only when the `labyrinth` schema exists.
+6. Test fixtures seed conversations with `session_replication_role = replica`, which needs a superuser test role.
+Not built:
+- The `labyrinthRelay` federation relay. Writes to remote-sequenced conversations return 501.
+- Retention purge.
+- Protecting attachment blobs from chat object GC, which needs a change to `chat.claim_blob_object_gc`.
+- Swift and Kotlin Petrel regeneration for `labyrinthHead`.
