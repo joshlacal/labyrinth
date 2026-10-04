@@ -170,6 +170,71 @@ pub fn datetime_from_ms(ms: u64) -> String {
     )
 }
 
+/// Unix time in ms for an RFC 3339 datetime
+/// (`YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`), truncated to milliseconds.
+/// The inverse of [`datetime_from_ms`]; times before 1970 are rejected.
+pub fn ms_from_datetime(s: &str) -> Result<u64> {
+    let bad = Error::Malformed("not an RFC 3339 datetime");
+    let b = s.as_bytes();
+    let num = |r: core::ops::Range<usize>| -> Result<i64> {
+        let d = b
+            .get(r)
+            .ok_or(Error::Malformed("not an RFC 3339 datetime"))?;
+        if d.is_empty() || !d.iter().all(u8::is_ascii_digit) {
+            return Err(Error::Malformed("not an RFC 3339 datetime"));
+        }
+        Ok(d.iter().fold(0i64, |a, c| a * 10 + i64::from(c - b'0')))
+    };
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't') {
+        return Err(bad);
+    }
+    if b[13] != b':' || b[16] != b':' {
+        return Err(bad);
+    }
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return Err(bad);
+    }
+    let mut i = 19;
+    let mut ms = 0i64;
+    if b[i] == b'.' {
+        let start = i + 1;
+        i = start;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return Err(bad);
+        }
+        let frac = &b[start..i.min(start + 3)];
+        ms = frac.iter().fold(0, |a, c| a * 10 + i64::from(c - b'0'))
+            * 10i64.pow(3 - frac.len() as u32);
+    }
+    let offset_min = match &b[i..] {
+        b"Z" | b"z" => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let m = num(i + 1..i + 3)? * 60 + num(i + 4..i + 6)?;
+            if *sign == b'+' { m } else { -m }
+        }
+        _ => return Err(bad),
+    };
+    let days = days_from_civil(y, mo as u32, d as u32);
+    let total = ((days * 86_400 + h * 3600 + mi * 60 + sec - offset_min * 60) * 1000) + ms;
+    u64::try_from(total).map_err(|_| bad)
+}
+
+/// (year, month, day) to days since 1970-01-01; H. Hinnant's algorithm.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = i64::from((m + 9) % 12);
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Days since 1970-01-01 to (year, month, day); H. Hinnant's algorithm.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -199,6 +264,27 @@ mod tests {
             datetime_from_ms(951_782_400_000),
             "2000-02-29T00:00:00.000Z"
         );
+    }
+
+    #[test]
+    fn datetimes_parse_back() {
+        for ms in [0, 951_782_400_000, 1_791_181_727_123, 4_102_444_799_999] {
+            assert_eq!(ms_from_datetime(&datetime_from_ms(ms)).unwrap(), ms);
+        }
+        assert_eq!(
+            ms_from_datetime("2026-10-05T08:28:47.1239+02:00").unwrap(),
+            1_791_181_727_123
+        );
+        assert_eq!(ms_from_datetime("1970-01-01T00:00:01Z").unwrap(), 1000);
+        for bad in [
+            "1969-12-31T23:59:59Z",
+            "2026-13-01T00:00:00Z",
+            "2026-10-05 08:28:47Z",
+            "2026-10-05T08:28:47",
+            "2026-10-05T08:28:47.Z",
+        ] {
+            assert!(ms_from_datetime(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

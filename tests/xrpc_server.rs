@@ -1,0 +1,228 @@
+//! What the XRPC stores and the reference server reject, and how errors
+//! map (design `docs/MLSDS_BACKEND.md` §2–§3; `--features xrpc`).
+
+#![cfg(feature = "xrpc")]
+
+#[path = "support/lexicon.rs"]
+mod lexicon;
+
+use std::path::Path;
+
+use labyrinth::Error;
+use labyrinth::device::DeviceSecrets;
+use labyrinth::mek::{Mek, distribute_transport};
+use labyrinth::message::seal_sender;
+use labyrinth::records::{Batch, Device, MekDistribution, datetime_from_ms};
+use labyrinth::sign::Ed25519Transport;
+use labyrinth::store::memory::MemoryBackend;
+use labyrinth::store::xrpc::server::MemoryXrpcServer;
+use labyrinth::store::xrpc::{
+    NSID_PREFIX, XrpcDirectory, XrpcError, XrpcMailboxStore, XrpcThreadStore, map_error,
+};
+use labyrinth::store::{MailboxDirectory, MailboxStore, ThreadStore, TimeRange};
+use serde_json::json;
+
+const A: &str = "did:plc:alice";
+const T: &str = "conv-1";
+
+fn signer(seed: u8) -> Ed25519Transport {
+    Ed25519Transport(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]))
+}
+fn tpub(seed: u8) -> [u8; 32] {
+    signer(seed).0.verifying_key().to_bytes()
+}
+
+fn server() -> MemoryXrpcServer {
+    let s = MemoryXrpcServer::new(MemoryBackend::new());
+    s.backend().register_chat_device(A, tpub(1));
+    s
+}
+
+/// A transport MEK minted by device `seed`, its record, and a sealed message.
+fn mek_and_message(seed: u8, id: &str) -> (MekDistribution, labyrinth::message::SealedMessage) {
+    let d = DeviceSecrets::generate().unwrap();
+    let e = labyrinth::epoch::open_genesis(A, &d, &signer(seed))
+        .unwrap()
+        .1
+        .record
+        .public;
+    let mut m = Mek::generate(&[e.head]).unwrap();
+    let rec = distribute_transport(T, &mut m, &signer(seed), &[(A.to_owned(), e)]).unwrap();
+    let wire = MekDistribution::from_record(&rec, None, datetime_from_ms(1)).unwrap();
+    (
+        wire,
+        seal_sender(&m, T, id, 1, b"x", &signer(seed)).unwrap(),
+    )
+}
+
+#[test]
+fn errors_map_to_store_errors() {
+    let e = |name: &str| map_error(XrpcError::named(400, name, ""));
+    assert_eq!(e("RecordAlreadyExists"), Error::Conflict);
+    assert_eq!(e("EpochHeadConflict"), Error::Conflict);
+    for f in [
+        "NotAuthorized",
+        "NotRecipient",
+        "NotParticipant",
+        "DeviceRevoked",
+    ] {
+        assert_eq!(e(f), Error::Forbidden);
+    }
+    assert_eq!(e("DeviceNotFound"), Error::NotFound("device"));
+    assert_eq!(e("AttestationNotCurrent"), Error::Unattested);
+    assert!(matches!(e("MixedMekBatch"), Error::Backend(m) if m.contains("MixedMekBatch")));
+    let no_response = XrpcError {
+        status: 0,
+        error: None,
+        message: Some("timeout".into()),
+    };
+    assert!(matches!(map_error(no_response), Error::Backend(_)));
+}
+
+#[test]
+fn mailbox_create_get_and_replay() {
+    let s = server();
+    let t = s.transport(A, tpub(1));
+    let mb = XrpcMailboxStore::new(A, t.clone());
+    let d = DeviceSecrets::generate().unwrap();
+    let key = d.public().device_key_pub;
+    assert_eq!(mb.get_device(&key).unwrap(), None);
+    assert_eq!(mb.get_epoch(0).unwrap(), None);
+    let rec = Device::from_public(d.public(), datetime_from_ms(1));
+    mb.create_device(&rec).unwrap();
+    assert_eq!(mb.create_device(&rec), Err(Error::Conflict));
+    assert_eq!(mb.get_device(&key).unwrap(), Some(rec.clone()));
+    assert_eq!(
+        mb.set_device_revoked(
+            &DeviceSecrets::generate().unwrap().public().device_key_pub,
+            "x"
+        ),
+        Err(Error::NotFound("device"))
+    );
+
+    // A retried procedure with the same operationId replays its response
+    // instead of failing as a second create.
+    let other = Device::from_public(DeviceSecrets::generate().unwrap().public(), "t".into());
+    let payload = serde_json::to_vec(&json!({ "record": other })).unwrap();
+    let nsid = format!("{NSID_PREFIX}createDevice");
+    let first = t.procedure(&nsid, &payload, [7; 16]).unwrap();
+    assert_eq!(t.procedure(&nsid, &payload, [7; 16]).unwrap(), first);
+    assert_eq!(
+        t.procedure(&nsid, &payload, [8; 16])
+            .unwrap_err()
+            .error
+            .as_deref(),
+        Some("RecordAlreadyExists")
+    );
+
+    // A revoked chat device is refused everywhere.
+    s.backend().remove_chat_device(A, tpub(1), 5);
+    assert_eq!(mb.list_devices(), Err(Error::Forbidden));
+}
+
+#[test]
+fn thread_writes_are_checked_and_stamped() {
+    let s = server();
+    s.backend().set_server_time(900);
+    let th = XrpcThreadStore::new(A, s.transport(A, tpub(1)));
+    let (mek, m1) = mek_and_message(1, "m1");
+    let (_, other) = mek_and_message(1, "m2");
+    let batch = |items: &[labyrinth::message::SealedMessage]| {
+        Batch::from_messages(T, items, datetime_from_ms(1)).unwrap()
+    };
+    let backend_err = |r: labyrinth::Result<String>, name: &str| match r {
+        Err(Error::Backend(m)) => assert!(m.contains(name), "{m}"),
+        r => panic!("{r:?}"),
+    };
+    // No MEK yet, then a MEK from another device's key.
+    backend_err(
+        th.append_batch(&batch(std::slice::from_ref(&m1))),
+        "UnknownMek",
+    );
+    let (foreign, _) = mek_and_message(2, "x");
+    assert!(
+        matches!(th.create_mek(&foreign), Err(Error::Backend(m)) if m.contains("SenderMismatch"))
+    );
+    th.create_mek(&mek).unwrap();
+    assert_eq!(th.create_mek(&mek), Err(Error::Conflict));
+    // One MEK per batch, and only the caller's own key.
+    backend_err(
+        th.append_batch(&batch(&[m1.clone(), other])),
+        "MixedMekBatch",
+    );
+    let (_, wrong_key) = mek_and_message(2, "m3");
+    backend_err(th.append_batch(&batch(&[wrong_key])), "SenderKeyMismatch");
+    th.append_batch(&batch(&[m1])).unwrap();
+    let got = th.list_batches(T, None, TimeRange::ALL).unwrap();
+    let order = got[0].order.unwrap();
+    assert_eq!((order.labyrinth_seq, order.received_at_ms), (2, 900));
+    let id: [u8; 12] = mek.mek_id.array("mekId").unwrap();
+    assert!(th.find_meks(T, &id).unwrap()[0].order.is_some());
+    // The leaf view is absent until the conversation has one.
+    let dir = XrpcDirectory::new(s.transport(A, tpub(1)));
+    assert_eq!(dir.member_device_keys(T, A).unwrap(), None);
+    s.backend().add_leaf(T, A, tpub(1));
+    assert_eq!(dir.member_device_keys(T, A).unwrap().unwrap().len(), 1);
+    assert_eq!(dir.latest(A).unwrap(), None);
+}
+
+/// Positive controls: the lexicon checks in `e2e_xrpc` catch bad calls.
+#[test]
+fn validator_rejects_bad_calls() {
+    let lex = lexicon::Lexicons::load(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("lexicons/blue/catbird/labyrinth"),
+    );
+    let n = |name: &str| format!("{NSID_PREFIX}{name}");
+    let ok = [("threadId", "t".to_owned()), ("fromMs", "5".to_owned())];
+    lex.validate_params(&n("listBatches"), &ok).unwrap();
+    assert!(
+        lex.validate_params(&n("listBatches"), &[("fromMs", "5".into())])
+            .is_err()
+    );
+    assert!(
+        lex.validate_params(
+            &n("listBatches"),
+            &[("threadId", "t".into()), ("x", "1".into())]
+        )
+        .is_err()
+    );
+    assert!(
+        lex.validate_params(
+            &n("listBatches"),
+            &[("threadId", "t".into()), ("fromMs", "-1".into())]
+        )
+        .is_err()
+    );
+    assert!(
+        lex.validate_params(&n("getDevice"), &[("deviceKeyPubkey", "ab".into())])
+            .is_err()
+    );
+    let d = Device::from_public(
+        DeviceSecrets::generate().unwrap().public(),
+        datetime_from_ms(0),
+    );
+    lex.validate_input(&n("createDevice"), &json!({ "record": d }))
+        .unwrap();
+    assert!(
+        lex.validate_input(&n("createDevice"), &json!({ "record": d, "x": 1 }))
+            .is_err()
+    );
+    let mut bad = serde_json::to_value(&d).unwrap();
+    bad["virtual"] = json!("no");
+    assert!(
+        lex.validate_input(&n("createDevice"), &json!({ "record": bad }))
+            .is_err()
+    );
+    assert!(
+        lex.validate_output(&n("appendBatch"), &json!({ "rkey": "x" }))
+            .is_err()
+    );
+    lex.validate_output(
+        &n("appendBatch"),
+        &json!({ "rkey": "x", "order": { "seq": 1, "receivedAt": "2026-10-04T00:00:00.000Z" } }),
+    )
+    .unwrap();
+    assert!(lex.declares_error(&n("appendBatch"), "MixedMekBatch"));
+    assert!(lex.declares_error(&n("appendBatch"), "RateLimited"));
+    assert!(!lex.declares_error(&n("getDevice"), "MixedMekBatch"));
+}

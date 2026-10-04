@@ -35,6 +35,8 @@
 
 pub mod keys;
 pub mod memory;
+#[cfg(feature = "xrpc")]
+pub mod xrpc;
 
 pub use keys::{
     ChatDeviceKey, MemberDeviceKey, ServerOrder, VouchAt, keys_valid_at, keys_valid_for,

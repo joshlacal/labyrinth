@@ -275,6 +275,21 @@ impl MemoryBackend {
         t.no_read.insert(did.to_owned());
     }
 
+    /// DIDs with at least one leaf recorded in `thread_id`.
+    pub fn leaf_dids(&self, thread_id: &str) -> Vec<String> {
+        let s = self.lock();
+        s.threads
+            .get(thread_id)
+            .and_then(|t| t.leaves.as_ref())
+            .map(|l| l.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The server clock (ms).
+    pub fn server_time(&self) -> u64 {
+        self.lock().server_now
+    }
+
     fn member_keys(&self, thread_id: &str, did: &str) -> Option<Vec<MemberDeviceKey>> {
         let s = self.lock();
         let leaves = s.threads.get(thread_id)?.leaves.as_ref()?;
