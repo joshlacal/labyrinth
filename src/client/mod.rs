@@ -10,7 +10,7 @@
 //! | recovery codes, passkey wrap, one-time-code enrollment | [`enroll`] |
 //! | [`Labyrinth::archive_outgoing`], [`Labyrinth::flush`] | [`send`] |
 //! | [`Labyrinth::load_thread`], [`Labyrinth::archive_owner`], [`Labyrinth::rearchive_thread_before_leave`] | [`read`] |
-//! | [`Labyrinth::peer_pin`] (epoch pinning, [CB-29]) | [`pins`] |
+//! | [`Labyrinth::peer_pin`] (epoch pinning, [CB-29]), [`Labyrinth::propose_repin`] / [`Labyrinth::repin_peer`] | [`pins`] |
 //! | [`CompositeDirectory`] (PDS × mls-ds cross-check, [CB-28]) | [`composite`] |
 //! | [`Labyrinth::export_state`], [`Labyrinth::from_state`] | [`state`] |
 //!
@@ -47,10 +47,10 @@ pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
 pub use epochs::{RotationReport, SyncReport};
 pub use lookup::{ThreadCursor, ThreadPage, ThreadSummary};
 pub use members::{ExcludedMember, ExclusionReason};
-pub use pins::PeerPin;
+pub use pins::{PeerPin, RepinProposal};
 pub use read::{LoadedMessage, MessageSource, RedactedMessage, ThreadHistory, Undecryptable};
 pub use recovery::{AUTO_RECOVERY_TTL_MS, RecoveryMethod, recovery_expiry};
-pub use send::{ArchiveOutcome, FlushedBatch};
+pub use send::{ArchiveOutcome, FlushedBatch, ResolvedRoster, RosterExclusion};
 
 use crate::device::{DevicePublic, DeviceSecrets};
 use crate::epoch::{EpochKeys as _, EpochSecret};

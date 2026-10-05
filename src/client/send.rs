@@ -2,12 +2,12 @@
 //! [CB-15], [CB-16], [CB-20]).
 
 use super::Labyrinth;
-use crate::Result;
 use crate::mailbox::EpochPublic;
 use crate::mek::{self, Mek, MekRecord};
 use crate::message::seal_sender;
 use crate::records::defs::SealedMessageDef;
 use crate::records::{BATCH_BYTE_BUDGET, Batch, MAX_BATCH_ITEMS, MekDistribution, OwnerBatch};
+use crate::{Error, Result};
 
 /// A batch record written to a store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,7 +29,65 @@ pub struct ArchiveOutcome {
     pub flushed: Option<FlushedBatch>,
 }
 
+/// A conversation member left out of a roster, loudly: it gets no MEK
+/// for the messages archived under this roster, so it cannot read them
+/// from history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RosterExclusion {
+    pub did: String,
+    /// Why: [`Error::EpochRollback`] (the peer's chain was reset or is
+    /// being replayed; see [`Labyrinth::propose_repin`]),
+    /// [`Error::Unattested`], [`Error::DirectoryFork`], or a record that
+    /// does not verify.
+    pub error: Error,
+}
+
+/// [`Labyrinth::resolve_roster_report`]: the roster plus the members left
+/// out of it.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedRoster {
+    pub roster: Vec<(String, EpochPublic)>,
+    pub excluded: Vec<RosterExclusion>,
+}
+
+/// True for failures that say nothing about the member (the backend did
+/// not answer, no randomness): the whole roster must be retried rather
+/// than the member dropped.
+fn is_transient(e: &Error) -> bool {
+    matches!(e, Error::Backend(_) | Error::Rng)
+}
+
 impl Labyrinth {
+    /// Like [`resolve_roster`](Self::resolve_roster), but a member whose
+    /// epoch fails a trust check ([CB-18], [CB-28], [CB-29], or a record
+    /// that does not verify) is excluded and reported instead of failing
+    /// the whole roster. Transient failures ([`Error::Backend`],
+    /// [`Error::Rng`]) still fail it, so a network blip never drops a
+    /// member. This account's own epoch is always included.
+    pub fn resolve_roster_report(&mut self, member_dids: &[&str]) -> Result<ResolvedRoster> {
+        let mut out = ResolvedRoster::default();
+        let me = self.did.clone();
+        for did in member_dids.iter().filter(|d| **d != me) {
+            let checked = self.b.directory.latest(did).and_then(|e| match e {
+                Some(epoch) => self
+                    .accept_for_addressing(did, &epoch)
+                    .map(|()| Some(epoch)),
+                None => Ok(None),
+            });
+            match checked {
+                Ok(Some(epoch)) => out.roster.push(((*did).to_owned(), epoch)),
+                Ok(None) => {}
+                Err(e) if is_transient(&e) => return Err(e),
+                Err(error) => out.excluded.push(RosterExclusion {
+                    did: (*did).to_owned(),
+                    error,
+                }),
+            }
+        }
+        out.roster.push((self.did.clone(), self.latest_public()?));
+        Ok(out)
+    }
+
     /// The roster ([CB-16]) for a conversation whose MLS members are
     /// `member_dids`: each enrolled member's latest published epoch,
     /// verified and attested by one of its current chat devices ([CB-18]),

@@ -14,12 +14,21 @@
 //! - first contact is trust-on-first-use, anchored by the [CB-18]
 //!   attestation the caller has already checked.
 //!
+//! A peer that legitimately resets its mailbox (account purge, then a new
+//! genesis) fails the pin forever with [`Error::EpochRollback`]. The way
+//! out is user-confirmed, like a Signal safety-number change:
+//! [`Labyrinth::propose_repin`] verifies the new chain from its genesis,
+//! which must be attested by a *current* chat device of the DID, and shows
+//! the old and new safety numbers; [`Labyrinth::repin_peer`] replaces the
+//! pin only with the head the user confirmed.
+//!
 //! Long term the latest heads should travel in MLS-authenticated group
 //! state, which removes the first-contact gap.
 
 use super::Labyrinth;
 use crate::mailbox::EpochPublic;
 use crate::sign::XVerifyingKey;
+use crate::store::VouchAt;
 use crate::{Error, Result};
 
 /// The most epochs a client walks to advance one pin. A legitimate account
@@ -89,6 +98,108 @@ impl Labyrinth {
         epoch.verify_link(prev.seq, &prev.head, &prev.sig_key)?;
         self.pins.insert(did.to_owned(), PeerPin::of(epoch));
         Ok(())
+    }
+}
+
+/// A peer's new epoch chain, verified and waiting for the user to accept
+/// the safety-number change ([`Labyrinth::repin_peer`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepinProposal {
+    pub did: String,
+    /// The pinned epoch it replaces (`None` if the peer was never pinned).
+    pub pinned_seq: Option<u64>,
+    /// The safety number with the pinned head (`None` if never pinned).
+    pub old_safety_number: Option<String>,
+    /// The peer's latest epoch on the new chain.
+    pub offered_seq: u64,
+    pub offered_head: [u8; 32],
+    /// The safety number with the new head: show it, and the change.
+    pub new_safety_number: String,
+}
+
+impl Labyrinth {
+    /// `did`'s latest published epoch, verified as a chain from its own
+    /// genesis (epoch 0): the genesis must be attested by a *current* chat
+    /// device of `did` per the directory ([CB-18]), every link must verify,
+    /// and the latest epoch must itself be attested by a current device.
+    fn verified_fresh_chain(&self, did: &str) -> Result<EpochPublic> {
+        let latest = self
+            .b
+            .directory
+            .latest(did)?
+            .ok_or(Error::NotFound("peer epoch"))?;
+        if latest.seq > MAX_PIN_ADVANCE {
+            return Err(Error::Malformed("peer epoch chain gap too long"));
+        }
+        let genesis = self
+            .b
+            .directory
+            .epoch(did, 0)?
+            .ok_or(Error::NotFound("peer genesis epoch"))?;
+        if genesis.seq != 0 {
+            return Err(Error::Malformed("directory epoch under the wrong number"));
+        }
+        self.check_attested(did, &genesis, VouchAt::Current)?;
+        let mut prev = PeerPin::of(&genesis);
+        for seq in 1..=latest.seq {
+            let e = if seq == latest.seq {
+                latest.clone()
+            } else {
+                self.b
+                    .directory
+                    .epoch(did, seq)?
+                    .ok_or(Error::NotFound("intermediate peer epoch"))?
+            };
+            if e.seq != seq {
+                return Err(Error::Malformed("directory epoch under the wrong number"));
+            }
+            e.verify(did, None)?;
+            e.verify_link(prev.seq, &prev.head, &prev.sig_key)?;
+            prev = PeerPin::of(&e);
+        }
+        if prev.head != latest.head {
+            return Err(Error::Malformed(
+                "peer chain does not end at its latest epoch",
+            ));
+        }
+        self.check_attested(did, &latest, VouchAt::Current)?;
+        Ok(latest)
+    }
+
+    /// Verifies `did`'s current chain from its genesis (see
+    /// [`repin_peer`](Self::repin_peer)) and returns the safety-number
+    /// change to show the user. Changes nothing.
+    pub fn propose_repin(&self, did: &str) -> Result<RepinProposal> {
+        let latest = self.verified_fresh_chain(did)?;
+        let me = self.latest_public()?.head;
+        let pin = self.pins.get(did);
+        Ok(RepinProposal {
+            did: did.to_owned(),
+            pinned_seq: pin.map(|p| p.seq),
+            old_safety_number: pin
+                .map(|p| crate::fingerprint::safety_number((&self.did, &me), (did, &p.head))),
+            offered_seq: latest.seq,
+            offered_head: latest.head,
+            new_safety_number: crate::fingerprint::safety_number(
+                (&self.did, &me),
+                (did, &latest.head),
+            ),
+        })
+    }
+
+    /// User-confirmed re-pin after a peer reset its mailbox: re-verifies
+    /// the chain as [`propose_repin`](Self::propose_repin) does and
+    /// replaces the pin, but only if its latest head is still
+    /// `confirmed_head` (the one whose safety number the user accepted);
+    /// otherwise [`Error::Conflict`] and nothing changes.
+    pub fn repin_peer(&mut self, did: &str, confirmed_head: &[u8; 32]) -> Result<PeerPin> {
+        let latest = self.verified_fresh_chain(did)?;
+        if latest.head != *confirmed_head {
+            return Err(Error::Conflict);
+        }
+        let pin = PeerPin::of(&latest);
+        self.pins.insert(did.to_owned(), pin.clone());
+        Ok(pin)
     }
 }
 
