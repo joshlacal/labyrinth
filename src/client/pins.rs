@@ -91,3 +91,27 @@ impl Labyrinth {
         Ok(())
     }
 }
+
+impl Labyrinth {
+    /// This account's current fingerprint ([CB-41]): 30 digits over the
+    /// newest epoch head this device reached.
+    pub fn own_fingerprint(&self) -> Result<String> {
+        let head = self.latest_public()?.head;
+        Ok(crate::fingerprint::account_digits(&self.did, &head))
+    }
+
+    /// The 60-digit safety number between this account's current head and
+    /// the head this client pinned for `did` ([CB-29]); both people should
+    /// see the same number. [`crate::Error::NotFound`] until `did` was addressed.
+    pub fn safety_number_with(&self, did: &str) -> Result<String> {
+        let pin = self
+            .pins
+            .get(did)
+            .ok_or(crate::Error::NotFound("peer pin"))?;
+        let head = self.latest_public()?.head;
+        Ok(crate::fingerprint::safety_number(
+            (&self.did, &head),
+            (did, &pin.head),
+        ))
+    }
+}

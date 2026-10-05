@@ -1,13 +1,15 @@
 //! Reader path: loading a thread's history, and owner-mode archiving
 //! (SPEC §7.1, §7.4, [CB-22]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::Labyrinth;
 use crate::epoch::EpochKeys as _;
 use crate::mek::{self, Mek, MekSender};
-use crate::message::{SealedMessage, open_owner, open_sender, seal_owner, verify_sender_device};
-use crate::records::{BATCH_BYTE_BUDGET, MAX_BATCH_ITEMS, MekDistribution};
+use crate::message::{
+    OwnerContent, SealedMessage, open_owner_content, open_sender, verify_sender_device,
+};
+use crate::records::{Batch, BatchEntry, MekDistribution, OwnerBatch};
 use crate::store::{Stored, TimeRange, VouchAt};
 use crate::{Error, Result};
 
@@ -47,20 +49,45 @@ pub struct Undecryptable {
     pub error: Error,
 }
 
+/// A message its author unsent ([CB-38]): render it as removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RedactedMessage {
+    pub message_id: String,
+    pub timestamp: u64,
+    pub sender: String,
+    /// True when the redaction is signed by one of the author's chat
+    /// devices; false means the server removed it on its own (or the
+    /// signing device is unknown), which the UI may want to say.
+    pub by_author: bool,
+}
+
 /// Result of [`Labyrinth::load_thread`], ordered by `(timestamp, messageId)`.
 #[derive(Clone, Debug, Default)]
 pub struct ThreadHistory {
     pub messages: Vec<LoadedMessage>,
     pub undecryptable: Vec<Undecryptable>,
+    /// Items unsent by their author ([CB-38]).
+    pub redacted: Vec<RedactedMessage>,
+    /// Message ids hidden by this account's delete-for-me tombstones
+    /// ([CB-38]).
+    pub deleted_for_me: Vec<String>,
     /// False if the conversation space refused reads ([`Error::Forbidden`]);
     /// only owner-archived messages are then included.
     pub space_readable: bool,
 }
 
+/// A delete-for-me tombstone: `(messageId, only copies from this author)`.
+pub(super) type Tombstone = (String, Option<String>);
+
+/// Selects items by `(messageId, timestamp)` before any decryption.
+pub(super) type Keep<'a> = &'a dyn Fn(&str, u64) -> bool;
+
 impl Labyrinth {
     /// Load and decrypt every message of `thread_id` in `range`: sender
     /// batches via any MEK addressed to any of my epochs (backward-chaining
-    /// as needed), plus my owner batches.
+    /// as needed), plus my owner batches. Items unsent by their author
+    /// come back in [`ThreadHistory::redacted`], and messages this account
+    /// deleted for itself are dropped ([`ThreadHistory::deleted_for_me`]).
     ///
     /// Copies are merged only when they are provably the same message: a
     /// sender copy is deduplicated on `(author DID, messageId)` with a
@@ -74,18 +101,45 @@ impl Labyrinth {
             space_readable: true,
             ..ThreadHistory::default()
         };
-        let batches = match self.b.threads.list_batches(thread_id, None, range) {
-            Ok(b) => b,
+        let batches = self.readable(&mut h, self.b.threads.list_batches(thread_id, None, range))?;
+        let keep = |_: &str, ts: u64| range.contains(ts);
+        self.open_batches(thread_id, batches, &keep, &mut h);
+        let owner = self.b.mailbox.list_owner_batches(thread_id, range)?;
+        let tombstones = self.open_owner_batches(thread_id, owner, &keep, &mut h)?;
+        finish(&mut h, &tombstones);
+        Ok(h)
+    }
+
+    /// A sender-batch listing; `Forbidden` (removed from a Space) degrades
+    /// to the owner archive and clears `h.space_readable`.
+    pub(super) fn readable(
+        &self,
+        h: &mut ThreadHistory,
+        r: Result<Vec<Stored<Batch>>>,
+    ) -> Result<Vec<Stored<Batch>>> {
+        match r {
+            Ok(b) => Ok(b),
             Err(Error::Forbidden) => {
                 h.space_readable = false;
-                Vec::new()
+                Ok(Vec::new())
             }
-            Err(e) => return Err(e),
-        };
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Opens every item of `batches` that `keep(messageId, timestamp)`
+    /// selects into `h`.
+    pub(super) fn open_batches(
+        &mut self,
+        thread_id: &str,
+        batches: Vec<Stored<Batch>>,
+        keep: Keep<'_>,
+        h: &mut ThreadHistory,
+    ) {
         for b in batches {
             let author = Some(b.author.clone());
             let items = if b.value.thread_id == thread_id {
-                b.value.to_messages()
+                b.value.entries()
             } else {
                 Err(Error::Malformed("batch filed under another thread"))
             };
@@ -101,9 +155,30 @@ impl Labyrinth {
                     continue;
                 }
             };
-            for s in items.iter().filter(|s| range.contains(s.timestamp)) {
+            for entry in items
+                .into_iter()
+                .filter(|e| keep(e.message_id(), e.timestamp()))
+            {
+                let s = match entry {
+                    BatchEntry::Sealed(s) => s,
+                    BatchEntry::Redacted {
+                        message_id,
+                        timestamp,
+                        redaction,
+                    } => {
+                        let by_author =
+                            self.redaction_by_author(thread_id, &b.author, &message_id, &redaction);
+                        h.redacted.push(RedactedMessage {
+                            message_id,
+                            timestamp,
+                            sender: b.author.clone(),
+                            by_author,
+                        });
+                        continue;
+                    }
+                };
                 let at = VouchAt::of(b.order, s.timestamp);
-                match self.open_sealed(thread_id, &b.author, s, at) {
+                match self.open_sealed(thread_id, &b.author, &s, at) {
                     Ok(frame) => h.messages.push(LoadedMessage {
                         thread_id: thread_id.to_owned(),
                         message_id: s.message_id.clone(),
@@ -122,32 +197,48 @@ impl Labyrinth {
                 }
             }
         }
-        self.load_owner(thread_id, range, &mut h)?;
-
-        dedupe(&mut h);
-        h.messages
-            .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
-        h.undecryptable
-            .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
-        Ok(h)
     }
 
-    fn load_owner(
+    /// [CB-38]: the redaction is signed by a chat device of `author` that
+    /// was valid when the server applied it (now, without a stamp).
+    fn redaction_by_author(
+        &self,
+        thread_id: &str,
+        author: &str,
+        message_id: &str,
+        r: &crate::deletion::Redaction,
+    ) -> bool {
+        let at = r
+            .redacted_at
+            .as_deref()
+            .and_then(|t| crate::records::ms_from_datetime(t).ok())
+            .map_or(VouchAt::Current, VouchAt::SenderClaim);
+        r.verify(author, thread_id, message_id).is_ok()
+            && self
+                .transport_keys(author, None, at)
+                .is_ok_and(|k| k.contains(&r.transport_public_key))
+    }
+
+    /// Opens my owner batches into `h`; returns the delete-for-me
+    /// tombstones among them.
+    pub(super) fn open_owner_batches(
         &mut self,
         thread_id: &str,
-        range: TimeRange,
+        batches: Vec<Stored<OwnerBatch>>,
+        keep: Keep<'_>,
         h: &mut ThreadHistory,
-    ) -> Result<()> {
-        for b in self.b.mailbox.list_owner_batches(thread_id, range)? {
+    ) -> Result<Vec<Tombstone>> {
+        let mut tombstones = Vec::new();
+        for b in batches {
             for m in b.value.to_messages()? {
-                if m.thread_id != thread_id || !range.contains(m.timestamp) {
+                if m.thread_id != thread_id || !keep(&m.message_id, m.timestamp) {
                     continue;
                 }
                 let opened = self
                     .epoch_secret(m.epoch_seq)
-                    .and_then(|e| open_owner(e.root(), &m));
+                    .and_then(|e| open_owner_content(e.root(), &m));
                 match opened {
-                    Ok(frame) => h.messages.push(LoadedMessage {
+                    Ok(OwnerContent::Frame(frame)) => h.messages.push(LoadedMessage {
                         thread_id: thread_id.to_owned(),
                         message_id: m.message_id,
                         timestamp: m.timestamp,
@@ -156,6 +247,9 @@ impl Labyrinth {
                         source: MessageSource::Owner,
                         conflict: false,
                     }),
+                    Ok(OwnerContent::Tombstone { author }) => {
+                        tombstones.push((m.message_id, author));
+                    }
                     Err(error) => h.undecryptable.push(Undecryptable {
                         message_id: m.message_id,
                         timestamp: m.timestamp,
@@ -165,7 +259,7 @@ impl Labyrinth {
                 }
             }
         }
-        Ok(())
+        Ok(tombstones)
     }
 
     /// SPEC §7.4: the sender key must be one of the author's chat devices,
@@ -267,69 +361,41 @@ impl Labyrinth {
         }
         self.heads.get(head).copied().ok_or(Error::WrongEpoch)
     }
+}
 
-    /// Archive a message into my own mailbox in owner mode (v1.0, cipher
-    /// version 3) under my latest epoch. Buffered like sender batches.
-    pub fn archive_owner(
-        &mut self,
-        thread_id: &str,
-        message_id: &str,
-        timestamp: u64,
-        frame: &[u8],
-    ) -> Result<Option<super::FlushedBatch>> {
-        let e = self.epoch_secret(self.latest)?;
-        let m = seal_owner(e.root(), e.seq, thread_id, message_id, timestamp, frame)?;
-        let size = |m: &crate::message::OwnerMessage| m.encrypted.len().div_ceil(3) * 4 + 200;
-        let mut flushed = None;
-        let pending: usize = self
-            .owner_outbox
-            .get(thread_id)
-            .map_or(0, |v| v.iter().map(size).sum());
-        if pending > 0 && pending + size(&m) > BATCH_BYTE_BUDGET {
-            flushed = self.flush_owner(thread_id)?;
+/// Applies delete-for-me tombstones, merges copies and sorts.
+pub(super) fn finish(h: &mut ThreadHistory, tombstones: &[Tombstone]) {
+    let hidden = |id: &str, sender: Option<&String>, owner: bool| {
+        tombstones
+            .iter()
+            .any(|(t, author)| t == id && (owner || author.is_none() || author.as_ref() == sender))
+    };
+    let mut deleted: Vec<String> = Vec::new();
+    h.messages.retain(|m| {
+        let hide = hidden(
+            &m.message_id,
+            m.sender.as_ref(),
+            m.source == MessageSource::Owner,
+        );
+        if hide {
+            deleted.push(m.message_id.clone());
         }
-        let queue = self.owner_outbox.entry(thread_id.to_owned()).or_default();
-        queue.push(m);
-        if queue.len() >= MAX_BATCH_ITEMS {
-            flushed = self.flush_owner(thread_id)?;
-        }
-        Ok(flushed)
-    }
-
-    /// [CB-22]: before leaving a conversation (and losing read access to
-    /// its space), copy every message I can read that is not already in my
-    /// owner archive into my mailbox. Returns how many were archived.
-    ///
-    /// Owner records carry no sender DID; a client that needs it must keep
-    /// it inside the frame.
-    pub fn rearchive_thread_before_leave(&mut self, thread_id: &str) -> Result<usize> {
-        let history = self.load_thread(thread_id, TimeRange::ALL)?;
-        // What the owner archive already holds, by (messageId, frame): a
-        // copy counts as archived only if its plaintext is byte-equal, so
-        // two distinct messages sharing an id are both kept.
-        let mut owner = ThreadHistory::default();
-        self.load_owner(thread_id, TimeRange::ALL, &mut owner)?;
-        let mut archived: HashSet<(String, Vec<u8>)> = owner
-            .messages
-            .into_iter()
-            .map(|m| (m.message_id, m.frame))
-            .collect();
-        let mut n = 0;
-        for m in history.messages {
-            if m.source != MessageSource::Sender {
-                continue;
-            }
-            let key = (m.message_id, m.frame);
-            if archived.contains(&key) {
-                continue;
-            }
-            self.archive_owner(thread_id, &key.0, m.timestamp, &key.1)?;
-            archived.insert(key);
-            n += 1;
-        }
-        self.flush_owner(thread_id)?;
-        Ok(n)
-    }
+        !hide
+    });
+    h.undecryptable
+        .retain(|u| !hidden(&u.message_id, u.sender.as_ref(), u.sender.is_none()));
+    h.redacted
+        .retain(|r| !hidden(&r.message_id, Some(&r.sender), false));
+    deleted.sort();
+    deleted.dedup();
+    h.deleted_for_me = deleted;
+    dedupe(h);
+    h.messages
+        .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
+    h.undecryptable
+        .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
+    h.redacted
+        .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
 }
 
 /// Merge provably identical copies and flag the rest (see

@@ -220,6 +220,14 @@ impl Labyrinth {
         result
     }
 
+    /// Publish the newest epoch again, to the mailbox and every extra
+    /// publisher: the retry after a rotation whose epoch was created but
+    /// whose publish failed. The [CB-28] check depends on the other
+    /// directory staying current.
+    pub fn publish_latest_keys(&self) -> Result<()> {
+        self.publish_keys(&self.latest_public()?)
+    }
+
     /// Forward-chain into every epoch opened since this device last synced
     /// (e.g. by a sibling device's revocation), then run
     /// [`check_epoch_integrity`](Self::check_epoch_integrity).

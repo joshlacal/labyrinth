@@ -25,23 +25,31 @@
 //! epoch's attestation key must be one of that DID's chat devices as the
 //! [`MailboxDirectory`] reports them.
 
+pub mod archive;
+pub mod attach;
 pub mod composite;
+pub mod delete;
 pub mod enroll;
 pub mod epochs;
+pub mod lookup;
 pub mod members;
 pub mod pins;
 pub mod read;
+pub mod recovery;
 pub mod send;
 pub mod state;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub use composite::CompositeDirectory;
+pub use delete::PurgeReport;
 pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
 pub use epochs::{RotationReport, SyncReport};
+pub use lookup::{ThreadCursor, ThreadPage, ThreadSummary};
 pub use members::{ExcludedMember, ExclusionReason};
 pub use pins::PeerPin;
-pub use read::{LoadedMessage, MessageSource, ThreadHistory, Undecryptable};
+pub use read::{LoadedMessage, MessageSource, RedactedMessage, ThreadHistory, Undecryptable};
+pub use recovery::{AUTO_RECOVERY_TTL_MS, RecoveryMethod, recovery_expiry};
 pub use send::{ArchiveOutcome, FlushedBatch};
 
 use crate::device::{DevicePublic, DeviceSecrets};

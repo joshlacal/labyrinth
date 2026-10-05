@@ -212,6 +212,12 @@ impl Labyrinth {
         let latest = reached.last().expect("non-empty");
         let head = epoch_record(b.mailbox.as_ref(), latest.seq)?.1.public.head;
         check_integrity(b.directory.as_ref(), did, latest.seq, &head)?;
+        // [CB-39] The bundle was used: keep it from expiring. Before any
+        // write, so a failure leaves nothing half-enrolled.
+        match b.mailbox.touch_virtual_device(&record.vdevice_id) {
+            Ok(()) | Err(Error::NotSupported(_)) => {}
+            Err(e) => return Err(e),
+        }
 
         let (device, public, evolve_token, member) =
             virtual_device::enroll_from_virtual(&restored, latest)?;
