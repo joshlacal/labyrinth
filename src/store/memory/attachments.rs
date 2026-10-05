@@ -112,17 +112,20 @@ impl State {
         let s = self.orf_state(did, device)?;
         let index = orf_server_map(s, INDEX_DOMAIN, &f.blinded_index)?;
         let salt = orf_server_map(s, TOKEN_DOMAIN, &f.blinded_token_salt)?;
+        // A missing reference, a wrong token and a gone message all look
+        // the same, so a caller cannot probe which check failed.
+        let gone = Error::NotFound("attachment");
         let r = self
             .attach
             .refs
             .get(&(did.to_owned(), index))
-            .ok_or(Error::NotFound("attachment"))?;
+            .ok_or(gone.clone())?;
         let mac = token_mac(&salt, &f.thread_id, &f.message_id);
         if !bool::from(subtle::ConstantTimeEq::ct_eq(&mac[..], &r.token_mac[..])) {
-            return Err(Error::Forbidden);
+            return Err(gone);
         }
         if !self.message_live(did, &f.thread_id, &f.message_id) {
-            return Err(Error::Forbidden);
+            return Err(gone);
         }
         self.attach
             .blobs

@@ -2,7 +2,7 @@
 //! thread listings, recovery-bundle touch/delete and mailbox purge
 //! ([CB-38], [CB-39]).
 
-use super::State;
+use super::{MemoryBackend, State};
 use crate::deletion::Redaction;
 use crate::records::{RedactionDef, datetime_from_ms};
 use crate::{Error, Result};
@@ -47,6 +47,29 @@ impl State {
             return Err(Error::NotFound("message"));
         }
         Ok(n)
+    }
+
+    /// mls-ds `deleteAccountData`: redact every live item `did` authored
+    /// with an unsigned (account-deletion) redaction, then purge.
+    pub(super) fn delete_account_data(&mut self, did: &str) -> usize {
+        let def = RedactionDef::account_deletion(Some(datetime_from_ms(self.server_now)));
+        let mut n = 0;
+        for t in self.threads.values_mut() {
+            for (b, _) in t
+                .repos
+                .get_mut(did)
+                .into_iter()
+                .flat_map(|r| r.batches.values_mut())
+            {
+                for i in b.items.iter_mut().filter(|i| i.redaction.is_none()) {
+                    i.signed_enc_message.0.clear();
+                    i.redaction = Some(def.clone());
+                    n += 1;
+                }
+            }
+        }
+        self.purge(did);
+        n
     }
 
     /// Threads where `did` wrote a MEK or is a MEK recipient.
@@ -115,5 +138,14 @@ impl State {
         self.ds_heads.remove(did);
         self.orf.retain(|(owner, _), _| owner != did);
         self.purge_attachments(did);
+    }
+}
+
+impl MemoryBackend {
+    /// The server-side account deletion (mls-ds `deleteAccountData`):
+    /// unsigned redactions of every item `did` authored, then a mailbox
+    /// purge. Returns how many items were redacted.
+    pub fn delete_account_data(&self, did: &str) -> usize {
+        self.lock().delete_account_data(did)
     }
 }

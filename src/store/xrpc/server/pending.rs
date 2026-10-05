@@ -10,16 +10,18 @@
 //! | `purgeMailbox` | `{}` → `{}` |
 //! | `touchVirtualDevice`, `deleteVirtualDevice` | `{vdeviceId}` → `{}` |
 //! | `putAttachmentRef` | `{deviceKeyPubkey, blindedIndex, blindedTokenSalt, blobId, threadId, messageId}` → `{}` |
-//! | `getAttachmentBlob` | `{deviceKeyPubkey, blindedIndex, blindedTokenSalt, threadId, messageId}` → blob bytes |
+//! | `getAttachmentBlob` (query) | `deviceKeyPubkey, blindedIndex, blindedTokenSalt` (hex), `threadId, messageId` → blob bytes |
 //! | `deleteAttachmentRef` | `{deviceKeyPubkey, blindedIndex}` → `{}` |
 //! | `listThreads`, `listOwnerThreads` (crate proposal, not built in mls-ds) | → `{threads: [threadId]}` |
 //!
-//! `getAttachmentBlob` takes its inputs as a JSON body here (it carries
-//! two 32-byte values); the mls-ds lexicon decides query vs. procedure.
+//! Errors as mls-ds returns them: a missing reference, a wrong token and a
+//! redacted or missing message are all `NotFound` (no probing);
+//! `OrfStateNotFound`; `AttachmentNotEntitled` (403) on put;
+//! `AttachmentAlreadyReferenced` (409).
 
 use serde::{Deserialize, Serialize};
 
-use super::{Caller, Input, MemoryXrpcServer, Reply, bad, body, err, json};
+use super::{Caller, Input, MemoryXrpcServer, Reply, bad, body, err, hex_param, json, req};
 use crate::deletion::Redaction;
 use crate::orf::ObliviousId;
 use crate::records::Bytes;
@@ -68,16 +70,6 @@ pub(crate) struct PutRefIn {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct GetBlobIn {
-    pub device_key_pubkey: Bytes,
-    pub blinded_index: Bytes,
-    pub blinded_token_salt: Bytes,
-    pub thread_id: String,
-    pub message_id: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DeleteRefIn {
     pub device_key_pubkey: Bytes,
     pub blinded_index: Bytes,
@@ -100,6 +92,7 @@ fn attachment_error(e: crate::Error) -> XrpcError {
             XrpcError::named(409, "AttachmentAlreadyReferenced", e.to_string())
         }
         crate::Error::NotFound("attachment") => XrpcError::named(404, "NotFound", e.to_string()),
+        crate::Error::Forbidden => XrpcError::named(403, "AttachmentNotEntitled", e.to_string()),
         e => err(e),
     }
 }
@@ -166,14 +159,13 @@ pub(super) fn handle(
             json(&Empty {})
         })(),
         "getAttachmentBlob" => (|| {
-            let i: GetBlobIn = body(input)?;
             let f = AttachmentFetch {
-                blinded_index: ObliviousId(arr(&i.blinded_index, "blindedIndex")?),
-                blinded_token_salt: ObliviousId(arr(&i.blinded_token_salt, "blindedTokenSalt")?),
-                thread_id: i.thread_id,
-                message_id: i.message_id,
+                blinded_index: ObliviousId(hex_param(input, "blindedIndex")?),
+                blinded_token_salt: ObliviousId(hex_param(input, "blindedTokenSalt")?),
+                thread_id: req(input, "threadId")?.to_owned(),
+                message_id: req(input, "messageId")?.to_owned(),
             };
-            let k = XVerifyingKey(arr(&i.device_key_pubkey, "deviceKeyPubkey")?);
+            let k = XVerifyingKey(hex_param(input, "deviceKeyPubkey")?);
             orf.fetch_attachment(&k, &f).map_err(attachment_error)
         })(),
         "deleteAttachmentRef" => (|| {

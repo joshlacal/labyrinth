@@ -48,7 +48,7 @@ fn attachment_references_follow_the_message_and_the_device() {
     // id does not open.
     assert_eq!(
         bob.fetch_attachment(T, "m2", "blob-1").unwrap_err(),
-        Error::Forbidden
+        Error::NotFound("attachment")
     );
     // A device restored later reaches it through the evolved ORF state.
     let setup = bob.create_recovery_code(Mechanism::Code).unwrap();
@@ -77,7 +77,7 @@ fn attachment_references_follow_the_message_and_the_device() {
     alice.unsend(T, "m1").unwrap();
     assert_eq!(
         alice.fetch_attachment(T, "m1", "blob-1").unwrap_err(),
-        Error::Forbidden
+        Error::NotFound("attachment")
     );
     // A revoked device's ORF state is gone.
     alice.attach_reference(T, "m2", "blob-2").unwrap();

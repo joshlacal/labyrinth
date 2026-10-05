@@ -49,16 +49,20 @@ pub struct Undecryptable {
     pub error: Error,
 }
 
-/// A message its author unsent ([CB-38]): render it as removed.
+/// A redacted message ([CB-38]): render it as removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RedactedMessage {
     pub message_id: String,
     pub timestamp: u64,
     pub sender: String,
     /// True when the redaction is signed by one of the author's chat
-    /// devices; false means the server removed it on its own (or the
-    /// signing device is unknown), which the UI may want to say.
+    /// devices ("unsent"); false means the server removed it on its own
+    /// (or the signing device is unknown).
     pub by_author: bool,
+    /// The server redacted it because the author's account was deleted
+    /// (an unsigned redaction): "deleted (account removed)". Never an
+    /// author unsend; `by_author` is false.
+    pub account_deleted: bool,
 }
 
 /// Result of [`Labyrinth::load_thread`], ordered by `(timestamp, messageId)`.
@@ -166,13 +170,15 @@ impl Labyrinth {
                         timestamp,
                         redaction,
                     } => {
-                        let by_author =
-                            self.redaction_by_author(thread_id, &b.author, &message_id, &redaction);
+                        let by_author = redaction.as_ref().is_some_and(|r| {
+                            self.redaction_by_author(thread_id, &b.author, &message_id, r)
+                        });
                         h.redacted.push(RedactedMessage {
                             message_id,
                             timestamp,
                             sender: b.author.clone(),
                             by_author,
+                            account_deleted: redaction.is_none(),
                         });
                         continue;
                     }

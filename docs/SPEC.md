@@ -425,10 +425,11 @@ Decision J1 defaults (provisional; `src/deletion.rs`, `src/client/delete.rs`):
 |---|---|---|
 | **Delete for me** (`delete_for_me`) | an owner-mode v5 tombstone (§7.1, kind `0x01`) in the reader's own mailbox, with the target's `messageId` and `timestamp` and an optional author DID; the message's attachment references are deleted | every device of the account hides the message (`ThreadHistory::deleted_for_me`); other members and the server see nothing |
 | **Unsend** (`unsend`) | the author's signed `redaction` replaces the item's `signedEncMessage` (now empty), keeping `messageId`/`timestamp`/`mekId`; `ThreadStore::redact_item`, mls-ds `redactMessage` | every reader gets `ThreadHistory::redacted`, with `by_author` true only if a chat key of the author signed `"catbird.labyrinth.redaction:did=" \|\| did \|\| ";message_id=" \|\| id \|\| ";thread_id=" \|\| hex(threadId)`; attachment fetches for it fail |
+| **Account deletion, server side** (mls-ds `deleteAccountData`) | the server redacts every item the DID authored with an **unsigned** `redaction` (`redactedAt` only; no key, no signature), then purges the mailbox | readers get `RedactedMessage::account_deleted = true`: "deleted (account removed)", never an unsend (`by_author` is false) |
 | **Account deletion** (`purge_account`) | redact every authored item in every thread, retract the epochs from every extra publisher, then `purge_mailbox` (devices, epochs, members, bundles, owner archive, ORF states, attachment refs, `mailboxKeys`) | others keep their history with the user's messages shown as removed |
 | **Edit** | frame level: a new message referencing the old id in the chat frame schema | Labyrinth stores both; the client applies the edit. Erasing the old text is an unsend |
 
-Each sealed item is signed on its own (`sig || ct`), so redacting one leaves the rest of its batch verifiable. Server backups keep deleted data for their retention window (Messenger caveat 3, p.49).
+Each sealed item is signed on its own (`sig || ct`), so redacting one leaves the rest of its batch verifiable. `defs#redaction` therefore has no required fields: `transportPubkey` and `sig` are absent exactly for an account-deletion redaction, and one without the other is malformed. A missing reference, a wrong token and a redacted message all fail an attachment fetch with the same `NotFound`, so callers cannot probe which. Server backups keep deleted data for their retention window (Messenger caveat 3, p.49).
 
 ## 8. Attachments (p.41–43)
 

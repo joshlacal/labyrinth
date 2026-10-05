@@ -171,3 +171,4 @@ Override by:
 - J1, J2 or J4 answered differently: edit `src/client/delete.rs`, `src/client/recovery.rs` or `src/attachment.rs`.
 - To restore abort-on-invalid: revert `src/client/members.rs` and the rotate changes in `src/client/epochs.rs`.
 - The tests `tests/rotation_audit.rs`, `tests/history_ops.rs`, `tests/attachments_recovery.rs` and `tests/xrpc_pending.rs` pin the behaviour.
+- **Amendment (agreed with the mls-ds lane):** `defs#redaction` has `required: []`. Server-side account deletion (`deleteAccountData`) has no author signature, so it writes `{redactedAt}` alone, and readers flag it `account_deleted`, never as an author unsend. Attachment fetch failures (missing ref, wrong token, redacted message) are all `NotFound`; a put the caller isn't entitled to is `AttachmentNotEntitled`. `getAttachmentBlob` is a query with hex params, as in mls-ds.

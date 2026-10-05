@@ -402,6 +402,8 @@ pub trait OrfServer {
     /// The blob bytes behind a reference, after the server recomputes the
     /// token MAC from the presented thread and message, and checks the
     /// message still exists unredacted where the caller can read it.
+    /// A missing reference, a wrong token and a gone message are all
+    /// [`Error::NotFound`] (`"attachment"`), so callers cannot probe.
     /// mls-ds `getAttachmentBlob` (new shape).
     fn fetch_attachment(
         &self,

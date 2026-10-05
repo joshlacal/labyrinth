@@ -346,10 +346,24 @@ fn gap_fields_validate() {
         vec![BatchEntry::Redacted {
             message_id: "m1".into(),
             timestamp: 7,
-            redaction: r,
+            redaction: Some(r),
         }]
     );
     assert!(batch.to_messages().is_err());
+    // An account-deletion redaction carries neither key nor signature.
+    batch.items[0].redaction = Some(RedactionDef::account_deletion(Some(ts.clone())));
+    check(&lex, nsid::BATCH, &batch);
+    assert!(matches!(
+        &batch.entries().unwrap()[0],
+        BatchEntry::Redacted {
+            redaction: None,
+            ..
+        }
+    ));
+    let mut half = RedactionDef::account_deletion(None);
+    half.sig = Some(labyrinth::records::Bytes(vec![0; 64]));
+    batch.items[0].redaction = Some(half);
+    assert!(batch.entries().is_err());
 
     let ob = OwnerBatch::from_messages(
         &[labyrinth::message::seal_owner_tombstone(&[1u8; 32], 0, THREAD, "m1", 7, None).unwrap()],

@@ -88,12 +88,16 @@ impl EpochPublicDef {
     }
 }
 
-/// `defs#redaction` ([CB-38]): an author's signed unsend request.
+/// `defs#redaction` ([CB-38]): an author's signed unsend request, or
+/// (without `transportPubkey` and `sig`) a server redaction for an account
+/// deletion (mls-ds `deleteAccountData`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactionDef {
-    pub transport_pubkey: Bytes,
-    pub sig: Bytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_pubkey: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redacted_at: Option<String>,
 }
@@ -101,18 +105,34 @@ pub struct RedactionDef {
 impl RedactionDef {
     pub fn from_redaction(r: &Redaction) -> Self {
         Self {
-            transport_pubkey: Bytes::from_slice(&r.transport_public_key),
-            sig: Bytes::from_slice(&r.sig),
+            transport_pubkey: Some(Bytes::from_slice(&r.transport_public_key)),
+            sig: Some(Bytes::from_slice(&r.sig)),
             redacted_at: r.redacted_at.clone(),
         }
     }
 
-    pub fn to_redaction(&self) -> Result<Redaction> {
-        Ok(Redaction {
-            transport_public_key: self.transport_pubkey.array("redaction key length")?,
-            sig: self.sig.array("redaction sig length")?,
-            redacted_at: self.redacted_at.clone(),
-        })
+    /// The unsigned redaction a server writes for an account deletion.
+    pub fn account_deletion(redacted_at: Option<String>) -> Self {
+        Self {
+            transport_pubkey: None,
+            sig: None,
+            redacted_at,
+        }
+    }
+
+    /// The author's signed redaction; `None` for an account-deletion
+    /// redaction (no key and no signature). One without the other is
+    /// malformed.
+    pub fn to_redaction(&self) -> Result<Option<Redaction>> {
+        match (&self.transport_pubkey, &self.sig) {
+            (None, None) => Ok(None),
+            (Some(k), Some(s)) => Ok(Some(Redaction {
+                transport_public_key: k.array("redaction key length")?,
+                sig: s.array("redaction sig length")?,
+                redacted_at: self.redacted_at.clone(),
+            })),
+            _ => Err(Error::Malformed("redaction key and sig must come together")),
+        }
     }
 }
 
@@ -143,8 +163,10 @@ impl SealedMessageDef {
         }
     }
 
-    /// The redaction, if this item was unsent ([CB-38]).
-    pub fn redaction(&self) -> Result<Option<Redaction>> {
+    /// `None` if the item is live; `Some(None)` if the server redacted it
+    /// for an account deletion; `Some(Some(r))` if its author unsent it
+    /// ([CB-38]).
+    pub fn redaction(&self) -> Result<Option<Option<Redaction>>> {
         self.redaction
             .as_ref()
             .map(RedactionDef::to_redaction)

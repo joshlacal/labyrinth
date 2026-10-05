@@ -192,6 +192,30 @@ fn purge_account_redacts_authored_items_and_erases_the_mailbox() {
     assert!(net.mailbox(A).list_epochs_for_test().is_empty());
 }
 
+#[test]
+fn server_account_deletion_reads_as_removed_not_unsent() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut alice = init(&net, &clock, A, 1);
+    let mut bob = init(&net, &clock, B, 2);
+    send(&mut alice, T, &[A, B], "m1", 10);
+    alice.flush().unwrap();
+    send(&mut bob, T, &[A, B], "b1", 20);
+    bob.flush().unwrap();
+    // mls-ds deleteAccountData: unsigned redactions, then a purge.
+    assert_eq!(net.delete_account_data(A), 1);
+    let h = read(&mut bob, T);
+    assert_eq!(ids(&h), ["b1"]);
+    assert_eq!(h.redacted.len(), 1);
+    let r = &h.redacted[0];
+    assert!(r.account_deleted && !r.by_author, "{r:?}");
+    // An author's own unsend is the opposite.
+    bob.unsend(T, "b1").unwrap();
+    let h = read(&mut bob, T);
+    let mine = h.redacted.iter().find(|r| r.message_id == "b1").unwrap();
+    assert!(mine.by_author && !mine.account_deleted);
+}
+
 trait ListEpochs {
     fn list_epochs_for_test(&self) -> Vec<u64>;
 }

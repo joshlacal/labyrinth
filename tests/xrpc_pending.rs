@@ -79,16 +79,20 @@ fn pending_endpoints_follow_the_agreed_shapes() {
         )
     };
     let get = |message: &str| {
-        call(
-            &*t,
-            "getAttachmentBlob",
-            json!({"deviceKeyPubkey": b(&device), "blindedIndex": b(&bi.0),
-                   "blindedTokenSalt": b(&bt.0), "threadId": T, "messageId": message}),
+        t.query(
+            "blue.catbird.labyrinth.getAttachmentBlob",
+            &[
+                ("deviceKeyPubkey", hex::encode(device)),
+                ("blindedIndex", hex::encode(bi.0)),
+                ("blindedTokenSalt", hex::encode(bt.0)),
+                ("threadId", T.to_owned()),
+                ("messageId", message.to_owned()),
+            ],
         )
     };
     put("m1").unwrap();
     assert_eq!(get("m1").unwrap(), b"ciphertext");
-    assert_eq!(err_name(get("m2")), "NotAuthorized");
+    assert_eq!(err_name(get("m2")), "NotFound");
 
     // Unsend: only with the calling chat device's own key.
     let r = Redaction::sign(A, T, "m1", &signer(1));
@@ -105,7 +109,7 @@ fn pending_endpoints_follow_the_agreed_shapes() {
     let out: Value = serde_json::from_slice(&redact(&r).unwrap()).unwrap();
     assert_eq!(out, json!({"redacted": 1}));
     // The message is gone, so the attachment is too.
-    assert_eq!(err_name(get("m1")), "NotAuthorized");
+    assert_eq!(err_name(get("m1")), "NotFound");
     call(
         &*t,
         "deleteAttachmentRef",
@@ -167,6 +171,7 @@ fn a_second_message_for_one_blob_is_refused() {
                    "threadId": T, "messageId": message}),
         )
     };
+    assert_eq!(err_name(put("m3")), "AttachmentNotEntitled");
     put("m1").unwrap();
     assert_eq!(err_name(put("m2")), "AttachmentAlreadyReferenced");
 }
