@@ -323,7 +323,7 @@ fn stale_head_replay_after_contact_is_rejected() {
 // ---- Finding 4: an invalid continuing member aborts rotation ([CB-25]) ----
 
 #[test]
-fn rotation_with_invalid_member_mac_fails() {
+fn rotation_excludes_and_reports_an_invalid_member() {
     let net = MemoryBackend::new();
     let clock = TestClock::default();
     net.register_chat_device(A, tpub(1));
@@ -349,12 +349,24 @@ fn rotation_with_invalid_member_mac_fails() {
     m.device_key_pubkey =
         labyrinth::records::Bytes::from_slice(&forged_key.public().device_key_pub.0);
     mb.create_epoch_member(&m).unwrap();
-    let err = laptop
+    // [CB-25] as amended: the planted row neither blocks the revocation
+    // (a DoS) nor disappears silently; it is dropped and reported.
+    let report = laptop
         .revoke_device(&phone.device_public().device_key_pub)
-        .unwrap_err();
-    assert!(matches!(err, Error::Malformed(_)), "{err:?}");
-    // Nothing was rotated: the tablet is still current.
-    assert_eq!(tablet.sync_epochs().unwrap().to, 0);
+        .unwrap();
+    assert_eq!(report.new_epoch, 1);
+    let forged = forged_key.public().device_key_pub;
+    assert_eq!(
+        report.excluded,
+        vec![labyrinth::client::ExcludedMember {
+            device_key: Some(forged),
+            reason: labyrinth::client::ExclusionReason::InvalidMac,
+        }]
+    );
+    // The tablet is carried over; the forged device is not a member.
+    assert_eq!(tablet.sync_epochs().unwrap().to, 1);
+    assert!(mb.get_epoch_member(1, &forged).unwrap().is_none());
+    assert!(mb.get_epoch_member(1, &tablet_key).unwrap().is_some());
 }
 
 /// Directory that refuses to serve one historical epoch.
@@ -648,9 +660,9 @@ fn state_round_trips_and_a_restarted_client_keeps_working() {
     let mut long = state.to_vec();
     long.push(0);
     assert!(restore(&long, A, 1).is_err());
-    let mut v2 = state.to_vec();
-    v2[4] = 2;
-    assert_eq!(restore(&v2, A, 1), Err(Error::Unsupported(2)));
+    let mut v3 = state.to_vec();
+    v3[4] = 3;
+    assert_eq!(restore(&v3, A, 1), Err(Error::Unsupported(3)));
     let mut bad_key = state.to_vec();
     let at = 4 + 1 + 2 + A.len() + 32 + 1; // second byte of deviceKey (byte 0 is clamped)
     bad_key[at] ^= 1;

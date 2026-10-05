@@ -5,6 +5,7 @@ use std::cell::RefCell;
 
 use super::epochs::{chain_forward, check_integrity, epoch_record};
 use super::{Backends, Labyrinth};
+use crate::device::ChatBinding;
 use crate::epoch::{EpochKeys as _, EpochSecret, PendingEpoch, verify_public};
 use crate::orf::EvolveToken;
 use crate::otc::{Initiator, InitiatorMessage, OneTimeCode, Responder, ResponderMessage};
@@ -115,12 +116,14 @@ impl Labyrinth {
             .transpose()?;
         let now = self.now();
         let mb = self.b.mailbox.as_ref();
+        // Device record first: mls-ds admits only registered devices as
+        // members (createVirtualDevice may carry the membership).
+        mb.create_device(&Device::from_public(&rec.public, now.clone()))?;
         mb.create_virtual_device(&VirtualDevice::from_bundle(
             &rec,
             wrap.as_ref(),
             now.clone(),
         ))?;
-        mb.create_device(&Device::from_public(&rec.public, now.clone()))?;
         mb.create_epoch_member(&EpochMember::from_record(&member, now))?;
         self.b.orf.register(
             &rec.public.device_key_pub,
@@ -204,6 +207,7 @@ impl Labyrinth {
             start,
             restored.device.public(),
             &restored.device.storage,
+            &Default::default(),
         )?;
         let latest = reached.last().expect("non-empty");
         let head = epoch_record(b.mailbox.as_ref(), latest.seq)?.1.public.head;
@@ -212,8 +216,9 @@ impl Labyrinth {
         let (device, public, evolve_token, member) =
             virtual_device::enroll_from_virtual(&restored, latest)?;
         let now = datetime_from_ms(b.clock.now_ms());
+        let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());
         b.mailbox
-            .create_device(&Device::from_public(&public, now.clone()))?;
+            .create_device(&Device::bound(&public, &binding, now.clone()))?;
         b.mailbox
             .create_epoch_member(&EpochMember::from_record(&member, now))?;
         b.orf.register(
@@ -295,8 +300,9 @@ impl Labyrinth {
         check_integrity(b.directory.as_ref(), did, epoch.seq, &record.public.head)?;
         let (device, public, evolve_token, member) = payload.enroll()?;
         let now = datetime_from_ms(b.clock.now_ms());
+        let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());
         b.mailbox
-            .create_device(&Device::from_public(&public, now.clone()))?;
+            .create_device(&Device::bound(&public, &binding, now.clone()))?;
         b.mailbox
             .create_epoch_member(&EpochMember::from_record(&member, now))?;
         let temp = otc_temp_orf_id(&isk);

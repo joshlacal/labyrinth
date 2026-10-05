@@ -45,6 +45,23 @@ pub enum Error {
     MekMismatch,
     #[error("randomness unavailable")]
     Rng,
+    /// [CB-40] The store holds epoch `seq` (the create-if-absent race
+    /// guard), but it does not chain from this device's epoch: it is not
+    /// signed by the previous epoch's mailbox key, its opener is not a
+    /// valid member of the previous epoch (or is locally revoked), or its
+    /// entropy does not open. No rotation can succeed until the backend
+    /// removes it, so the client reports it instead of retrying.
+    #[error("epoch {seq} is squatted by an invalid record: {reason}")]
+    EpochSquatted { seq: u64, reason: &'static str },
+    /// [CB-25] A member this client already verified in the epoch being
+    /// rotated now fails verification: the store altered a record it had
+    /// served intact. Rotation aborts rather than silently evicting it.
+    #[error("a member this device verified in epoch {seq} no longer verifies")]
+    MemberTampered { seq: u64 },
+    /// The backend does not provide this operation (yet), e.g. an mls-ds
+    /// endpoint whose lexicon is not wired into the XRPC stores.
+    #[error("operation not supported by this backend: {0}")]
+    NotSupported(&'static str),
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

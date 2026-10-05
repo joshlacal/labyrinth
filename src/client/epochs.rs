@@ -3,8 +3,9 @@
 
 use std::collections::BTreeSet;
 
+use super::members::ExcludedMember;
 use super::{Backends, Labyrinth};
-use crate::device::{DevicePublic, DeviceSecrets};
+use crate::device::{ChatBinding, DevicePublic, DeviceSecrets};
 use crate::encoding::random;
 use crate::epoch::{
     EpochMemberRecord, EpochRecord, EpochSecret, OpenedEpoch, backward_chain, forward_chain,
@@ -26,6 +27,11 @@ pub struct SyncReport {
     /// rotation never completed). Call [`Labyrinth::revoke_device`] again
     /// for each.
     pub readmitted: Vec<XVerifyingKey>,
+    /// Members of the reached epoch that fail verification or are not
+    /// bound to a current chat device ([CB-25], [CB-36]). The next
+    /// rotation drops them; surface them to the user (a planted row, or a
+    /// removed chat device whose Labyrinth device is still a member).
+    pub invalid_members: Vec<ExcludedMember>,
 }
 
 /// Result of [`Labyrinth::revoke_device`].
@@ -36,6 +42,10 @@ pub struct RotationReport {
     /// The revoked device. Its ORF server state ([CB-17]) has already
     /// been deleted through [`super::Backends::orf`] (SPEC §5.6).
     pub revoked: XVerifyingKey,
+    /// Members of the previous epoch the rotation dropped because they
+    /// failed verification or are not bound to a current chat device
+    /// ([CB-25] as amended, [CB-36]). Never silent: show these.
+    pub excluded: Vec<ExcludedMember>,
 }
 
 /// How many times a rotation retries after losing the create race.
@@ -49,12 +59,6 @@ pub(super) fn epoch_record(mb: &dyn MailboxStore, seq: u64) -> Result<(String, E
     Ok((s.rkey, s.value.to_record()?))
 }
 
-fn device_public(mb: &dyn MailboxStore, key: &XVerifyingKey) -> Result<DevicePublic> {
-    mb.get_device(key)?
-        .ok_or(Error::NotFound("device"))?
-        .to_public()
-}
-
 fn member(
     mb: &dyn MailboxStore,
     seq: u64,
@@ -66,29 +70,62 @@ fn member(
 }
 
 /// Forward-chains from `start` as long as the store has a next epoch.
-/// Returns every epoch reached, `start` first. A next epoch that holds no
-/// membership for `me` fails with [`Error::NotEpochMember`]: the device
-/// was revoked.
+/// Returns every epoch reached, `start` first.
+///
+/// A next epoch that chains validly (signed with the previous epoch's
+/// mailbox key, opened by a valid member of the previous epoch) but holds
+/// no valid membership for `me` fails with [`Error::NotEpochMember`]: the
+/// device was revoked. A next epoch that does not chain, or whose opener
+/// is in `revoked`, fails with [`Error::EpochSquatted`] ([CB-40]): it
+/// occupies the sequence number every rotation needs, so retrying cannot
+/// help and the caller must surface it.
 pub(super) fn chain_forward(
     mb: &dyn MailboxStore,
     did: &str,
     start: EpochSecret,
     me: &DevicePublic,
     storage: &X25519Secret,
+    revoked: &BTreeSet<[u8; 32]>,
 ) -> Result<Vec<EpochSecret>> {
     let mut out = vec![start];
     loop {
         let prev = out.last().expect("non-empty");
-        let seq = prev.seq + 1;
+        let seq = prev
+            .seq
+            .checked_add(1)
+            .ok_or(Error::Malformed("epoch sequence overflow"))?;
         let Some(next) = mb.get_epoch(seq)? else {
             return Ok(out);
         };
-        let record = next.value.to_record()?;
-        let mine = member(mb, seq, &me.device_key_pub)?.ok_or(Error::NotEpochMember)?;
-        let opener = device_public(mb, &record.opened_by)?;
-        let opener_prev =
-            member(mb, prev.seq, &opener.device_key_pub)?.ok_or(Error::NotEpochMember)?;
+        let squat = |reason| Error::EpochSquatted { seq, reason };
+        let record = next
+            .value
+            .to_record()
+            .ok()
+            .filter(|r| r.public.seq == seq)
+            .ok_or(squat("the epoch record does not parse"))?;
         let prev_public = epoch_record(mb, prev.seq)?.1.public;
+        record
+            .public
+            .verify(did, Some(&prev_public))
+            .map_err(|_| squat("it is not signed by the previous epoch's mailbox key"))?;
+        let opener = mb
+            .get_device(&record.opened_by)?
+            .and_then(|d| d.to_public().ok())
+            .filter(|p| p.verify().is_ok() && !p.is_virtual && p.device_key_pub == record.opened_by)
+            .ok_or(squat("its opener has no valid physical device record"))?;
+        if revoked.contains(&record.opened_by.0) {
+            return Err(squat("it was opened by a device this client revoked"));
+        }
+        let opener_prev = member(mb, prev.seq, &opener.device_key_pub)
+            .ok()
+            .flatten()
+            .filter(|m| verify_member(prev, m).is_ok())
+            .ok_or(squat("its opener was not a member of the previous epoch"))?;
+        let mine = member(mb, seq, &me.device_key_pub)
+            .ok()
+            .flatten()
+            .ok_or(Error::NotEpochMember)?;
         let opened = OpenedEpoch {
             epoch_id: &next.rkey,
             record: &record,
@@ -96,7 +133,10 @@ pub(super) fn chain_forward(
             opener: &opener,
             opener_prev_member: &opener_prev,
         };
-        let e = forward_chain(did, prev, &prev_public, &opened, storage)?;
+        let e = forward_chain(did, prev, &prev_public, &opened, storage).map_err(|e| match e {
+            Error::NotEpochMember => Error::NotEpochMember,
+            _ => squat("the entropy addressed to this device does not open"),
+        })?;
         out.push(e);
     }
 }
@@ -143,16 +183,21 @@ impl Labyrinth {
             .iter()
             .map(|m| EpochMember::from_record(m, now.clone()))
             .collect();
-        // The epoch create is the guard; the device record follows it.
+        // mls-ds admits only registered devices as epoch members, so the
+        // device record comes first; the epoch create stays the race guard
+        // (a loser leaves an orphan device record that is never a member).
+        let key = device.public().device_key_pub;
+        let binding = ChatBinding::sign(did, &key, transport.as_ref());
+        b.mailbox
+            .create_device(&Device::bound(device.public(), &binding, now.clone()))?;
         let id = b
             .mailbox
-            .create_epoch(&Epoch::from_record(&new.record, now.clone()), &members)?;
-        b.mailbox
-            .create_device(&Device::from_public(device.public(), now))?;
-        b.orf.register(&device.public().device_key_pub, None)?;
+            .create_epoch(&Epoch::from_record(&new.record, now), &members)?;
+        b.orf.register(&key, None)?;
         let mut salt = [0u8; 32];
         random(&mut salt)?;
-        let me = Self::assemble(did, device, transport, b, salt, [pending.assign_id(id)])?;
+        let mut me = Self::assemble(did, device, transport, b, salt, [pending.assign_id(id)])?;
+        me.remember_verified(0, [key.0]);
         me.publish_keys(&new.record.public)?;
         Ok(me)
     }
@@ -189,30 +234,31 @@ impl Labyrinth {
             start,
             self.device.public(),
             &self.device.storage,
+            &self.revoked,
         )?;
         for e in reached {
             self.latest = self.latest.max(e.seq);
             self.epochs.insert(e.seq, e);
         }
         self.check_epoch_integrity()?;
-        let readmitted = if self.revoked.is_empty() {
-            Vec::new()
-        } else {
-            self.b
-                .mailbox
-                .list_epoch_members(self.latest)?
-                .iter()
-                .map(EpochMember::to_record)
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .map(|m| m.device_key_pub)
-                .filter(|k| self.revoked.contains(&k.0))
-                .collect()
-        };
+        let latest = self.epoch_secret(self.latest)?;
+        let audit = self.audit_epoch(&latest)?;
+        let readmitted = audit
+            .valid
+            .iter()
+            .map(|v| v.record.device_key_pub)
+            .chain(audit.excluded.iter().filter_map(|x| x.device_key))
+            .filter(|k| self.revoked.contains(&k.0))
+            .collect();
+        self.remember_verified(
+            latest.seq,
+            audit.valid.iter().map(|v| v.record.device_key_pub.0),
+        );
         Ok(SyncReport {
             from,
             to: self.latest,
             readmitted,
+            invalid_members: audit.excluded,
         })
     }
 
@@ -280,10 +326,11 @@ impl Labyrinth {
                 Err(Error::Conflict) => {
                     self.sync_epochs()?;
                 }
-                Ok(new_epoch) => {
+                Ok((new_epoch, excluded)) => {
                     return Ok(RotationReport {
                         new_epoch,
                         revoked: *target,
+                        excluded,
                     });
                 }
                 Err(e) => return Err(e),
@@ -301,33 +348,38 @@ impl Labyrinth {
     /// Open the epoch after `self.latest`, carrying over every member of
     /// the previous epoch except this device (the opener is added by
     /// [`open_next`]), the devices in `exclude`, and devices the store
-    /// reports as revoked. A carried-over device whose MAC fails aborts the
-    /// rotation ([CB-25]).
-    fn rotate(&mut self, exclude: &BTreeSet<[u8; 32]>) -> Result<u64> {
+    /// reports as revoked.
+    ///
+    /// [CB-25] as amended: a member that fails verification or is not
+    /// bound to a current chat device ([CB-36]) is dropped and returned,
+    /// so one planted row cannot block revocation; a member this client
+    /// already verified in that epoch failing now aborts with
+    /// [`Error::MemberTampered`].
+    fn rotate(&mut self, exclude: &BTreeSet<[u8; 32]>) -> Result<(u64, Vec<ExcludedMember>)> {
         let prev = self.epoch_secret(self.latest)?;
+        let mine = self.transport.transport_public_key();
+        let current = self.b.directory.device_transport_keys(&self.did)?;
+        if !current.iter().any(|k| k.is_current() && k.key == mine) {
+            // Without our own chat device the directory view is wrong (or
+            // we were removed); a rotation would drop every sibling.
+            return Err(Error::Unattested);
+        }
+        let audit = self.audit_epoch(&prev)?;
+        self.check_not_tampered(prev.seq, &audit.excluded)?;
         let mb = self.b.mailbox.as_ref();
         let (_, prev_record) = epoch_record(mb, prev.seq)?;
-        let prev_members: Vec<EpochMemberRecord> = mb
-            .list_epoch_members(prev.seq)?
-            .iter()
-            .map(EpochMember::to_record)
-            .collect::<Result<_>>()?;
         let me = self.device.public().device_key_pub;
-        let mut continuing = Vec::new();
-        for m in &prev_members {
-            if m.device_key_pub == me || exclude.contains(&m.device_key_pub.0) {
-                continue;
-            }
-            let rec = mb
-                .get_device(&m.device_key_pub)?
-                .ok_or(Error::NotFound("device"))?;
-            if rec.revoked_at.is_some() {
-                continue;
-            }
-            verify_member(&prev, m)
-                .map_err(|_| Error::Malformed("continuing device has an invalid epoch MAC"))?;
-            continuing.push(rec.to_public()?);
-        }
+        let continuing: Vec<DevicePublic> = audit
+            .valid
+            .iter()
+            .filter(|v| {
+                let k = v.record.device_key_pub;
+                k != me && !exclude.contains(&k.0) && !v.revoked
+            })
+            .map(|v| v.public.clone())
+            .collect();
+        let prev_members: Vec<EpochMemberRecord> =
+            audit.valid.iter().map(|v| v.record.clone()).collect();
         let (pending, new) = open_next(
             &self.did,
             &prev,
@@ -354,7 +406,13 @@ impl Labyrinth {
         let e = pending.assign_id(id);
         self.latest = e.seq;
         self.epochs.insert(e.seq, e);
+        self.remember_verified(self.latest, new.members.iter().map(|m| m.device_key_pub.0));
         self.publish_keys(&new.record.public)?;
-        Ok(self.latest)
+        let excluded = audit
+            .excluded
+            .into_iter()
+            .filter(|x| x.device_key.is_none_or(|k| !exclude.contains(&k.0)))
+            .collect();
+        Ok((self.latest, excluded))
     }
 }

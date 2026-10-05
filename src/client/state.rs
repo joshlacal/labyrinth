@@ -17,7 +17,7 @@
 //! length-prefixed, no trailing bytes:
 //!
 //! ```text
-//! "LBYS" 0x01
+//! "LBYS" 0x02            (0x01 = the same without `verified`)
 //! did                      str16
 //! transportPub             32
 //! deviceKey storage        32 32
@@ -29,6 +29,7 @@
 //! latest                   u64
 //! epochs   u32 × (seq u64, epochID str16, root 32)
 //! revoked  u32 × 32
+//! verified seq u64, u32 × 32          members verified in epoch seq ([CB-25])
 //! pins     u32 × (did str16, seq u64, head 32, sigKey 32)
 //! meks     u32 × (threadId str16, u32 × (secret 32, rosterHash 32, provenance))
 //! provenance = 0x00 | 0x01 senderDid str16 head 32 | 0x02 transportPub 32 createdHere u8
@@ -50,7 +51,7 @@ use crate::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"LBYS";
 /// Version byte of the state encoding.
-pub const STATE_VERSION: u8 = 0x01;
+pub const STATE_VERSION: u8 = 0x02;
 
 /// Writer. A first pass with `buf = None` only measures, so the real
 /// buffer is allocated once at its final size and never reallocates
@@ -204,6 +205,11 @@ impl Labyrinth {
         for k in &self.revoked {
             w.bytes(k);
         }
+        w.u64(self.verified.0);
+        w.u32(self.verified.1.len())?;
+        for k in &self.verified.1 {
+            w.bytes(k);
+        }
         w.u32(self.pins.len())?;
         for (did, pin) in &self.pins {
             w.str(did)?;
@@ -259,7 +265,7 @@ impl Labyrinth {
             return Err(Error::Malformed("not a labyrinth client state"));
         }
         let version = r.u8()?;
-        if version != STATE_VERSION {
+        if version != STATE_VERSION && version != 0x01 {
             return Err(Error::Unsupported(version));
         }
         if r.str()? != did {
@@ -298,6 +304,13 @@ impl Labyrinth {
         let mut revoked = BTreeSet::new();
         for _ in 0..r.count(32)? {
             revoked.insert(r.arr::<32>()?);
+        }
+        let mut verified = (latest, BTreeSet::new());
+        if version >= 0x02 {
+            verified.0 = r.u64()?;
+            for _ in 0..r.count(32)? {
+                verified.1.insert(r.arr::<32>()?);
+            }
         }
         let mut pins = BTreeMap::new();
         for _ in 0..r.count(2 + 8 + 64)? {
@@ -347,6 +360,7 @@ impl Labyrinth {
         }
         verify_public(newest, &record.public)?;
         me.revoked = revoked;
+        me.verified = verified;
         me.pins = pins;
         me.meks = meks;
         Ok(me)

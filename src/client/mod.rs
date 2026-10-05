@@ -28,6 +28,7 @@
 pub mod composite;
 pub mod enroll;
 pub mod epochs;
+pub mod members;
 pub mod pins;
 pub mod read;
 pub mod send;
@@ -38,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub use composite::CompositeDirectory;
 pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
 pub use epochs::{RotationReport, SyncReport};
+pub use members::{ExcludedMember, ExclusionReason};
 pub use pins::PeerPin;
 pub use read::{LoadedMessage, MessageSource, ThreadHistory, Undecryptable};
 pub use send::{ArchiveOutcome, FlushedBatch};
@@ -106,6 +108,10 @@ pub struct Labyrinth {
     /// `deviceKeyPub`s this client revoked; every rotation excludes them,
     /// whatever the store says about `revokedAt`.
     revoked: BTreeSet<[u8; 32]>,
+    /// Members of one epoch (the sequence number) this client verified;
+    /// a later verification failure for one of them is store tampering
+    /// ([`Error::MemberTampered`]), not a planted row.
+    verified: (u64, BTreeSet<[u8; 32]>),
     /// Newest accepted epoch of every peer this client addressed ([CB-29]).
     pins: BTreeMap<String, PeerPin>,
     /// MEKs minted or opened here, per thread, newest last.
@@ -147,6 +153,7 @@ impl Labyrinth {
             latest,
             heads: HashMap::new(),
             revoked: BTreeSet::new(),
+            verified: (latest, BTreeSet::new()),
             pins: BTreeMap::new(),
             meks: HashMap::new(),
             outbox: BTreeMap::new(),

@@ -7,8 +7,52 @@
 
 use crate::hpke::labyrinth::{X25519Public, X25519Secret};
 use crate::orf::{OrfClientState, orf_client_init};
-use crate::sign::{XSigningKey, XVerifyingKey};
+use crate::sign::{TransportSigner, XSigningKey, XVerifyingKey, verify_transport};
 use crate::{Error, Result};
+
+/// Signature prefix of a [`ChatBinding`].
+const BINDING_PREFIX: &str = "catbird.labyrinth.device_binding:";
+
+/// [CB-36] A physical device's binding to the MLS chat device that
+/// enrolled it: `Ed25519(chatKey, "catbird.labyrinth.device_binding:" ||
+/// did || ":" || deviceKeyPub)`. A rotating client carries a physical
+/// device over only while its binding verifies and names a *current* chat
+/// device of the DID, so revoking the chat device also drops the
+/// Labyrinth device, and a device record planted by some other chat
+/// device can't pass as this one. Virtual devices carry no binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatBinding {
+    pub transport_public_key: [u8; 32],
+    pub sig: [u8; 64],
+}
+
+fn binding_message(did: &str, device_key: &XVerifyingKey) -> Vec<u8> {
+    [
+        format!("{BINDING_PREFIX}{did}:").as_bytes(),
+        device_key.0.as_slice(),
+    ]
+    .concat()
+}
+
+impl ChatBinding {
+    /// Binds `device_key` of `did` to the chat key behind `transport`.
+    pub fn sign(did: &str, device_key: &XVerifyingKey, transport: &dyn TransportSigner) -> Self {
+        Self {
+            transport_public_key: transport.transport_public_key(),
+            sig: transport.sign_transport(&binding_message(did, device_key)),
+        }
+    }
+
+    /// Checks the signature. The caller separately checks that
+    /// `transport_public_key` is a current chat device of `did`.
+    pub fn verify(&self, did: &str, device_key: &XVerifyingKey) -> Result<()> {
+        verify_transport(
+            &self.transport_public_key,
+            &binding_message(did, device_key),
+            &self.sig,
+        )
+    }
+}
 
 /// Use-case byte for `pk_sign(deviceKey, 0x30, epochStorageKeyPub)`.
 pub const USE_CASE_STORAGE: u8 = 0x30;
@@ -217,6 +261,18 @@ mod tests {
         let mut p = d.public().clone();
         p.epoch_storage_auth_key_pub = None;
         assert!(p.verify().is_err());
+    }
+
+    #[test]
+    fn chat_binding_binds_did_and_device() {
+        let t = crate::sign::Ed25519Transport(ed25519_dalek::SigningKey::from_bytes(&[7; 32]));
+        let d = DeviceSecrets::generate().unwrap();
+        let k = d.public().device_key_pub;
+        let b = ChatBinding::sign("did:plc:a", &k, &t);
+        b.verify("did:plc:a", &k).unwrap();
+        assert!(b.verify("did:plc:b", &k).is_err());
+        let other = DeviceSecrets::generate().unwrap().public().device_key_pub;
+        assert!(b.verify("did:plc:a", &other).is_err());
     }
 
     #[test]

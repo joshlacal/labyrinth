@@ -2,9 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::defs::{EpochPublicDef, OwnerMessageDef};
+use super::defs::{EpochPublicDef, OwnerMessageDef, TransportAttestationDef};
 use super::{Bytes, check_type, nsid};
-use crate::device::DevicePublic;
+use crate::device::{ChatBinding, DevicePublic};
 use crate::epoch::{EpochMemberRecord, EpochRecord};
 use crate::hpke::labyrinth::X25519Public;
 use crate::mailbox::EpochPublic;
@@ -27,6 +27,9 @@ pub struct Device {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch_storage_auth_key_sig: Option<Bytes>,
     pub r#virtual: bool,
+    /// [CB-36] The enrolling chat device's binding; physical devices only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_binding: Option<TransportAttestationDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<String>,
     pub created_at: String,
@@ -44,9 +47,33 @@ impl Device {
                 .map(|k| Bytes::from_slice(&k.0)),
             epoch_storage_auth_key_sig: p.sig_0x31.map(|s| Bytes::from_slice(&s)),
             r#virtual: p.is_virtual,
+            chat_binding: None,
             revoked_at: None,
             created_at,
         }
+    }
+
+    /// A physical device record carrying its [CB-36] chat binding.
+    pub fn bound(p: &DevicePublic, binding: &ChatBinding, created_at: String) -> Self {
+        let mut d = Self::from_public(p, created_at);
+        d.chat_binding = Some(TransportAttestationDef {
+            transport_pubkey: Bytes::from_slice(&binding.transport_public_key),
+            sig: Bytes::from_slice(&binding.sig),
+        });
+        d
+    }
+
+    /// The [CB-36] chat binding, parsed (not verified).
+    pub fn chat_binding(&self) -> Result<Option<ChatBinding>> {
+        self.chat_binding
+            .as_ref()
+            .map(|b| {
+                Ok(ChatBinding {
+                    transport_public_key: b.transport_pubkey.array("chatBinding key length")?,
+                    sig: b.sig.array("chatBinding sig length")?,
+                })
+            })
+            .transpose()
     }
 
     /// Parses the record; call [`DevicePublic::verify`] on the result.
