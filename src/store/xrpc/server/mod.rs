@@ -153,20 +153,27 @@ impl MemoryXrpcServer {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.as_str())
         };
-        let refuse = |m: &str| XrpcError::named(401, "InvalidSignature", m);
+        // mls-ds: a signature that does not verify is 401 InvalidSignature;
+        // a missing header, a non-canonical claim, or a claim that does not
+        // match the request or the clock window is 400 InvalidRequest.
+        let invalid = |m: &str| XrpcError::named(400, "InvalidRequest", m);
         match (find(READ_HEADER), find(READ_SIGNATURE_HEADER)) {
             (None, None) if !self.signed_reads => Ok(()),
             (Some(h), Some(s)) => {
-                let claim =
-                    verify_read(h, s, &c.device).map_err(|_| refuse("bad read signature"))?;
+                let claim = verify_read(h, s, &c.device).map_err(|e| match e {
+                    crate::Error::BadSignature | crate::Error::BadPublicKey => {
+                        XrpcError::named(401, "InvalidSignature", "bad read signature")
+                    }
+                    _ => invalid("malformed read claim"),
+                })?;
                 let now = self.net.server_time();
                 if claim.matches(nsid, params, &c.did, &hex::encode(c.device), now) {
                     Ok(())
                 } else {
-                    Err(refuse("read claim does not match the request"))
+                    Err(invalid("read claim does not match the request"))
                 }
             }
-            _ => Err(refuse("missing signed read headers")),
+            _ => Err(invalid("missing signed read headers")),
         }
     }
 

@@ -10,11 +10,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use labyrinth::sign::{Ed25519Transport, TransportSigner};
 use labyrinth::store::memory::MemoryBackend;
+use labyrinth::store::xrpc::XrpcError;
 use labyrinth::store::xrpc::read_auth::{
     READ_HEADER, READ_SIGNATURE_HEADER, ReadClaim, canonical_query, verify_read,
 };
 use labyrinth::store::xrpc::server::MemoryXrpcServer;
-use labyrinth::store::xrpc::XrpcError;
 use serde_json::Value;
 
 fn vector() -> Value {
@@ -108,7 +108,17 @@ fn server() -> MemoryXrpcServer {
     s
 }
 
+/// mls-ds's answers: 400 InvalidRequest for a missing, non-canonical or
+/// mismatched claim; 401 InvalidSignature for a signature that fails.
 fn refused(r: Result<Vec<u8>, XrpcError>) {
+    let e = r.expect_err("must be refused");
+    assert_eq!(
+        (e.status, e.error.as_deref()),
+        (400, Some("InvalidRequest"))
+    );
+}
+
+fn bad_signature(r: Result<Vec<u8>, XrpcError>) {
     let e = r.expect_err("must be refused");
     assert_eq!(
         (e.status, e.error.as_deref()),
@@ -152,7 +162,7 @@ fn server_refuses_mismatched_claims() {
         &signer(1),
     ));
     // Signed by a key that is not the caller's chat device.
-    refused(send(ReadClaim::new(NSID, &p, DID, &dev, now), &signer(2)));
+    bad_signature(send(ReadClaim::new(NSID, &p, DID, &dev, now), &signer(2)));
     // One header without the other.
     let mut h = ReadClaim::new(NSID, &p, DID, &dev, now).sign(&*signer(1));
     h.pop();

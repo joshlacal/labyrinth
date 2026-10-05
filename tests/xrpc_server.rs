@@ -256,3 +256,28 @@ fn validator_rejects_bad_calls() {
     assert!(lex.declares_error(&n("appendBatch"), "RateLimited"));
     assert!(!lex.declares_error(&n("getDevice"), "MixedMekBatch"));
 }
+
+#[test]
+fn unknown_conversation_state_is_conversation_not_found() {
+    let net = MemoryBackend::new();
+    let s = MemoryXrpcServer::new(net.clone());
+    net.register_chat_device(A, tpub(1));
+    let t = s.transport(A, tpub(1));
+    let q = |c: &str| {
+        t.query(
+            "blue.catbird.chat.getConversationState",
+            &[("conversationId", c.to_owned())],
+        )
+    };
+    let e = q("gone").unwrap_err();
+    assert_eq!(
+        (e.status, e.error.as_deref()),
+        (404, Some("ConversationNotFound"))
+    );
+    assert_eq!(
+        labyrinth::store::xrpc::map_error(e),
+        Error::NotFound("conversation")
+    );
+    net.add_leaf(T, A, tpub(1));
+    assert!(q(T).is_ok());
+}

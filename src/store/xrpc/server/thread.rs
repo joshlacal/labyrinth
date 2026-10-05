@@ -278,8 +278,17 @@ pub(super) fn flag(input: &Input<'_>, k: &str) -> core::result::Result<bool, Xrp
 pub(super) fn conversation_state(s: &MemoryXrpcServer, input: &Input<'_>) -> Reply {
     let thread = req(input, "conversationId")?;
     let dir = s.net.ds_directory();
+    let dids = s.net.leaf_dids(thread);
+    if dids.is_empty() {
+        // mls-ds: no such conversation (never created, or deleted).
+        return Err(super::XrpcError::named(
+            404,
+            "ConversationNotFound",
+            "no such conversation",
+        ));
+    }
     let mut participants = Vec::new();
-    for did in s.net.leaf_dids(thread) {
+    for did in dids {
         let mut p = serde_json::json!({ "userDid": did });
         if let Some(e) = dir.latest(&did).map_err(err)? {
             p["labyrinthHead"] = serde_json::json!({
