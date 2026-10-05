@@ -217,6 +217,22 @@ impl Labyrinth {
         Ok(out)
     }
 
+    /// Write the buffered sender and owner batches of `thread_id` only.
+    pub fn flush_thread(&mut self, thread_id: &str) -> Result<Vec<FlushedBatch>> {
+        let mut out = Vec::new();
+        out.extend(self.flush_sender(thread_id)?);
+        out.extend(self.flush_owner(thread_id)?);
+        Ok(out)
+    }
+
+    /// Drop every buffered, unwritten message of `thread_id` (a caller
+    /// that failed part-way through a thread and will retry it from its
+    /// own queue). Returns how many were dropped.
+    pub fn discard_pending(&mut self, thread_id: &str) -> usize {
+        self.outbox.remove(thread_id).map_or(0, |v| v.len())
+            + self.owner_outbox.remove(thread_id).map_or(0, |v| v.len())
+    }
+
     /// Messages buffered for `thread_id` but not yet written.
     pub fn pending(&self, thread_id: &str) -> usize {
         self.outbox.get(thread_id).map_or(0, Vec::len)

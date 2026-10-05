@@ -121,3 +121,21 @@ fn transient_directory_failure_fails_the_roster_instead_of_dropping_members() {
         Err(Error::Backend(_))
     ));
 }
+
+#[test]
+fn discard_pending_drops_one_threads_buffer_only() {
+    let (net, clock) = (MemoryBackend::new(), TestClock::default());
+    let mut alice = init(&net, &clock, A, 1);
+    let roster = alice.resolve_roster(&[A]).unwrap();
+    alice
+        .archive_outgoing("t1", &roster, "m1", 1, b"x")
+        .unwrap();
+    alice
+        .archive_outgoing("t2", &roster, "m2", 2, b"y")
+        .unwrap();
+    assert_eq!(alice.discard_pending("t1"), 1);
+    assert_eq!(alice.pending("t1"), 0);
+    assert_eq!(alice.flush_thread("t2").unwrap().len(), 1);
+    assert_eq!(alice.pending("t2"), 0);
+    assert!(alice.flush().unwrap().is_empty());
+}
