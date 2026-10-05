@@ -15,6 +15,12 @@
 //! [`binding`]); procedures replay their response for a repeated
 //! `operationId`.
 //!
+//! Labyrinth queries carrying the device-signed read headers
+//! ([`super::read_auth`]) are verified against the calling chat device
+//! (`deviceId` = lowercase hex of its key here); with
+//! [`MemoryXrpcServer::require_signed_reads`] an unsigned query is refused,
+//! as mls-ds does.
+//!
 //! It does not model service auth, federation, quotas or retention.
 
 mod attachments;
@@ -31,8 +37,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 pub(crate) use super::XrpcError;
+use super::read_auth::{READ_HEADER, READ_SIGNATURE_HEADER, SignedReadTransport, verify_read};
 use super::{MAX_PAGE, NSID_PREFIX, XrpcTransport};
 use crate::Error;
+use crate::sign::TransportSigner;
 use crate::store::MailboxDirectory;
 use crate::store::memory::MemoryBackend;
 
@@ -44,6 +52,7 @@ pub struct MemoryXrpcServer {
     net: MemoryBackend,
     page_size: usize,
     replays: Arc<Mutex<HashMap<[u8; 16], Reply>>>,
+    signed_reads: bool,
 }
 
 /// The authenticated caller of one request.
@@ -66,7 +75,15 @@ impl MemoryXrpcServer {
             net,
             page_size: MAX_PAGE,
             replays: Arc::default(),
+            signed_reads: false,
         }
+    }
+
+    /// Refuse every Labyrinth query without valid device-signed read
+    /// headers (`InvalidSignature`), as mls-ds does.
+    pub fn require_signed_reads(mut self) -> Self {
+        self.signed_reads = true;
+        self
     }
 
     /// Pages hold at most `n` items (exercises the stores' paging).
@@ -88,6 +105,58 @@ impl MemoryXrpcServer {
                 device,
             },
         })
+    }
+
+    /// A transport for chat device `signer` of `did` that signs every
+    /// Labyrinth query ([`SignedReadTransport`]) with the server clock.
+    pub fn signed_transport(
+        &self,
+        did: &str,
+        signer: Arc<dyn TransportSigner + Send + Sync>,
+    ) -> Arc<dyn XrpcTransport> {
+        let key = signer.transport_public_key();
+        let net = self.net.clone();
+        Arc::new(SignedReadTransport::new(
+            self.transport(did, key),
+            did,
+            &hex::encode(key),
+            signer,
+            Arc::new(move || net.server_time()),
+        ))
+    }
+
+    /// Checks the device-signed read headers of a Labyrinth query.
+    fn check_read(
+        &self,
+        c: &Caller,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> core::result::Result<(), XrpcError> {
+        if !nsid.starts_with(NSID_PREFIX) {
+            return Ok(());
+        }
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        let refuse = |m: &str| XrpcError::named(401, "InvalidSignature", m);
+        match (find(READ_HEADER), find(READ_SIGNATURE_HEADER)) {
+            (None, None) if !self.signed_reads => Ok(()),
+            (Some(h), Some(s)) => {
+                let claim =
+                    verify_read(h, s, &c.device).map_err(|_| refuse("bad read signature"))?;
+                let now = self.net.server_time();
+                if claim.matches(nsid, params, &c.did, &hex::encode(c.device), now) {
+                    Ok(())
+                } else {
+                    Err(refuse("read claim does not match the request"))
+                }
+            }
+            _ => Err(refuse("missing signed read headers")),
+        }
     }
 
     fn handle(&self, c: &Caller, nsid: &str, input: Input<'_>) -> Reply {
@@ -126,7 +195,14 @@ struct MemoryTransport {
 }
 
 impl XrpcTransport for MemoryTransport {
-    fn query(&self, nsid: &str, params: &[(&str, String)]) -> Reply {
+    fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> Reply {
+        self.server
+            .check_read(&self.caller, nsid, params, headers)?;
         self.server
             .handle(&self.caller, nsid, Input::Params(params))
     }

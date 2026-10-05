@@ -31,6 +31,7 @@
 
 mod directory;
 mod mailbox;
+pub mod read_auth;
 pub mod server;
 mod thread;
 mod wire;
@@ -74,16 +75,29 @@ impl XrpcError {
 
 /// How the stores reach mls-ds. Implementations add authentication: a
 /// service-auth token whose `lxm` is the NSID plus `actorDeviceId` on
-/// every call, and on procedures a `labyrinthWriteBody` signature by the
-/// chat device key over `{operationId, actorDeviceId, endpointNsid,
-/// sha256(payload), signedAt}` (design §3).
+/// every call; on procedures a `labyrinthWriteBody` signature by the chat
+/// device key over `{operationId, actorDeviceId, endpointNsid,
+/// sha256(payload), signedAt}` (design §3); on Labyrinth queries the
+/// device-signed read headers of [`read_auth`] (built with
+/// [`read_auth::ReadClaim`], or added by [`read_auth::SignedReadTransport`]).
 pub trait XrpcTransport: Send + Sync {
-    /// `GET /xrpc/{nsid}?{params}`; returns the response body.
+    /// `GET /xrpc/{nsid}?{params}` with extra request `headers` (sent
+    /// verbatim); returns the response body. A wrapping transport must
+    /// forward `headers`: dropping them makes signed reads fail.
+    fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> core::result::Result<Vec<u8>, XrpcError>;
+    /// `GET /xrpc/{nsid}?{params}` with no extra headers.
     fn query(
         &self,
         nsid: &str,
         params: &[(&str, String)],
-    ) -> core::result::Result<Vec<u8>, XrpcError>;
+    ) -> core::result::Result<Vec<u8>, XrpcError> {
+        self.query_with_headers(nsid, params, &[])
+    }
     /// `POST /xrpc/{nsid}` with the JSON `payload`; returns the response
     /// body. A retry must reuse `operation_id`, so mls-ds replays the
     /// original response instead of applying the write twice.

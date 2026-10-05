@@ -103,8 +103,14 @@ impl Recorder {
 }
 
 impl XrpcTransport for Recorder {
-    fn query(&self, nsid: &str, params: &[(&str, String)]) -> Result<Vec<u8>, XrpcError> {
-        let out = self.inner.query(nsid, params);
+    fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> Result<Vec<u8>, XrpcError> {
+        // Headers (signed reads) carry a clock and are not part of the trace.
+        let out = self.inner.query_with_headers(nsid, params, headers);
         if nsid.starts_with(NSID_PREFIX) {
             self.lex
                 .validate_params(nsid, params)

@@ -90,13 +90,18 @@ impl Validating {
 }
 
 impl XrpcTransport for Validating {
-    fn query(&self, nsid: &str, params: &[(&str, String)]) -> Result<Vec<u8>, XrpcError> {
+    fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> Result<Vec<u8>, XrpcError> {
         if nsid.starts_with(NSID_PREFIX) {
             self.lex
                 .validate_params(nsid, params)
                 .unwrap_or_else(|e| panic!("{nsid}: {e}"));
         }
-        let out = self.inner.query(nsid, params);
+        let out = self.inner.query_with_headers(nsid, params, headers);
         self.check(nsid, &out);
         out
     }
@@ -135,7 +140,10 @@ impl World {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("lexicons/blue/catbird/labyrinth");
         Self {
             // Two items per page exercises every store's paging.
-            server: MemoryXrpcServer::new(MemoryBackend::new()).with_page_size(2),
+            // Every Labyrinth query must carry device-signed read headers.
+            server: MemoryXrpcServer::new(MemoryBackend::new())
+                .with_page_size(2)
+                .require_signed_reads(),
             lex: Arc::new(Lexicons::load(&dir)),
             seen: Arc::default(),
             sent: Vec::new(),
@@ -149,7 +157,7 @@ impl World {
 
     fn transport(&self, did: &str, seed: u8) -> Arc<dyn XrpcTransport> {
         Arc::new(Validating {
-            inner: self.server.transport(did, tpub(seed)),
+            inner: self.server.signed_transport(did, Arc::new(signer(seed))),
             lex: self.lex.clone(),
             seen: self.seen.clone(),
         })
