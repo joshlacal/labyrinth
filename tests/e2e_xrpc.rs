@@ -577,6 +577,10 @@ fn account_purge_over_xrpc_is_server_side() {
     bob.flush().unwrap();
     alice.create_recovery_code(Mechanism::Code).unwrap();
 
+    // The sequencer signs its account-deletion redactions; the directory
+    // reports its key.
+    w.net()
+        .set_sequencer("did:web:ds.example", Some([0x5e; 32]));
     // mls-ds has no listThreads, so the client hands the redaction and
     // purge to deleteAccountData after retracting the PDS copy.
     let report = alice.purge_account().unwrap();
@@ -586,9 +590,10 @@ fn account_purge_over_xrpc_is_server_side() {
     assert_eq!(got(&h), w.expected(&["b1"]));
     assert_eq!(h.redacted.len(), 2);
     assert!(
-        h.redacted
-            .iter()
-            .all(|r| r.sender == ALICE && r.account_deleted && !r.by_author)
+        h.redacted.iter().all(|r| r.sender == ALICE
+            && r.account_deleted
+            && !r.by_author
+            && !r.removed_by_server)
     );
     // Both directories forgot Alice, and her mailbox is empty.
     assert!(w.net().directory().latest(ALICE).unwrap().is_none());
@@ -641,6 +646,19 @@ fn lookups_over_xrpc() {
     let ids: Vec<&str> = threads.iter().map(|t| t.thread_id.as_str()).collect();
     assert_eq!(ids, ["conv-e2e", "other-thread"]);
     assert!(threads[0].sender_history && threads[1].owner_archive);
+    // An unreachable remote sequencer: the partial list names it, and the
+    // strict listing refuses instead of hiding the gap.
+    w.server
+        .set_unreachable_sequencers(&["did:web:far.example", "did:web:away.example"]);
+    let partial = alice.list_threads_report().unwrap();
+    assert_eq!(partial.threads, threads);
+    assert_eq!(
+        partial.incomplete,
+        ["did:web:away.example", "did:web:far.example"]
+    );
+    assert!(matches!(alice.list_threads(), Err(Error::Backend(_))));
+    w.server.set_unreachable_sequencers(&[]);
+    assert!(alice.list_threads_report().unwrap().incomplete.is_empty());
 
     // Newest first by sender time, although the server pages by seq.
     let page = alice.load_thread_page(THREAD, None, 2).unwrap();

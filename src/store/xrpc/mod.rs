@@ -190,13 +190,34 @@ impl Xrpc {
         )
     }
 
-    /// Every item of a paged list query, following `cursor`.
+    /// Every item of a paged list query, following `cursor`. A page that
+    /// reports `incomplete` sequencers fails the listing (see
+    /// [`list_all_report`](Self::list_all_report)).
     pub(crate) fn list_all<T: DeserializeOwned>(
         &self,
         name: &str,
         params: &[(&str, String)],
     ) -> Result<Vec<T>> {
+        let (items, incomplete) = self.list_all_report(name, params)?;
+        if incomplete.is_empty() {
+            Ok(items)
+        } else {
+            Err(Error::Backend(format!(
+                "{name} incomplete: unreachable sequencers {}",
+                incomplete.join(", ")
+            )))
+        }
+    }
+
+    /// Every item of a paged list query, plus every sequencer DID any page
+    /// reported `incomplete` (sorted, deduplicated).
+    pub(crate) fn list_all_report<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        params: &[(&str, String)],
+    ) -> Result<(Vec<T>, Vec<String>)> {
         const MAX_PAGES: usize = 100_000;
+        let mut incomplete = std::collections::BTreeSet::new();
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
@@ -206,10 +227,11 @@ impl Xrpc {
             }
             let page: wire::Page<T> = self.get(name, &p)?;
             out.extend(page.items);
+            incomplete.extend(page.incomplete.unwrap_or_default());
             match page.cursor {
                 Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
                 Some(_) => return Err(Error::Backend("xrpc cursor did not advance".into())),
-                None => return Ok(out),
+                None => return Ok((out, incomplete.into_iter().collect())),
             }
         }
         Err(Error::Backend("xrpc listing too long".into()))

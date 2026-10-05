@@ -53,6 +53,8 @@ pub struct MemoryXrpcServer {
     page_size: usize,
     replays: Arc<Mutex<HashMap<[u8; 16], Reply>>>,
     signed_reads: bool,
+    /// Remote sequencers `listThreads` reports as `incomplete`.
+    unreachable: Arc<Mutex<Vec<String>>>,
 }
 
 /// The authenticated caller of one request.
@@ -76,7 +78,16 @@ impl MemoryXrpcServer {
             page_size: MAX_PAGE,
             replays: Arc::default(),
             signed_reads: false,
+            unreachable: Arc::default(),
         }
+    }
+
+    /// From now on `listThreads` answers with `incomplete: dids`, as the
+    /// home DS does when those remote sequencers are unreachable (empty:
+    /// complete again).
+    pub fn set_unreachable_sequencers(&self, dids: &[&str]) {
+        *self.unreachable.lock().unwrap_or_else(|e| e.into_inner()) =
+            dids.iter().map(|d| (*d).to_owned()).collect();
     }
 
     /// Refuse every Labyrinth query without valid device-signed read
@@ -290,6 +301,16 @@ pub(crate) fn hex_param<const N: usize>(
 impl MemoryXrpcServer {
     /// One page of `items` per the `cursor` / `limit` parameters.
     pub(crate) fn page<T: Serialize>(&self, items: Vec<T>, input: &Input<'_>) -> Reply {
+        self.page_with(items, input, None)
+    }
+
+    /// [`page`](Self::page) with `incomplete` sequencers (`listThreads`).
+    pub(crate) fn page_with<T: Serialize>(
+        &self,
+        items: Vec<T>,
+        input: &Input<'_>,
+        incomplete: Option<Vec<String>>,
+    ) -> Reply {
         let start = num(input, "cursor")?.unwrap_or(0) as usize;
         let limit =
             num(input, "limit")?.map_or(self.page_size, |l| (l as usize).clamp(1, self.page_size));
@@ -300,6 +321,10 @@ impl MemoryXrpcServer {
             .skip(start)
             .take(end.saturating_sub(start))
             .collect();
-        json(&super::wire::Page { items, cursor })
+        json(&super::wire::Page {
+            items,
+            cursor,
+            incomplete,
+        })
     }
 }

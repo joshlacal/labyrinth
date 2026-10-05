@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use super::Labyrinth;
+use crate::deletion::StoredRedaction;
 use crate::epoch::EpochKeys as _;
 use crate::mek::{self, Mek, MekSender};
 use crate::message::{
@@ -55,14 +56,19 @@ pub struct RedactedMessage {
     pub message_id: String,
     pub timestamp: u64,
     pub sender: String,
-    /// True when the redaction is signed by one of the author's chat
-    /// devices ("unsent"); false means the server removed it on its own
-    /// (or the signing device is unknown).
+    /// The redaction is signed by one of the author's chat devices:
+    /// "unsent".
     pub by_author: bool,
-    /// The server redacted it because the author's account was deleted
-    /// (an unsigned redaction): "deleted (account removed)". Never an
-    /// author unsend; `by_author` is false.
+    /// The conversation's sequencer DS redacted it because the author's
+    /// account was deleted, and its signature verifies under the
+    /// sequencer's key ([`crate::store::MailboxDirectory::sequencer_key`]):
+    /// "deleted (account removed)".
     pub account_deleted: bool,
+    /// Neither of the above: the server removed it, and nothing proves
+    /// why (an unsigned redaction, a DS signature that is missing or does
+    /// not verify, or an author signature that does not verify): "removed
+    /// by server". Exactly one of the three flags is set.
+    pub removed_by_server: bool,
 }
 
 /// Result of [`Labyrinth::load_thread`], ordered by `(timestamp, messageId)`.
@@ -170,15 +176,24 @@ impl Labyrinth {
                         timestamp,
                         redaction,
                     } => {
-                        let by_author = redaction.as_ref().is_some_and(|r| {
-                            self.redaction_by_author(thread_id, &b.author, &message_id, r)
-                        });
+                        let (by_author, account_deleted) = match &redaction {
+                            StoredRedaction::Author(r) => (
+                                self.redaction_by_author(thread_id, &b.author, &message_id, r),
+                                false,
+                            ),
+                            StoredRedaction::Server(r) => (
+                                false,
+                                self.redaction_by_sequencer(thread_id, &b.author, &message_id, r),
+                            ),
+                            StoredRedaction::Unsigned { .. } => (false, false),
+                        };
                         h.redacted.push(RedactedMessage {
                             message_id,
                             timestamp,
                             sender: b.author.clone(),
                             by_author,
-                            account_deleted: redaction.is_none(),
+                            account_deleted,
+                            removed_by_server: !by_author && !account_deleted,
                         });
                         continue;
                     }
@@ -223,6 +238,25 @@ impl Labyrinth {
             && self
                 .transport_keys(author, None, at)
                 .is_ok_and(|k| k.contains(&r.transport_public_key))
+    }
+
+    /// [CB-38]: an account-deletion redaction signed by the DS that
+    /// sequences `thread_id`, under the key the directory reports for it.
+    fn redaction_by_sequencer(
+        &self,
+        thread_id: &str,
+        author: &str,
+        message_id: &str,
+        r: &crate::deletion::ServerRedaction,
+    ) -> bool {
+        match self.b.directory.sequencer_key(thread_id) {
+            Ok(Some(k)) => {
+                k.did == r.by
+                    && r.verify_account_deletion(author, thread_id, message_id, &k.key)
+                        .is_ok()
+            }
+            _ => false,
+        }
     }
 
     /// Opens my owner batches into `h`; returns the delete-for-me

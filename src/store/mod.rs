@@ -41,7 +41,8 @@ pub mod pds;
 pub mod xrpc;
 
 pub use keys::{
-    ChatDeviceKey, MemberDeviceKey, ServerOrder, VouchAt, keys_valid_at, keys_valid_for,
+    ChatDeviceKey, MemberDeviceKey, SequencerKey, ServerOrder, VouchAt, keys_valid_at,
+    keys_valid_for,
 };
 
 use crate::deletion::Redaction;
@@ -220,6 +221,15 @@ pub trait MailboxStore {
     }
 }
 
+/// [`ThreadStore::list_threads_report`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadListing {
+    pub threads: Vec<String>,
+    /// Sequencer DS DIDs the server could not reach: their conversations
+    /// may be missing from `threads`.
+    pub incomplete: Vec<String>,
+}
+
 /// The conversation spaces the caller belongs to. Writes go to the
 /// caller's own repo in the thread's space; reads see every member's repo.
 pub trait ThreadStore {
@@ -290,6 +300,17 @@ pub trait ThreadStore {
         Err(Error::NotSupported("listThreads"))
     }
 
+    /// [`list_threads`](Self::list_threads), but a listing the server
+    /// could only partly assemble (a remote sequencer DS unreachable)
+    /// comes back with those sequencers named in
+    /// [`ThreadListing::incomplete`] instead of failing.
+    fn list_threads_report(&self) -> Result<ThreadListing> {
+        Ok(ThreadListing {
+            threads: self.list_threads()?,
+            incomplete: Vec::new(),
+        })
+    }
+
     /// Unsend ([CB-38]): replace every item of this handle's DID with
     /// `message_id` in `thread_id` by `redaction`, keeping its id and
     /// timestamp. Returns how many items were redacted. When none match,
@@ -339,6 +360,14 @@ pub trait MailboxDirectory {
         did: &str,
     ) -> Result<Option<Vec<MemberDeviceKey>>> {
         let _ = (thread_id, did);
+        Ok(None)
+    }
+    /// The redaction signing key of the DS that sequences `thread_id`
+    /// ([`SequencerKey`]); `None` when the backend cannot say, and then no
+    /// server redaction can be shown as an account deletion (readers fall
+    /// back to "removed by server").
+    fn sequencer_key(&self, thread_id: &str) -> Result<Option<SequencerKey>> {
+        let _ = thread_id;
         Ok(None)
     }
 }

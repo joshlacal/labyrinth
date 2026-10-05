@@ -93,6 +93,9 @@ struct State {
     orf: HashMap<(String, [u8; 32]), crate::orf::OrfServerState>,
     /// Attachment references and chat blobs ([CB-33]).
     attach: attachments::AttachState,
+    /// The DS that sequences every thread here: its DID and, when it
+    /// signs its own redactions, its Ed25519 seed ([CB-38]).
+    sequencer: Option<(String, Option<[u8; 32]>)>,
 }
 
 impl State {
@@ -287,6 +290,27 @@ impl MemoryBackend {
             .and_then(|t| t.leaves.as_ref())
             .map(|l| l.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Every thread is sequenced by DS `did`; with `signing_seed`, its
+    /// account-deletion redactions are signed by that Ed25519 key and the
+    /// directories report it ([`crate::store::MailboxDirectory::sequencer_key`]).
+    /// Without a call, account deletion writes bare `{redactedAt}`
+    /// redactions.
+    pub fn set_sequencer(&self, did: &str, signing_seed: Option<[u8; 32]>) {
+        self.lock().sequencer = Some((did.to_owned(), signing_seed));
+    }
+
+    fn sequencer_key(&self) -> Option<super::SequencerKey> {
+        let s = self.lock();
+        let (did, seed) = s.sequencer.as_ref()?;
+        let key = ed25519_dalek::SigningKey::from_bytes(seed.as_ref()?)
+            .verifying_key()
+            .to_bytes();
+        Some(super::SequencerKey {
+            did: did.clone(),
+            key,
+        })
     }
 
     /// The server clock (ms).

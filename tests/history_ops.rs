@@ -193,6 +193,31 @@ fn purge_account_redacts_authored_items_and_erases_the_mailbox() {
 }
 
 #[test]
+fn unsigned_server_redaction_reads_as_removed_by_server() {
+    // A DS that does not sign (bare {redactedAt}, or by + reason without
+    // sig): nothing proves why, so it is never "account removed".
+    for sequencer in [None, Some("did:web:ds.example")] {
+        let net = MemoryBackend::new();
+        let clock = TestClock::default();
+        let mut alice = init(&net, &clock, A, 1);
+        let mut bob = init(&net, &clock, B, 2);
+        if let Some(by) = sequencer {
+            net.set_sequencer(by, None);
+        }
+        send(&mut alice, T, &[A, B], "m1", 10);
+        alice.flush().unwrap();
+        assert_eq!(net.delete_account_data(A), 1);
+        let h = read(&mut bob, T);
+        assert_eq!(h.redacted.len(), 1);
+        let r = &h.redacted[0];
+        assert!(
+            r.removed_by_server && !r.account_deleted && !r.by_author,
+            "{r:?}"
+        );
+    }
+}
+
+#[test]
 fn server_account_deletion_reads_as_removed_not_unsent() {
     let net = MemoryBackend::new();
     let clock = TestClock::default();
@@ -202,13 +227,26 @@ fn server_account_deletion_reads_as_removed_not_unsent() {
     alice.flush().unwrap();
     send(&mut bob, T, &[A, B], "b1", 20);
     bob.flush().unwrap();
-    // mls-ds deleteAccountData: unsigned redactions, then a purge.
+    // mls-ds deleteAccountData: redactions signed by the sequencer DS,
+    // then a purge.
+    net.set_sequencer("did:web:ds.example", Some([0x5e; 32]));
     assert_eq!(net.delete_account_data(A), 1);
     let h = read(&mut bob, T);
     assert_eq!(ids(&h), ["b1"]);
     assert_eq!(h.redacted.len(), 1);
     let r = &h.redacted[0];
-    assert!(r.account_deleted && !r.by_author, "{r:?}");
+    assert!(
+        r.account_deleted && !r.by_author && !r.removed_by_server,
+        "{r:?}"
+    );
+    // The sequencer's key changes (or another DS claims it): the same
+    // redaction no longer proves an account deletion.
+    net.set_sequencer("did:web:ds.example", Some([0x5f; 32]));
+    let r = read(&mut bob, T).redacted[0].clone();
+    assert!(r.removed_by_server && !r.account_deleted, "{r:?}");
+    net.set_sequencer("did:web:other.example", Some([0x5e; 32]));
+    let r = read(&mut bob, T).redacted[0].clone();
+    assert!(r.removed_by_server && !r.account_deleted, "{r:?}");
     // An author's own unsend is the opposite.
     bob.unsend(T, "b1").unwrap();
     let h = read(&mut bob, T);

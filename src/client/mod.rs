@@ -45,7 +45,7 @@ pub use composite::CompositeDirectory;
 pub use delete::{PurgeReport, delete_account_remote};
 pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
 pub use epochs::{RotationReport, SyncReport};
-pub use lookup::{ThreadCursor, ThreadPage, ThreadSummary};
+pub use lookup::{ThreadCursor, ThreadList, ThreadPage, ThreadSummary};
 pub use members::{ExcludedMember, ExclusionReason};
 pub use pins::{PeerPin, RepinProposal};
 pub use read::{LoadedMessage, MessageSource, RedactedMessage, ThreadHistory, Undecryptable};

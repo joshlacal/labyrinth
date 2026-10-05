@@ -15,6 +15,16 @@
 //!   record carries no server order. A removed device can backdate it;
 //!   SPEC §10 keeps that as a residual risk for Space-stored threads.
 
+/// The signing key of the DS that sequences a conversation: it signs the
+/// redactions the DS applies on its own ([CB-38] account deletion).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequencerKey {
+    /// The DS's DID (`defs#redaction.by`).
+    pub did: String,
+    /// Its Ed25519 redaction signing key.
+    pub key: [u8; 32],
+}
+
 /// One chat device transport key in the MLS device view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChatDeviceKey {

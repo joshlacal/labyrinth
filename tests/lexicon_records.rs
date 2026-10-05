@@ -322,7 +322,7 @@ fn validator_rejects_bad_records() {
 /// [CB-37] owner v5, [CB-39] lastUsedAt) validate and round-trip.
 #[test]
 fn gap_fields_validate() {
-    use labyrinth::deletion::Redaction;
+    use labyrinth::deletion::{Redaction, ServerRedaction, StoredRedaction};
     use labyrinth::device::ChatBinding;
     use labyrinth::records::{BatchEntry, RedactionDef};
     let lex = lexicons();
@@ -347,23 +347,55 @@ fn gap_fields_validate() {
         vec![BatchEntry::Redacted {
             message_id: "m1".into(),
             timestamp: 7,
-            redaction: Some(r),
+            redaction: StoredRedaction::Author(r.clone()),
         }]
     );
     assert!(batch.to_messages().is_err());
-    // An account-deletion redaction carries neither key nor signature.
+    // A bare server removal carries neither key nor signature.
     batch.items[0].redaction = Some(RedactionDef::account_deletion(Some(ts.clone())));
     check(&lex, nsid::BATCH, &batch);
     assert!(matches!(
         &batch.entries().unwrap()[0],
         BatchEntry::Redacted {
-            redaction: None,
+            redaction: StoredRedaction::Unsigned { .. },
             ..
         }
     ));
+    // A sequencer's account deletion: by + reason + redactedAt (+ sig).
+    let ds = transport(9);
+    for signer in [Some(&ds as &dyn labyrinth::sign::TransportSigner), None] {
+        let sr =
+            ServerRedaction::account_deletion("did:web:ds.example", DID, THREAD, "m1", &ts, signer);
+        batch.items[0].redaction = Some(RedactionDef::from_server(&sr));
+        check(&lex, nsid::BATCH, &batch);
+        assert_eq!(
+            batch.entries().unwrap()[0],
+            BatchEntry::Redacted {
+                message_id: "m1".into(),
+                timestamp: 7,
+                redaction: StoredRedaction::Server(sr),
+            }
+        );
+    }
+    // Field combinations that are no one kind are malformed.
     let mut half = RedactionDef::account_deletion(None);
     half.sig = Some(labyrinth::records::Bytes(vec![0; 64]));
     batch.items[0].redaction = Some(half);
+    assert!(batch.entries().is_err());
+    let mut mixed = RedactionDef::from_redaction(&r);
+    mixed.by = Some("did:web:ds.example".into());
+    batch.items[0].redaction = Some(mixed);
+    assert!(batch.entries().is_err());
+    let mut no_at = RedactionDef::from_server(&ServerRedaction::account_deletion(
+        "did:web:ds.example",
+        DID,
+        THREAD,
+        "m1",
+        &ts,
+        None,
+    ));
+    no_at.redacted_at = None;
+    batch.items[0].redaction = Some(no_at);
     assert!(batch.entries().is_err());
 
     let ob = OwnerBatch::from_messages(

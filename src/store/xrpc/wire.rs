@@ -37,12 +37,15 @@ impl OrderDef {
     }
 }
 
-/// `{items, cursor?}`.
+/// `{items, cursor?, incomplete?}`. `incomplete` (`listThreads` only)
+/// names sequencer DSes the server could not reach.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<Vec<String>>,
 }
 
 /// `{record}`.

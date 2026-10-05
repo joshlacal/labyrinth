@@ -154,13 +154,13 @@ impl MekDistribution {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchEntry {
     Sealed(SealedMessage),
-    /// Redacted ([CB-38]); the ciphertext is gone. `redaction` is the
-    /// author's signed unsend, or `None` when the server redacted it for
-    /// an account deletion. Never treat `None` as an author unsend.
+    /// Redacted ([CB-38]); the ciphertext is gone. `redaction` says by
+    /// whom; only a verified [`crate::deletion::StoredRedaction::Author`]
+    /// is an author unsend.
     Redacted {
         message_id: String,
         timestamp: u64,
-        redaction: Option<crate::deletion::Redaction>,
+        redaction: crate::deletion::StoredRedaction,
     },
 }
 

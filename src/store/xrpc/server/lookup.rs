@@ -51,7 +51,12 @@ pub(super) fn handle(
                 .into_iter()
                 .map(|thread_id| ThreadView { thread_id })
                 .collect();
-            s.page(v, input)
+            let unreachable = s
+                .unreachable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            s.page_with(v, input, (!unreachable.is_empty()).then_some(unreachable))
         })(),
         "listOwnerThreads" => (|| {
             let mb = s.net.mailbox(&c.did);

@@ -23,7 +23,7 @@
 
 use super::pins::MAX_PIN_ADVANCE;
 use crate::mailbox::EpochPublic;
-use crate::store::{ChatDeviceKey, MailboxDirectory, MemberDeviceKey};
+use crate::store::{ChatDeviceKey, MailboxDirectory, MemberDeviceKey, SequencerKey};
 use crate::{Error, Result};
 
 /// Cross-checking directory over the PDS and mls-ds. See the module docs.
@@ -112,5 +112,13 @@ impl MailboxDirectory for CompositeDirectory {
         did: &str,
     ) -> Result<Option<Vec<MemberDeviceKey>>> {
         self.ds.member_device_keys(thread_id, did)
+    }
+
+    /// The DS's own answer first; the PDS side only if the DS has none.
+    fn sequencer_key(&self, thread_id: &str) -> Result<Option<SequencerKey>> {
+        match self.ds.sequencer_key(thread_id)? {
+            Some(k) => Ok(Some(k)),
+            None => self.pds.sequencer_key(thread_id),
+        }
     }
 }

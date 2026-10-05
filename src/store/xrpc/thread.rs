@@ -14,7 +14,7 @@ use super::{Xrpc, XrpcTransport};
 use crate::Result;
 use crate::deletion::Redaction;
 use crate::records::{Batch, MekDistribution, RedactionDef};
-use crate::store::{Stored, ThreadStore, TimeRange};
+use crate::store::{Stored, ThreadListing, ThreadStore, TimeRange};
 
 /// The conversation records on the sequencer DS, writing as one DID.
 pub struct XrpcThreadStore {
@@ -143,9 +143,19 @@ impl ThreadStore for XrpcThreadStore {
         Ok(v)
     }
 
-    /// `listThreads` (merged across sequencers by the home DS).
+    /// `listThreads` (merged across sequencers by the home DS). Fails
+    /// when a sequencer was unreachable; see
+    /// [`list_threads_report`](ThreadStore::list_threads_report).
     fn list_threads(&self) -> Result<Vec<String>> {
         let v: Vec<ThreadView> = self.x.list_all("listThreads", &[])?;
         Ok(v.into_iter().map(|t| t.thread_id).collect())
+    }
+
+    fn list_threads_report(&self) -> Result<ThreadListing> {
+        let (v, incomplete): (Vec<ThreadView>, _) = self.x.list_all_report("listThreads", &[])?;
+        Ok(ThreadListing {
+            threads: v.into_iter().map(|t| t.thread_id).collect(),
+            incomplete,
+        })
     }
 }

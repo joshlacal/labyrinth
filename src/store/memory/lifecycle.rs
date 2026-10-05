@@ -3,8 +3,9 @@
 //! ([CB-38], [CB-39]).
 
 use super::{MemoryBackend, State};
-use crate::deletion::Redaction;
+use crate::deletion::{Redaction, ServerRedaction};
 use crate::records::{RedactionDef, datetime_from_ms};
+use crate::sign::{Ed25519Transport, TransportSigner};
 use crate::{Error, Result};
 
 impl State {
@@ -50,11 +51,14 @@ impl State {
     }
 
     /// mls-ds `deleteAccountData`: redact every live item `did` authored
-    /// with an unsigned (account-deletion) redaction, then purge.
+    /// with the sequencer's account-deletion redaction (signed when it has
+    /// a key; a bare `{redactedAt}` without [`MemoryBackend::set_sequencer`]),
+    /// then purge.
     pub(super) fn delete_account_data(&mut self, did: &str) -> usize {
-        let def = RedactionDef::account_deletion(Some(datetime_from_ms(self.server_now)));
+        let at = datetime_from_ms(self.server_now);
+        let sequencer = self.sequencer.clone();
         let mut n = 0;
-        for t in self.threads.values_mut() {
+        for (thread_id, t) in self.threads.iter_mut() {
             for (b, _) in t
                 .repos
                 .get_mut(did)
@@ -62,8 +66,24 @@ impl State {
                 .flat_map(|r| r.batches.values_mut())
             {
                 for i in b.items.iter_mut().filter(|i| i.redaction.is_none()) {
+                    let def = match &sequencer {
+                        None => RedactionDef::account_deletion(Some(at.clone())),
+                        Some((by, seed)) => {
+                            let signer = seed.map(|s| {
+                                Ed25519Transport(ed25519_dalek::SigningKey::from_bytes(&s))
+                            });
+                            RedactionDef::from_server(&ServerRedaction::account_deletion(
+                                by,
+                                did,
+                                thread_id,
+                                &i.message_id,
+                                &at,
+                                signer.as_ref().map(|s| s as &dyn TransportSigner),
+                            ))
+                        }
+                    };
                     i.signed_enc_message.0.clear();
-                    i.redaction = Some(def.clone());
+                    i.redaction = Some(def);
                     n += 1;
                 }
             }

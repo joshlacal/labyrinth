@@ -303,10 +303,16 @@ fn record_crate_xrpc_trace() {
     // Removing a recovery method rotates its device out and deletes it.
     alice.remove_recovery_method(&keychain.vdevice_id).unwrap();
 
-    // Carol deletes her account server-side; Bob sees "account removed".
+    // Carol deletes her account server-side. The reference server here
+    // has no sequencer signing key and XrpcDirectory reports none, so Bob
+    // sees "removed by server", never an unsend.
     assert!(carol.purge_account().unwrap().server_side);
     let h = bob.load_thread(THREAD, TimeRange::ALL).unwrap();
-    assert!(h.redacted.iter().any(|r| r.account_deleted));
+    assert!(
+        h.redacted
+            .iter()
+            .any(|r| r.removed_by_server && !r.by_author && !r.account_deleted)
+    );
     XrpcMailboxStore::new(BOB, w.transport(BOB, 3))
         .purge_mailbox()
         .unwrap();
