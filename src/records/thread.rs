@@ -150,6 +150,34 @@ impl MekDistribution {
     }
 }
 
+/// One item of a [`Batch`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchEntry {
+    Sealed(SealedMessage),
+    /// Unsent by its author ([CB-38]); the ciphertext is gone.
+    Redacted {
+        message_id: String,
+        timestamp: u64,
+        redaction: crate::deletion::Redaction,
+    },
+}
+
+impl BatchEntry {
+    pub fn message_id(&self) -> &str {
+        match self {
+            Self::Sealed(s) => &s.message_id,
+            Self::Redacted { message_id, .. } => message_id,
+        }
+    }
+
+    pub fn timestamp(&self) -> u64 {
+        match self {
+            Self::Sealed(s) => s.timestamp,
+            Self::Redacted { timestamp, .. } => *timestamp,
+        }
+    }
+}
+
 /// `blue.catbird.labyrinth.batch`, rkey = TID.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -179,6 +207,26 @@ impl Batch {
         })
     }
 
+    /// Every item, redacted ones ([CB-38]) included.
+    pub fn entries(&self) -> Result<Vec<BatchEntry>> {
+        check_type(&self.type_, nsid::BATCH)?;
+        if self.items.is_empty() || self.items.len() > super::MAX_BATCH_ITEMS {
+            return Err(Error::Malformed("batch size"));
+        }
+        self.items
+            .iter()
+            .map(|i| match i.redaction()? {
+                Some(redaction) => Ok(BatchEntry::Redacted {
+                    message_id: i.message_id.clone(),
+                    timestamp: i.timestamp,
+                    redaction,
+                }),
+                None => i.to_message().map(BatchEntry::Sealed),
+            })
+            .collect()
+    }
+
+    /// The sealed items; fails if any was redacted (see [`Self::entries`]).
     pub fn to_messages(&self) -> Result<Vec<SealedMessage>> {
         check_type(&self.type_, nsid::BATCH)?;
         if self.items.is_empty() || self.items.len() > super::MAX_BATCH_ITEMS {

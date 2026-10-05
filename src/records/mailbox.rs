@@ -231,6 +231,10 @@ pub struct VirtualDevice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passkey_credential_id: Option<Bytes>,
     pub created_at: String,
+    /// Last successful restore or keep-alive ([CB-39]); stamped by the
+    /// server (clients never write it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
 }
 
 impl VirtualDevice {
@@ -255,6 +259,7 @@ impl VirtualDevice {
             passkey_wrapped_code: passkey.map(|p| Bytes(p.wrapped_code.clone())),
             passkey_credential_id: passkey.map(|p| Bytes(p.credential_id.clone())),
             created_at,
+            last_used_at: None,
         }
     }
 

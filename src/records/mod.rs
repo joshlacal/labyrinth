@@ -17,10 +17,13 @@ pub mod mailbox;
 pub mod thread;
 
 pub use defs::{
-    EpochPublicDef, MekRecipientDef, OwnerMessageDef, SealedMessageDef, TransportAttestationDef,
+    EpochPublicDef, MekRecipientDef, OwnerMessageDef, RedactionDef, SealedMessageDef,
+    TransportAttestationDef,
 };
 pub use mailbox::{Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, VirtualDevice};
-pub use thread::{Batch, LabyrinthSenderDef, MekDistribution, MekSenderDef, TransportSenderDef};
+pub use thread::{
+    Batch, BatchEntry, LabyrinthSenderDef, MekDistribution, MekSenderDef, TransportSenderDef,
+};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;

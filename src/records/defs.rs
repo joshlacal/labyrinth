@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Bytes;
+use crate::deletion::Redaction;
 use crate::hpke::hawk::HawkEncPublic;
 use crate::hpke::labyrinth::X25519Public;
 use crate::mailbox::{EpochPublic, MailboxPublicKeys, TransportAttestation};
@@ -87,7 +88,37 @@ impl EpochPublicDef {
     }
 }
 
-/// `defs#sealedMessage` (SPEC §7.2).
+/// `defs#redaction` ([CB-38]): an author's signed unsend request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RedactionDef {
+    pub transport_pubkey: Bytes,
+    pub sig: Bytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_at: Option<String>,
+}
+
+impl RedactionDef {
+    pub fn from_redaction(r: &Redaction) -> Self {
+        Self {
+            transport_pubkey: Bytes::from_slice(&r.transport_public_key),
+            sig: Bytes::from_slice(&r.sig),
+            redacted_at: r.redacted_at.clone(),
+        }
+    }
+
+    pub fn to_redaction(&self) -> Result<Redaction> {
+        Ok(Redaction {
+            transport_public_key: self.transport_pubkey.array("redaction key length")?,
+            sig: self.sig.array("redaction sig length")?,
+            redacted_at: self.redacted_at.clone(),
+        })
+    }
+}
+
+/// `defs#sealedMessage` (SPEC §7.2). A redacted item ([CB-38]) keeps its
+/// `messageId`, `timestamp`, `mekId` and sender key, carries `redaction`,
+/// and has an empty `signedEncMessage`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SealedMessageDef {
@@ -96,6 +127,8 @@ pub struct SealedMessageDef {
     pub mek_id: Bytes,
     pub sender_transport_pubkey: Bytes,
     pub signed_enc_message: Bytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction: Option<RedactionDef>,
 }
 
 impl SealedMessageDef {
@@ -106,10 +139,22 @@ impl SealedMessageDef {
             mek_id: Bytes::from_slice(&m.mek_id),
             sender_transport_pubkey: Bytes::from_slice(&m.sender_transport_pub),
             signed_enc_message: Bytes(m.signed_enc_message.clone()),
+            redaction: None,
         }
     }
 
+    /// The redaction, if this item was unsent ([CB-38]).
+    pub fn redaction(&self) -> Result<Option<Redaction>> {
+        self.redaction
+            .as_ref()
+            .map(RedactionDef::to_redaction)
+            .transpose()
+    }
+
     pub fn to_message(&self) -> Result<SealedMessage> {
+        if self.redaction.is_some() {
+            return Err(Error::Malformed("item was redacted"));
+        }
         Ok(SealedMessage {
             message_id: self.message_id.clone(),
             timestamp: self.timestamp,

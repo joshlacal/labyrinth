@@ -5,11 +5,14 @@
 //! records; [`store`] defines where those records live.
 
 pub mod aead;
+pub mod attachment;
 pub mod client;
+pub mod deletion;
 pub mod device;
 pub mod encoding;
 pub mod epoch;
 pub mod error;
+pub mod fingerprint;
 pub mod hpke;
 pub mod mailbox;
 pub mod mek;

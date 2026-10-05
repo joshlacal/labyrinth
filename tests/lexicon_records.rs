@@ -286,7 +286,7 @@ fn validator_rejects_bad_records() {
     .unwrap();
     let mut v = serde_json::to_value(ob).unwrap();
     lex.validate_record(nsid::OWNER_BATCH, &v).unwrap();
-    v["items"][0]["version"] = json!(5);
+    v["items"][0]["version"] = json!(6);
     assert!(lex.validate_record(nsid::OWNER_BATCH, &v).is_err());
     // epochNumber is bounded at 2^40, in the lexicon and in the records layer.
     v["items"][0]["version"] = json!(3);
@@ -315,4 +315,57 @@ fn validator_rejects_bad_records() {
     let mut pubdef = labyrinth::records::EpochPublicDef::from_public(&m.epoch);
     pubdef.epoch_number = u64::MAX;
     assert!(pubdef.to_public().is_err());
+}
+
+/// The gap-closing record fields ([CB-36] chat binding, [CB-38] redaction,
+/// [CB-37] owner v5, [CB-39] lastUsedAt) validate and round-trip.
+#[test]
+fn gap_fields_validate() {
+    use labyrinth::deletion::Redaction;
+    use labyrinth::device::ChatBinding;
+    use labyrinth::records::{BatchEntry, RedactionDef};
+    let lex = lexicons();
+    let ts = datetime_from_ms(9);
+    let d = DeviceSecrets::generate().unwrap();
+    let binding = ChatBinding::sign(DID, &d.public().device_key_pub, &transport(3));
+    let bound = Device::bound(d.public(), &binding, ts.clone());
+    check(&lex, nsid::DEVICE, &bound);
+    assert_eq!(bound.chat_binding().unwrap(), Some(binding));
+
+    let t = transport(4);
+    let mek = Mek::generate(&[[1u8; 32]]).unwrap();
+    let sealed = seal_sender(&mek, THREAD, "m1", 7, b"hi", &t).unwrap();
+    let mut batch = Batch::from_messages(THREAD, &[sealed], ts.clone()).unwrap();
+    let mut r = Redaction::sign(DID, THREAD, "m1", &t);
+    r.redacted_at = Some(ts.clone());
+    batch.items[0].signed_enc_message.0.clear();
+    batch.items[0].redaction = Some(RedactionDef::from_redaction(&r));
+    check(&lex, nsid::BATCH, &batch);
+    assert_eq!(
+        batch.entries().unwrap(),
+        vec![BatchEntry::Redacted {
+            message_id: "m1".into(),
+            timestamp: 7,
+            redaction: r,
+        }]
+    );
+    assert!(batch.to_messages().is_err());
+
+    let ob = OwnerBatch::from_messages(
+        &[labyrinth::message::seal_owner_tombstone(&[1u8; 32], 0, THREAD, "m1", 7, None).unwrap()],
+        ts.clone(),
+    )
+    .unwrap();
+    assert_eq!(ob.items[0].version, 5);
+    check(&lex, nsid::OWNER_BATCH, &ob);
+
+    let a = DeviceSecrets::generate().unwrap();
+    let (p0, _) = open_genesis(DID, &a, &transport(1)).unwrap();
+    let e0 = p0.assign_id(space_epoch_id(0));
+    let code = RecoveryCode::generate().unwrap();
+    let (vrec, _, _) =
+        virtual_device::create(DID, &code, &a, &e0, &[9u8; 32], Mechanism::Keychain).unwrap();
+    let mut vd = VirtualDevice::from_bundle(&vrec, None, ts.clone());
+    vd.last_used_at = Some(datetime_from_ms(10));
+    check(&lex, nsid::VIRTUAL_DEVICE, &vd);
 }

@@ -323,8 +323,16 @@ fn sealed_message_tamper_every_field() {
 fn owner_mode_round_trip_and_binding() {
     let root = [0x42u8; 32];
     let msg = seal_owner(&root, 7, THREAD, "m-1", 123, b"note to self").unwrap();
-    assert_eq!((msg.version, msg.epoch_seq), (3, 7));
+    assert_eq!((msg.version, msg.epoch_seq), (5, 7));
     assert_eq!(open_owner(&root, &msg).unwrap(), b"note to self");
+
+    // [CB-37] v5 binds the message id and timestamp too.
+    let mut wrong_id = msg.clone();
+    wrong_id.message_id = "m-2".into();
+    assert!(open_owner(&root, &wrong_id).is_err());
+    let mut wrong_ts = msg.clone();
+    wrong_ts.timestamp = 124;
+    assert!(open_owner(&root, &wrong_ts).is_err());
 
     let mut wrong_seq = msg.clone();
     wrong_seq.epoch_seq = 8;
@@ -351,7 +359,8 @@ fn padding_hides_lengths() {
     let b = seal_sender(&mek, THREAD, "b", 1, &[b'x'; 12], &alice.transport).unwrap();
     assert_eq!(a.signed_enc_message.len(), b.signed_enc_message.len());
     let root = [1u8; 32];
-    let a = seal_owner(&root, 0, THREAD, "a", 1, &[0; 11]).unwrap();
-    let b = seal_owner(&root, 0, THREAD, "b", 1, &[0; 12]).unwrap();
+    // v5 owner content is `kind || frame`: 11 and 12 bytes pad alike.
+    let a = seal_owner(&root, 0, THREAD, "a", 1, &[0; 10]).unwrap();
+    let b = seal_owner(&root, 0, THREAD, "b", 1, &[0; 11]).unwrap();
     assert_eq!(a.encrypted.len(), b.encrypted.len());
 }
