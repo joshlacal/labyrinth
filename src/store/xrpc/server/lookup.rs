@@ -1,7 +1,6 @@
 //! Lookup endpoints of the reference server (mls-ds
 //! `labyrinth/repo/lookup.rs`): `getMessages`, `listThreads` and
-//! `listOwnerThreads`. (The file name is historical: these were the
-//! crate's pending proposals until mls-ds built them.)
+//! `listOwnerThreads`.
 //!
 //! - `getMessages`: the readable batches of one thread holding any of
 //!   1..=100 `messageIds` (repeated query keys), in server seq order,

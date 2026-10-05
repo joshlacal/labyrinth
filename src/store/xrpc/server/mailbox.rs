@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::binding::{require_bound, require_registered, verify_chat_binding};
 use super::{Caller, Input, MemoryXrpcServer, Reply, bad, body, err, hex_param, json, num, req};
+use crate::Error;
 use crate::orf::EvolveToken;
 use crate::records::{Device, Epoch, EpochMember, OwnerBatch, VirtualDevice};
 use crate::sign::XVerifyingKey;
@@ -148,6 +149,12 @@ pub(super) fn handle(
         })(),
         "getVirtualDevice" => (|| {
             let id = hex_param::<16>(input, "vdeviceId")?;
+            // Reading a bundle also records it as used (lexicon:
+            // getVirtualDevice touches it, returning the server lastUsedAt).
+            match mb.touch_virtual_device(&id) {
+                Ok(()) | Err(Error::NotFound(_)) => {}
+                Err(e) => return Err(err(e)),
+            }
             let v = mb.get_virtual_device(&id).map_err(err)?;
             json(&RecordBody {
                 record: v.ok_or_else(|| not_found("VirtualDeviceNotFound"))?,

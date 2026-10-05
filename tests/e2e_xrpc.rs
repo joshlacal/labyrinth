@@ -519,17 +519,20 @@ fn unsend_attachments_and_recovery_lifecycle_over_xrpc() {
     let state = orf_client_init().unwrap();
     let (bi, bt) = blind(&state, THREAD, "blob-2");
     assert_eq!(orf.attachment_ref_created_at(&dev, &bi).unwrap(), None);
-    orf.put_attachment_ref(
-        &dev,
-        &AttachmentPut {
-            blinded_index: bi,
-            blinded_token_salt: bt,
-            blob_id: "blob-2".into(),
-            thread_id: THREAD.into(),
-            message_id: "a2".into(),
-        },
-    )
-    .unwrap();
+    let put = AttachmentPut {
+        blinded_index: bi,
+        blinded_token_salt: bt,
+        blob_id: "blob-2".into(),
+        thread_id: THREAD.into(),
+        message_id: "a2".into(),
+    };
+    orf.put_attachment_ref(&dev, &put).unwrap();
+    // Re-putting the identical reference answers RecordAlreadyExists, as
+    // mls-ds does, and leaves the one reference in place.
+    assert!(matches!(
+        orf.put_attachment_ref(&dev, &put),
+        Err(Error::Conflict)
+    ));
     assert_eq!(
         orf.attachment_ref_created_at(&dev, &bi).unwrap(),
         Some(w.ts)

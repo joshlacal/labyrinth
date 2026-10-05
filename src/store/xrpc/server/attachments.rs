@@ -8,10 +8,10 @@
 //! look alike); `OrfStateNotFound`; on put, `AttachmentNotEntitled` (403)
 //! when the blob or the message is not one the caller may reference, and
 //! `AttachmentAlreadyReferenced` (409) for a second message per blob.
-//!
-//! One deliberate difference: re-putting the identical reference succeeds
-//! here, where mls-ds answers `RecordAlreadyExists`; both leave one
-//! reference.
+//! Re-putting a reference that already exists answers `RecordAlreadyExists`
+//! (409), as mls-ds does, and leaves the one stored reference unchanged. (The
+//! memory `OrfServer` itself treats an identical re-put as a no-op; the
+//! XRPC layer reports it the way mls-ds does.)
 
 use super::{Caller, Input, MemoryXrpcServer, Reply, bad, body, err, hex_param, json, req};
 use crate::Error;
@@ -48,10 +48,21 @@ fn put(s: &MemoryXrpcServer, c: &Caller, input: &Input<'_>) -> Reply {
         message_id: i.message_id,
     };
     let k = XVerifyingKey(arr(&i.device_key_pubkey, "deviceKeyPubkey")?);
+    let existed = s
+        .net
+        .attachment_ref_created_at(&c.did, &k.0, &put.blinded_index)
+        .is_ok();
     s.net
         .orf(&c.did)
         .put_attachment_ref(&k, &put)
         .map_err(attachment_error)?;
+    if existed {
+        return Err(XrpcError::named(
+            409,
+            "RecordAlreadyExists",
+            "attachment reference already exists",
+        ));
+    }
     json(&Empty {})
 }
 

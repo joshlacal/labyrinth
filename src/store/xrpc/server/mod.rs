@@ -19,8 +19,8 @@
 
 mod attachments;
 mod binding;
+mod lookup;
 mod mailbox;
-mod pending;
 mod retention;
 mod thread;
 
@@ -115,7 +115,7 @@ impl MemoryXrpcServer {
             .or_else(|| thread::handle(self, c, name, &input))
             .or_else(|| retention::handle(self, c, name, &input))
             .or_else(|| attachments::handle(self, c, name, &input))
-            .or_else(|| pending::handle(self, c, name, &input))
+            .or_else(|| lookup::handle(self, c, name, &input))
             .unwrap_or_else(|| Err(XrpcError::named(501, "MethodNotImplemented", nsid)))
     }
 }
