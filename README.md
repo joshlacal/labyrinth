@@ -30,7 +30,8 @@ The whitepapers leave many choices open and are written around Facebook identiti
 | `src/mek/`, `src/message.rs` | MEK distribution and opening; owner-mode and sender-mode message encryption |
 | `src/records/` | atproto record types for every lexicon, with lossless conversions to the protocol structs |
 | `src/store/` | Synchronous storage traits (`MailboxStore`, `ThreadStore`, `MailboxDirectory`, `KeyPublisher`, `OrfServer`), the chat-key vouching rule, an in-memory backend, and (feature `xrpc`) stores over the mls-ds `blue.catbird.labyrinth.*` endpoints with a memory-backed reference server |
-| `src/client/` | `Labyrinth`: the high-level client a chat app calls (initialize, sync, revoke, recover, enroll, archive, load, export and restore its state), and `CompositeDirectory`, which cross-checks the PDS and mls-ds epoch heads |
+| `src/client/` | `Labyrinth`, the high-level client a chat app calls. It covers initialize, sync, revoke (with membership audit), recover, enroll, archive, and export and restore of its state; loading by range, by id or newest-first page; delete-for-me, unsend and account purge; attachment references; recovery-method lifecycle; and fingerprints. Also `CompositeDirectory`, which cross-checks the PDS and mls-ds epoch heads |
+| `src/deletion.rs`, `src/attachment.rs`, `src/fingerprint.rs` | Signed redactions, attachment-reference derivations, safety numbers |
 | `lexicons/blue/catbird/labyrinth/` | Draft `blue.catbird.labyrinth.*` record lexicons and the mls-ds XRPC queries and procedures |
 | `docs/SPEC.md`, `docs/DECISIONS.md`, `docs/MLSDS_BACKEND.md` | The protocol profile, the decision log, and the mls-ds backend design |
 
@@ -82,7 +83,12 @@ The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-an
 - **History reads trust removed devices, up to their removal.** Messages and MEKs signed by a chat device that has since been removed still verify if they were written before its removal ([CB-27]). With mls-ds that is decided by the server's stamp (receive time and conversation sequence), so a removed device cannot backdate; records in a Space carry no stamp, so there the sender's timestamp decides and a removed device can backdate. Addressing a new MEK requires a current device.
 - **First contact.** Senders pin each peer's newest epoch and refuse rollbacks afterwards ([CB-29]). With `CompositeDirectory` the first epoch must also agree between the peer's PDS and mls-ds; with a single directory it is trust-on-first-use. Carrying latest heads in MLS-authenticated group state is the long-term fix.
 - **Client state is secret.** `Labyrinth::export_state()` returns the device's private keys, epoch roots, MEKs, revoked set and pins ([CB-30]). Store it only in the platform keychain or SQLCipher; flush pending batches first, since they are not included.
-- **Not yet provided:** the atproto Space store, the mls-ds server side of the Labyrinth endpoints (the client stores exist behind the `xrpc` feature), client wrappers for attachment references (SPEC §8), and a UniFFI surface.
+- **Revocation can't be wedged by a planted row.** A rotation drops and reports invalid or unbound members instead of aborting ([CB-25], [CB-36]), and a squatted next epoch is reported as `EpochSquatted` ([CB-40]). Clearing a squat still needs the backend.
+- **Deletion is cooperative.** An unsend asks the server to redact, and readers can tell an author's unsend from a server removal. Deleted data survives in server backups for their retention window.
+- **Not yet provided:**
+  - the atproto Space store;
+  - the XRPC wrappers for the 2026-10-05 endpoints (unsend, purge, recovery-bundle touch and delete, the new attachment references). Their trait methods return `NotSupported` over XRPC until the mls-ds lexicons land; see DECISIONS 2026-10-05;
+  - a UniFFI surface.
 
 ## References
 

@@ -13,7 +13,7 @@
 //! It does **not** hold unflushed batches: call [`Labyrinth::flush`]
 //! first.
 //!
-//! Encoding (version 1), all integers big-endian, strings and lists
+//! Encoding (version 2), all integers big-endian, strings and lists
 //! length-prefixed, no trailing bytes:
 //!
 //! ```text

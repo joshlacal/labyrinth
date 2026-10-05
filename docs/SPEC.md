@@ -19,6 +19,7 @@ Whitepaper page numbers below refer to the v1.1 paper, e.g. "(p.27)". Every plac
 |---|---|
 | user / account (`userFbid`) | atproto account DID, e.g. `did:plc:abc…` **[CB-1]** |
 | inbox / mailbox | one per DID |
+| `labyrinthID` (the server-assigned instance id, p.21) | the account DID itself: a DID has exactly one mailbox, so there is no separate instance id **[CB-34]** |
 | device | a Catbird install that is enrolled in the mailbox. It is distinct from (but usually paired with) an mls-ds chat device |
 | virtual device | a recovery bundle unlocked by a recovery code |
 | thread | an MLS conversation (`chat.conversations.conversation_id`) **[CB-2]** |
@@ -165,7 +166,8 @@ prev_sig = XEdDSA(prevSigPriv, "minos.unstructured_signature.epoch_prev:" || epo
 ```
 
 - **[CB-10]** `epochHead` is the raw 32-byte digest. In the `+` concatenation above it is used as raw bytes.
-- A mailbox created by this crate always has a head from epoch 0 on. We have no v1.0 mailboxes to upgrade.
+- **[CB-35] No v1.0 upgrade path.** The paper allows a null `previousEpochHead` at epoch 0 *or* at a one-time v1.0→v1.1 upgrade (p.23). A mailbox created by this crate always has a head from epoch 0 on, and `EpochPublic::sign`/`verify` reject a null previous head at any epoch above 0: Catbird has no v1.0 mailboxes to upgrade, and accepting a null link mid-chain would let a backend restart a chain.
+- **[CB-41] Fingerprints.** The head commits to the DID, the current mailbox keys and the whole chain, so it doubles as a safety number (`src/fingerprint.rs`): `fp = kdf(head, MINOS_SALT, "catbird.labyrinth.fingerprint.v1:" || did, 30)`, shown as six 5-digit groups (each 5-byte chunk big-endian mod 100000); two accounts compare the 60 digits of both, ordered by DID (`Labyrinth::safety_number_with` uses the [CB-29] pin for the peer), or 8 emoji (`fp[i] mod 64`). It changes on every rotation.
 - **[CB-18] Transport attestation.** The device that opens an epoch also signs the head with its chat transport key (Ed25519):
   - `attestation = Ed25519(transportKey, "catbird.labyrinth.epoch_head_attest:" || did || ":" || epochHead)`.
   - A sender accepts a recipient's head only if the attesting key belongs to one of that DID's devices in the MLS group.
@@ -202,9 +204,14 @@ encEntropy[d] = labyrinth_hpke(d.epochStorageKeyPub, self.authPub, self.authPriv
 
 - Revoking a device opens a new epoch that excludes it.
 - **Local revoked set.** The revoking client records the device in its own revoked set (persisted, §9.3) before touching the store, and every rotation it performs excludes the whole set, whatever the store says about `revokedAt`. It reports success only after checking that the new epoch neither lists an excluded device nor encrypts entropy to one. A store that drops `revokedAt` therefore cannot re-admit the device. `sync_epochs` reports locally revoked devices that are still members of the reached epoch (a sibling re-admitted them, or a rotation never completed) so the caller can revoke again.
-- **[CB-25] Rotation rules.**
+- **[CB-25] Rotation rules (amended 2026-10-05).**
   - The opener carries itself over and encrypts the entropy to its own storage key too, so any install holding its keys can forward-chain.
-  - A device listed as continuing whose previous-epoch MAC or `sig_0x30`/`sig_0x31` fails aborts the rotation with an error. It is never dropped silently, because a silent drop would be an unannounced revocation.
+  - Before rotating, the client audits every member of the previous epoch (`src/client/members.rs`). A member whose record does not parse, whose device record is missing or fails `sig_0x30`/`sig_0x31`, whose MAC fails, or (physical devices) that is not bound to a *current* chat device of the DID ([CB-36]) is **excluded and reported** in `RotationReport::excluded`. The same audit runs on every `sync_epochs` (`SyncReport::invalid_members`) and on demand (`audit_members`).
+  - Why: any chat device of the DID can write a member row (gap audit G-P0-2). If an invalid row aborted rotation, one planted row would block every later revocation; if it were dropped silently, a backend could evict a real device unannounced. Exclusion with a report is neither.
+  - Exception: if a member this client already verified **in that same epoch** now fails a record or MAC check, the store rewrote a row it had served intact. The rotation aborts with `MemberTampered`. (An insider can only add rows for new keys, never rewrite one; a failed chat binding is a legitimate exclusion and does not count.) The verified set is persisted ([CB-30], state v2).
+  - The rotating device's own chat key must be current in the directory, or the rotation fails with `Unattested` (a wrong directory view would otherwise drop every sibling).
+- **[CB-36] Device binding.** A physical device record carries `chatBinding = {transportPubkey, Ed25519(chat key, "catbird.labyrinth.device_binding:" || did || ":" || deviceKeyPub)}` from the chat device that enrolled it; virtual devices carry none. Rotation carries a physical device over only while its binding verifies and names a current chat device, so removing a chat device drops its Labyrinth device at the next rotation (and the report says so). mls-ds additionally requires the binding at `createDevice` and admits epochs and members only from bound, registered devices; genesis therefore writes the device record before epoch 0, and a recovery bundle writes its device record before the `virtualDevice`.
+- **[CB-40] Squatted epochs.** Epoch numbers are create-if-absent, so a bogus record at `seq + 1` would block every rotation. Forward chaining classifies the next epoch: if it is not signed with the previous epoch's mailbox signing key (`prev_sig`), its opener is not a valid physical member of the previous epoch, its opener is in this client's revoked set, or its entropy does not open, it fails with `EpochSquatted {seq, reason}` and is never retried; only a validly chained epoch without a valid membership for this device means `NotEpochMember` (revoked). Removing a squat needs the backend (mls-ds refuses epoch writes from unbound devices).
   - Forward chaining checks, in order: the opener's record verifies, is physical, matches `openedBy`, and holds a valid MAC in the previous epoch; the entropy decrypts; the derived mailbox keys equal the published `epochPublic`, whose head, self signature, attestation and `prev_sig` link verify; the reader's own MAC verifies under the new epoch; and the encrypted back-link decrypts to the previous sequence number and root.
 - The backend then deletes the device's ORF server state.
 - **[CB-11]** The rotation is **mandatory**: unlike Messenger, the client library always rotates when it revokes.
@@ -273,6 +280,11 @@ Each recovery mechanism gets its own virtual device. This crate provides helpers
 
 A PIN vault (HSM or Juicebox) is out of scope for the first release.
 
+**[CB-39] Recovery-method lifecycle** (decision J2 defaults, paper p.46). `Labyrinth::list_recovery_methods` lists every bundle with its mechanism, `createdAt`, `lastUsedAt` and expiry:
+- `keychain` and `passkey` bundles, which a platform stores for the user, expire 180 days (`AUTO_RECOVERY_TTL_MS`) after `max(createdAt, lastUsedAt)`; `code` and `otc` bundles never expire.
+- A restore touches its bundle (`touchVirtualDevice`, server clock) before writing anything; the app may also call `touch_recovery_method` when it confirms its keychain copy still exists.
+- `remove_recovery_method` revokes the virtual device (a rotation without it, its ORF state deleted) and then deletes the bundle (`deleteVirtualDevice`); `remove_expired_recovery_methods` does this for every expired bundle by the client clock. mls-ds also expires them server-side.
+
 ### 6.5 One-time code (p.44–45)
 
 - **CPace** runs over Ristretto255 / SHA-512, using the 6-digit code as the password **[CB-14]**:
@@ -300,21 +312,29 @@ epochID            (UTF-8)
 
 Code: `src/message.rs` (§7.1–7.2), `src/mek.rs` and `src/mek/distribute.rs` (§7.3–7.4).
 
-### 7.1 Owner upload (v1.0 mode, cipher version 3; p.37–38)
+### 7.1 Owner upload (cipher versions 3 and 5; p.37–38)
 
 ```
 messageKey = kdf(root, null, "message_key_in_epoch_" || seq || "_cipher_version_3_thread_" || threadId)
 encrypted  = encrypt(messageKey, "message_thread_" || threadId, pad(messageData))
 ```
 
-Stored record: `(threadId, messageId, timestamp, epochSequenceID, version = 3, encrypted)`.
+Stored record: `(threadId, messageId, timestamp, epochSequenceID, version, encrypted)`.
 
-- We write only version 3. For completeness we also **decrypt** the other key derivations from the paper's implementation notes (p.51–52), all with the same AAD:
+- **[CB-37] We write version 5**: the version-3 key derivation with `_cipher_version_5_`, and
+  ```
+  aad     = "catbird.labyrinth.owner_message_v5:message_id=" || messageId || ";thread_id=" || hex(threadId)
+            || ";timestamp=" || timestamp
+  content = kind(1) || body        // 0x00 = message frame, 0x01 = delete-for-me tombstone (§7.5)
+  encrypted = encrypt(messageKey, aad, pad(content))
+  ```
+  so `messageId` and `timestamp` are authenticated, and a tombstone is padded and stored like a message (the server cannot tell them apart).
+- Readers also accept version 3 (the paper's writer) and, for completeness, the other key derivations from the paper's implementation notes (p.51–52), all with the paper's AAD:
   - version 0: `kdf(root, threadId, "message_key_in_epoch_" || seq)` (the salt is the thread id);
   - version 2: `kdf(root, threadId, "message_key_in_epoch_" || seq || "cipher_version_2")` (no underscore before `cipher`, as printed);
   - version 4: version 3 with `_cipher_version_4_thread_`.
   - Version 1 and anything above 4 are rejected.
-- Only `threadId`, `epochSequenceID` and `version` are authenticated (they feed the key or the AAD). `messageId` and `timestamp` are not, exactly as in the paper: a backend can swap them between owner messages of the same thread and epoch. Sender mode (§7.2) binds both.
+- In versions 0–4 only `threadId`, `epochSequenceID` and `version` are authenticated (they feed the key or the AAD). `messageId` and `timestamp` are not, exactly as in the paper: a backend can swap them between such owner messages of the same thread and epoch. Version 5 and sender mode (§7.2) bind both. Version 1 and anything above 5 are rejected.
 
 ### 7.2 Sender upload (v1.1, p.38–39)
 
@@ -393,13 +413,38 @@ To read a message:
 3. Verify `sig` and that the sender key is one of the sender's MLS devices: a current one, or one removed *after* the message's timestamp ([CB-27]). The same bound applies to the key that attests a MEK's sender epoch (or signs a transport MEK), at the timestamp of the first message that needed the MEK.
 4. Decrypt the message and remove the padding.
 
+**Lookups.** `load_message(thread, messageId)` returns every copy of one message (via `ThreadStore::get_messages` / `MailboxStore::get_owner_messages`; the defaults scan, an indexed backend overrides them). `load_thread_page(thread, before, limit)` returns the `limit` newest distinct `(timestamp, messageId)` positions older than the cursor, newest first, decrypting only those; all copies at one position stay on one page, and the next cursor is the oldest position returned (`"<ts>:<messageId>"`). It reads `list_batches_before` / `list_owner_batches_before`, whose contract lets a backend stop early only once the page is provably complete. `list_threads()` lists the threads this account has history in from its own records: MEKs it wrote or was addressed in, and its owner archive, so a restored device finds conversations it has left.
+
 **Duplicates [CB-31].** A thread can hold several copies of one `messageId`: a sender copy, my owner-archive copy, or a different member reusing the id. Copies are merged only when they are provably the same message: sender copies on `(author DID, messageId)` with a byte-equal frame; an owner copy only when its frame is byte-equal to a loaded copy with that `messageId`. Every other copy is returned with `conflict = true`, so a member cannot suppress someone else's message by reusing its id. Re-archiving on leave ([CB-22]) keeps every distinct `(messageId, frame)`.
+
+### 7.5 Deletion and edits [CB-38]
+
+Decision J1 defaults (provisional; `src/deletion.rs`, `src/client/delete.rs`):
+
+| Operation | Mechanism | Who sees what |
+|---|---|---|
+| **Delete for me** (`delete_for_me`) | an owner-mode v5 tombstone (§7.1, kind `0x01`) in the reader's own mailbox, with the target's `messageId` and `timestamp` and an optional author DID; the message's attachment references are deleted | every device of the account hides the message (`ThreadHistory::deleted_for_me`); other members and the server see nothing |
+| **Unsend** (`unsend`) | the author's signed `redaction` replaces the item's `signedEncMessage` (now empty), keeping `messageId`/`timestamp`/`mekId`; `ThreadStore::redact_item`, mls-ds `redactMessage` | every reader gets `ThreadHistory::redacted`, with `by_author` true only if a chat key of the author signed `"catbird.labyrinth.redaction:did=" \|\| did \|\| ";message_id=" \|\| id \|\| ";thread_id=" \|\| hex(threadId)`; attachment fetches for it fail |
+| **Account deletion** (`purge_account`) | redact every authored item in every thread, retract the epochs from every extra publisher, then `purge_mailbox` (devices, epochs, members, bundles, owner archive, ORF states, attachment refs, `mailboxKeys`) | others keep their history with the user's messages shown as removed |
+| **Edit** | frame level: a new message referencing the old id in the chat frame schema | Labyrinth stores both; the client applies the edit. Erasing the old text is an unsend |
+
+Each sealed item is signed on its own (`sig || ct`), so redacting one leaves the rest of its batch verifiable. Server backups keep deleted data for their retention window (Messenger caveat 3, p.49).
 
 ## 8. Attachments (p.41–43)
 
-- Attachment bytes stay where Catbird chat already puts them: `mls-ds` blob storage, already encrypted per message.
-- Each mailbox gets a reference object per attachment, indexed by `orf_client_map(orfClientState, "attachment_key_scope", json([backupID, objectID]))`.
-- The object carries an access token: `orf_client_map(…, "attachment_token_salt_scope", …)`, MAC'd over the thread and message.
+- **[CB-32] Cipher and transport.** Attachment bytes stay where Catbird chat already puts them: mls-ds blob storage, encrypted by chat with **AES-256-GCM** under a per-blob key carried in the message frame. The paper's `encrypt_attachment` (AES-256-CBC + PKCS7, p.11) is not used: GCM is authenticated and is what chat already ships. mls-ds streams the bytes (`getAttachmentBlob`) instead of handing out CDN URLs, so there is no URL TTL to manage; if presigned URLs are added later they get short TTLs.
+- **[CB-33] Reference objects** (`src/attachment.rs`, `src/client/attach.rs`). Each mailbox holds one reference per attachment:
+  ```
+  input         = json(["<backupID>", "<objectID>"])      backupID = threadId, objectID = blobId
+  blindedIndex  = orf_client_map(orfClientState, "attachment_key_scope", input)
+  blindedSalt   = orf_client_map(orfClientState, "attachment_token_salt_scope", input)
+  index         = orf_server_map(s, "catbird.labyrinth.orf.attachment_index", blindedIndex)    (server)
+  tokenSalt     = orf_server_map(s, "catbird.labyrinth.orf.attachment_token", blindedSalt)     (server)
+  tokenMac      = HMAC-SHA256(key = tokenSalt, json(["<threadId>", "<messageId>"]))           (server)
+  ```
+  `json` is compact JSON with standard escaping (the paper's literal concatenation for plain ids). The server stores `index → {blobId, tokenMac}` with the owner and message only as keyed digests. On `fetch_attachment` the client presents the blinded values plus `threadId`/`messageId`; the server recomputes the MAC and checks the message still exists unredacted where the caller can read it. Only a device holding the account's ORF client state can name a reference, and the token can be computed or checked only while such a device is asking (p.42). ORF evolution preserves both values across restored devices; revocation deletes the device's ORF state.
+  - **One message per attachment object** (v1.1 content unlinkability): a second message for the same blob fails with `Conflict` (`AttachmentAlreadyReferenced`); a forwarded attachment is re-uploaded. The `messageId` of an attachment-bearing message is the chat message UUID, which mls-ds checks against the blob's binding.
+  - `attach_reference` must follow the message's archive flush (the server checks the message exists). Delete-for-me deletes the account's references; unsend revokes access for everyone.
 - ORF needs an active server, so the ORF **server** role always belongs to `mls-ds`, whichever backend holds the mailbox **[CB-17]**.
 
 ## 9. Storage backends
@@ -431,7 +476,9 @@ Every `epochNumber` is bounded at 2⁴⁰ (lexicon `maximum`, checked again when
 - `ThreadStore`: the conversation spaces. Writes go to the caller's repo; reads see every member's repo.
 - `MailboxDirectory`: other accounts' latest `epochPublic`, every published `epochPublic` by number (`epoch(did, seq)`, [CB-29]), their MLS chat device keys, each with an optional `removed_at` ([CB-27]), and, where the backend has one, their device leaves in a conversation with the chat seqs that added and removed each (`member_device_keys`).
 - `KeyPublisher`: another destination for a new epoch's public keys (the PDS `mailboxKeys` record, or the mls-ds head directory), so two independent directories stay current.
-- `OrfServer`: the ORF server role ([CB-17]): register a device's state (fresh, or evolved from a parent with an evolve token), map, and delete on revocation. The server computes every step.
+- `OrfServer`: the ORF server role ([CB-17]): register a device's state (fresh, or evolved from a parent with an evolve token), map, and delete on revocation, plus the attachment references (§8). The server computes every step.
+
+Methods added on 2026-10-05, each with a default so a backend can lag: `ThreadStore::{redact_item, get_messages, list_batches_before, list_threads}`, `MailboxStore::{get_owner_messages, list_owner_batches_before, list_owner_threads, touch_virtual_device, delete_virtual_device, purge_mailbox}`, `KeyPublisher::retract`, `OrfServer::{put_attachment_ref, fetch_attachment, delete_attachment_ref}`. The lookups default to scans of the existing listings (correct on every backend); the others default to `Error::NotSupported` until the mls-ds endpoints and their XRPC wrappers exist. The memory backend implements all of them, and `MemoryXrpcServer` serves the agreed shapes (`src/store/xrpc/server/pending.rs`).
 
 A record read back is a `Stored<T>` with an optional `ServerOrder {labyrinth_seq, chat_seq, received_at_ms}`: mls-ds stamps every MEK, batch and owner batch when it is written; a Space assigns none.
 
@@ -454,11 +501,12 @@ The traits are **synchronous** and return `Result`, so the crate needs no async 
 
 `client::Labyrinth` is one enrolled device. It holds the device secrets, the epoch-secret cache, its revoked-device set, its peer pins ([CB-29]) and its MEK cache.
 
-- **Persistence [CB-30]:** `export_state()` returns a versioned binary encoding of all of that (magic `LBYS`, version 1, big-endian, length-prefixed; layout in `src/client/state.rs`) in a buffer that zeroizes on drop; `from_state(bytes, did, transport, backends)` rebuilds the client after checking the DID, the transport key, the device secrets against their public record and the newest epoch against the store. **The bytes are secret**: the embedding app stores them only in the platform keychain or SQLCipher. Unflushed batches are not included; flush first.
+- **Persistence [CB-30]:** `export_state()` returns a versioned binary encoding of all of that (magic `LBYS`, version 2 (adds the [CB-25] verified-member set; version 1 still loads), big-endian, length-prefixed; layout in `src/client/state.rs`) in a buffer that zeroizes on drop; `from_state(bytes, did, transport, backends)` rebuilds the client after checking the DID, the transport key, the device secrets against their public record and the newest epoch against the store. **The bytes are secret**: the embedding app stores them only in the platform keychain or SQLCipher. Unflushed batches are not included; flush first.
 - **Lifecycle:** `initialize` (epoch 0, device, `mailboxKeys`), `sync_epochs` (forward-chain into epochs opened by sibling devices, then the [CB-28] integrity check, and report re-admitted revoked devices), `revoke_device` (add to the local revoked set, mark revoked, open the next epoch without any locally revoked device, publish `mailboxKeys`; retries on `Conflict`).
 - **Enrollment:** `create_recovery_code`, `create_passkey_recovery`, `restore_with_recovery_code` (typo correction, forward-chaining with the virtual device, integrity check, then enrollment in the newest epoch), `restore_with_passkey`, and one-time codes (`otc_offer`/`otc_respond` on the existing device, `otc_start`/`enroll_via_otc` on the new one).
 - **Backends:** `mailbox`, `threads`, `directory`, `orf`, `publishers` and `clock`. In production `directory` is a `client::CompositeDirectory` over the PDS `mailboxKeys` records and the mls-ds head chain: equal heads pass, a newer head passes only through a verified `prev_sig` chain from the older one, and anything else fails with `DirectoryFork`. Every new epoch goes to the mailbox and to each publisher. The client registers each new device's ORF state (genesis; recovery bundle and restore, evolved from the parent; a one-time code's temporary state under an id both devices derive from the CPace key) and deletes a revoked device's state before rotating.
 - **Sending:** `resolve_roster` and `archive_outgoing` check every recipient epoch against the DID's current chat devices ([CB-18]) and its pin ([CB-29]), reuse a cached MEK under the reuse rules or distribute a new one, and buffer the sealed message; `flush` writes batches.
+- **History management:** `delete_for_me`, `unsend`, `purge_account` (§7.5); `load_message`, `load_thread_page`, `list_threads` (§7.4); `attach_reference`, `fetch_attachment`, `delete_attachment_reference` (§8); `list_recovery_methods`, `touch_recovery_method`, `remove_recovery_method`, `remove_expired_recovery_methods` (§6.4); `audit_members` (§5.6); `own_fingerprint`, `safety_number_with` (§5.3); `publish_latest_keys` retries a publish that failed after its epoch was created.
 - **Reading:** a chat key vouches for a message or MEK only if it was valid when the record was written ([CB-27]): by the record's `ServerOrder` when it has one (received before the key's account-wide revocation, and, where the directory reports the conversation's leaves, while the device had a leaf at the stamp's `chat_seq`), else by the sender's timestamp. `load_thread` opens sender batches through any MEK addressed to any of the caller's epochs (backward-chaining as needed) plus owner batches, merges only provably identical copies (§7.4), and reports what it could not open (for example `NotRecipient` before a join or after a leave). `archive_owner` writes v1.0 owner messages; `rearchive_thread_before_leave` implements [CB-22].
 
 ## 10. Known limitations we keep from the paper (p.47)

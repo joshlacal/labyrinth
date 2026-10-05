@@ -173,3 +173,46 @@ impl NowForTest for TestClock {
         self.now_ms()
     }
 }
+
+#[test]
+fn version_1_client_state_still_loads() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let phone = init(&net, &clock, A, 1);
+    let v2 = phone.export_state().unwrap();
+    assert_eq!(v2[4], 2);
+    // Strip the v2 `verified` section (seq u64, count u32, keys) that
+    // follows the empty revoked list of this fresh client.
+    let epochs = 4 + (8 + 2 + 12 + 32);
+    let at = 4
+        + 1
+        + 2
+        + A.len()
+        + 32
+        + 32
+        + 32
+        + 33
+        + 32
+        + 32
+        + 32
+        + 64
+        + 33
+        + 65
+        + 1
+        + 32
+        + 8
+        + epochs
+        + 4;
+    let n = u32::from_be_bytes(v2[at + 8..at + 12].try_into().unwrap()) as usize;
+    assert_eq!(n, 1, "the genesis device verified itself");
+    let mut v1 = v2[..at].to_vec();
+    v1.extend_from_slice(&v2[at + 12 + 32 * n..]);
+    v1[4] = 1;
+    labyrinth::client::Labyrinth::from_state(
+        &v1,
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A),
+    )
+    .unwrap();
+}
