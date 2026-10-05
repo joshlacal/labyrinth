@@ -30,7 +30,8 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::{MAX_PAGE, NSID_PREFIX, XrpcError, XrpcTransport};
+pub(crate) use super::XrpcError;
+use super::{MAX_PAGE, NSID_PREFIX, XrpcTransport};
 use crate::Error;
 use crate::store::MailboxDirectory;
 use crate::store::memory::MemoryBackend;

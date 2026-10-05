@@ -1,7 +1,7 @@
 //! The reference server's handlers for the gap-closing endpoints
 //! (`src/store/xrpc/server/{retention,attachments,pending}.rs`) over a raw
 //! transport: the mls-ds request shapes and error names, plus the
-//! crate-proposed `listOwnerThreads`. `tests/e2e_xrpc.rs` drives the same
+//! `listOwnerThreads` lookup. `tests/e2e_xrpc.rs` drives the same
 //! endpoints through the XRPC stores with lexicon validation.
 
 #![cfg(feature = "xrpc")]
@@ -136,7 +136,7 @@ fn pending_endpoints_follow_the_agreed_shapes() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(threads, json!({"threads": []}));
+    assert_eq!(threads, json!({"items": []}));
     call(&*t, "purgeMailbox", json!({})).unwrap();
     assert_eq!(net.attachment_ref_count(A), 0);
 }

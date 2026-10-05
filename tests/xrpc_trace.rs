@@ -9,7 +9,9 @@
 //! The scenario covers the binding-era genesis order (`createDevice` with a
 //! `chatBinding` before `createEpoch`), sends, reads, recovery bundles
 //! (create, restore, touch, remove), unsend, the attachment refusals that
-//! need no seeded blob, server-side account deletion and `purgeMailbox`.
+//! need no seeded blob, the lookups (`getMessages`, `listThreads`,
+//! `listOwnerThreads`, newest-first `listBatches`), server-side account
+//! deletion and `purgeMailbox`.
 //! Every call is validated against the lexicons.
 //!
 //! The test always runs the scenario and checks it. To (re)write the
@@ -279,6 +281,19 @@ fn record_crate_xrpc_trace() {
     );
     alice.delete_attachment_reference(THREAD, blob).unwrap();
 
+    // Lookups: by message id, by thread, newest first.
+    assert_eq!(
+        alice
+            .load_message(THREAD, &msg_id(2))
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    assert!(!alice.list_threads().unwrap().is_empty());
+    let page = bob.load_thread_page(THREAD, None, 2).unwrap();
+    assert_eq!(page.history.messages.len(), 2);
+
     // Removing a recovery method rotates its device out and deletes it.
     alice.remove_recovery_method(&keychain.vdevice_id).unwrap();
 
@@ -310,6 +325,9 @@ fn record_crate_xrpc_trace() {
         "deleteAttachmentRef",
         "deleteAccountData",
         "purgeMailbox",
+        "getMessages",
+        "listThreads",
+        "listOwnerThreads",
     ] {
         assert!(seen.iter().any(|s| s == name), "{name} not in the trace");
     }

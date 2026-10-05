@@ -10,8 +10,8 @@
 //!
 //! | Trait | Implementation | Endpoints |
 //! |---|---|---|
-//! | [`crate::store::MailboxStore`] | [`XrpcMailboxStore`] | `createDevice` … `listOwnerBatches`, `publishEpochHead`, `touchVirtualDevice`, `deleteVirtualDevice`, `purgeMailbox`, `deleteAccountData` |
-//! | [`crate::store::ThreadStore`] | [`XrpcThreadStore`] | `createMek`, `findMeks`, `appendBatch`, `listBatches`, `redactMessage` |
+//! | [`crate::store::MailboxStore`] | [`XrpcMailboxStore`] | `createDevice` … `listOwnerBatches`, `listOwnerThreads`, `publishEpochHead`, `touchVirtualDevice`, `deleteVirtualDevice`, `purgeMailbox`, `deleteAccountData` |
+//! | [`crate::store::ThreadStore`] | [`XrpcThreadStore`] | `createMek`, `findMeks`, `appendBatch`, `listBatches`, `getMessages`, `listThreads`, `redactMessage` |
 //! | [`crate::store::MailboxDirectory`], [`crate::store::KeyPublisher`] | [`XrpcDirectory`] | `getEpochHead`, `getChatDeviceKeys`, `getMemberDevices`, `publishEpochHead`; `retract` is `purgeMailbox` |
 //! | [`crate::store::OrfServer`] | [`XrpcOrf`] | `registerOrfState`, `deleteOrfState`, `putAttachmentRef`, `getAttachmentRef`, `getAttachmentBlob`, `deleteAttachmentRef` |
 //!

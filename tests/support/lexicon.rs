@@ -85,17 +85,42 @@ impl Lexicons {
                 return Err(format!("params: missing required {k}"));
             }
         }
-        for (k, raw) in params {
+        let mut keys: Vec<&str> = params.iter().map(|(k, _)| *k).collect();
+        keys.dedup();
+        for k in keys {
             let pdef = def["properties"]
-                .get(*k)
+                .get(k)
                 .ok_or(format!("params: unknown parameter {k}"))?;
-            let v = if pdef["type"] == "integer" {
-                Value::from(
-                    raw.parse::<i64>()
-                        .map_err(|_| format!("params.{k}: not an integer"))?,
+            let raws: Vec<&str> = params
+                .iter()
+                .filter(|(n, _)| *n == k)
+                .map(|(_, v)| v.as_str())
+                .collect();
+            let scalar = |d: &Value, raw: &str| -> Result<Value, String> {
+                Ok(match d["type"].as_str() {
+                    Some("integer") => Value::from(
+                        raw.parse::<i64>()
+                            .map_err(|_| format!("params.{k}: not an integer"))?,
+                    ),
+                    Some("boolean") => match raw {
+                        "true" => Value::Bool(true),
+                        "false" => Value::Bool(false),
+                        _ => return Err(format!("params.{k}: not a boolean")),
+                    },
+                    _ => Value::from(raw),
+                })
+            };
+            // Arrays are repeated keys (`k=a&k=b`).
+            let v = if pdef["type"] == "array" {
+                Value::Array(
+                    raws.iter()
+                        .map(|r| scalar(&pdef["items"], r))
+                        .collect::<Result<_, _>>()?,
                 )
+            } else if let [raw] = raws.as_slice() {
+                scalar(pdef, raw)?
             } else {
-                Value::from(raw.as_str())
+                return Err(format!("params: {k} repeated"));
             };
             self.value(nsid, pdef, &v, &format!("params.{k}"))?;
         }

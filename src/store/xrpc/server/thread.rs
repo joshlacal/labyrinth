@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use super::mailbox::range;
 use super::{Caller, Input, MemoryXrpcServer, Reply, bad, body, err, hex_param, json, num, req};
 use crate::records::{
-    Batch, Bytes, EpochPublicDef, MekDistribution, MekSenderDef, datetime_from_ms,
+    Batch, Bytes, EpochPublicDef, MekDistribution, MekSenderDef, datetime_from_ms, ms_from_datetime,
 };
 use crate::store::xrpc::XrpcError;
 use crate::store::xrpc::wire::{
@@ -132,35 +132,11 @@ pub(super) fn handle(
         "listBatches" => (|| {
             let thread = req(input, "threadId")?;
             let sender = super::param(input, "sender");
-            let mut v = th
+            let v = th
                 .list_batches(thread, sender, range(input)?)
                 .map_err(err)?;
-            let mut readable: HashMap<Vec<u8>, bool> = HashMap::new();
-            let mut keep = Vec::new();
-            for b in v.drain(..) {
-                let Some(first) = b.value.items.first() else {
-                    continue;
-                };
-                let ok = b.author == c.did
-                    || match readable.get(&first.mek_id.0) {
-                        Some(ok) => *ok,
-                        None => {
-                            let id = first.mek_id.array::<12>("mekId").map_err(err)?;
-                            let ok = th
-                                .find_meks(thread, &id)
-                                .map_err(err)?
-                                .iter()
-                                .any(|m| can_read(m, &c.did));
-                            readable.insert(first.mek_id.0.clone(), ok);
-                            ok
-                        }
-                    };
-                if ok {
-                    keep.push(b);
-                }
-            }
-            keep.sort_by_key(|b| b.order.map(|o| o.labyrinth_seq));
-            s.page(keep.into_iter().map(authored).collect(), input)
+            let v = readable(&th, &c.did, thread, received(input, v)?)?;
+            s.page(seq_order(v, flag(input, "reverse")?), input)
         })(),
         "publishEpochHead" => (|| {
             let i: PublishHeadIn = body(input)?;
@@ -223,6 +199,78 @@ pub(super) fn handle(
         _ => return None,
     };
     Some(r)
+}
+
+/// Batches the caller may read: its own, or sealed under a MEK it wrote
+/// or received ([CB-16], [CB-22]); one MEK lookup per distinct MEK.
+pub(super) fn readable(
+    th: &impl ThreadStore,
+    did: &str,
+    thread: &str,
+    batches: Vec<Stored<Batch>>,
+) -> core::result::Result<Vec<Stored<Batch>>, XrpcError> {
+    let mut known: HashMap<Vec<u8>, bool> = HashMap::new();
+    let mut keep = Vec::new();
+    for b in batches {
+        let Some(first) = b.value.items.first() else {
+            continue;
+        };
+        let ok = b.author == did
+            || match known.get(&first.mek_id.0) {
+                Some(ok) => *ok,
+                None => {
+                    let id = first.mek_id.array::<12>("mekId").map_err(err)?;
+                    let ok = th
+                        .find_meks(thread, &id)
+                        .map_err(err)?
+                        .iter()
+                        .any(|m| can_read(m, did));
+                    known.insert(first.mek_id.0.clone(), ok);
+                    ok
+                }
+            };
+        if ok {
+            keep.push(b);
+        }
+    }
+    Ok(keep)
+}
+
+/// Keeps records the server received in `[since, until)`.
+pub(super) fn received<T>(
+    input: &Input<'_>,
+    v: Vec<Stored<T>>,
+) -> core::result::Result<Vec<Stored<T>>, XrpcError> {
+    let at = |k: &str| {
+        super::param(input, k)
+            .map(|d| ms_from_datetime(d).map_err(|_| bad(&format!("{k} is not a datetime"))))
+            .transpose()
+    };
+    let (since, until) = (at("since")?, at("until")?);
+    Ok(v.into_iter()
+        .filter(|b| {
+            let t = b.order.map_or(0, |o| o.received_at_ms);
+            since.is_none_or(|s| t >= s) && until.is_none_or(|u| t < u)
+        })
+        .collect())
+}
+
+/// Server seq order (descending with `reverse`), as authored views.
+pub(super) fn seq_order<T>(mut v: Vec<Stored<T>>, reverse: bool) -> Vec<AuthoredView<T>> {
+    v.sort_by_key(|b| b.order.map(|o| o.labyrinth_seq));
+    if reverse {
+        v.reverse();
+    }
+    v.into_iter().map(authored).collect()
+}
+
+/// A boolean query parameter (`true` / `false`, default false).
+pub(super) fn flag(input: &Input<'_>, k: &str) -> core::result::Result<bool, XrpcError> {
+    match super::param(input, k) {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(bad(&format!("{k} is not a boolean"))),
+    }
 }
 
 /// The `labyrinthHead` projection of `getConversationState` (design §1a):

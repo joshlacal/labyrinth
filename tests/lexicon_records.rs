@@ -52,9 +52,9 @@ fn check<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
 #[test]
 fn lexicons_are_well_formed() {
     let lex = lexicons();
-    // 9 record lexicons, `defs`, and 33 XRPC queries and procedures
+    // 9 record lexicons, `defs`, and 36 XRPC queries and procedures
     // (including the server-to-server `labyrinthRelay`).
-    assert_eq!(lex.docs().count(), 43);
+    assert_eq!(lex.docs().count(), 46);
     for (id, doc) in lex.docs() {
         let main = &doc["defs"]["main"];
         if let Some(t @ ("query" | "procedure")) = main["type"].as_str() {

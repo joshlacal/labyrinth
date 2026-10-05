@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::wire::{
     CreateEpochIn, CreateEpochOut, Empty, EpochView, MarkRevokedIn, OwnedView, PublishHeadIn,
-    RecordBody, RkeyOrderOut, RkeyOut, VdeviceIn,
+    RecordBody, RkeyOrderOut, RkeyOut, ThreadView, VdeviceIn,
 };
 use super::{Xrpc, XrpcTransport};
 use crate::records::{
@@ -174,6 +174,43 @@ impl MailboxStore for XrpcMailboxStore {
         };
         let _: Empty = self.x.post("publishEpochHead", &input)?;
         Ok(())
+    }
+
+    /// `listOwnerThreads`.
+    fn list_owner_threads(&self) -> Result<Vec<String>> {
+        let v: Vec<ThreadView> = self.x.list_all("listOwnerThreads", &[])?;
+        Ok(v.into_iter().map(|t| t.thread_id).collect())
+    }
+
+    /// `listOwnerBatches` newest first (`reverse=true`, `untilMs`), then
+    /// sorted by newest item: server seq is not sender time, so `limit`
+    /// cannot stop it early.
+    fn list_owner_batches_before(
+        &self,
+        thread_id: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Stored<OwnerBatch>>> {
+        let _ = limit;
+        let mut p = vec![
+            ("threadId", thread_id.to_owned()),
+            ("reverse", "true".to_owned()),
+        ];
+        if let Some(b) = before_ms {
+            p.push(("untilMs", b.to_string()));
+        }
+        let v: Vec<OwnedView<OwnerBatch>> = self.x.list_all("listOwnerBatches", &p)?;
+        let mut v = v
+            .into_iter()
+            .map(|v| {
+                Ok(Stored {
+                    order: Some(v.order.to_order()?),
+                    ..self.stored(v.rkey, v.record)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        v.sort_by_key(|b| core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max()));
+        Ok(v)
     }
 
     /// `touchVirtualDevice`.

@@ -179,8 +179,7 @@ Context: the gap-closure entry above left the new trait methods returning `NotSu
 Chose (provisional):
 - **Wrappers.** `XrpcThreadStore::redact_item` calls `redactMessage`. `XrpcMailboxStore` gains `touch_virtual_device`, `delete_virtual_device`, `purge_mailbox` and a new trait method `MailboxStore::delete_account_data` (`deleteAccountData`). `XrpcOrf` gains `put_attachment_ref`, `fetch_attachment` (raw-bytes `getAttachmentBlob`), `delete_attachment_ref`, plus an inherent `attachment_ref_created_at` (`getAttachmentRef`).
 - **Unsend is idempotent over XRPC.** mls-ds counts an unknown or already-redacted id as zero, so `redact_item` returns `Ok(0)` there. The memory store still says `NotFound`, and the trait documents both.
-- **Account purge over mls-ds is server-side.** mls-ds has no `listThreads`. `purge_account` therefore retracts the extra publishers and calls `deleteAccountData` when `list_threads` is `NotSupported`, and the report says `server_side`.
-  - Rejected: building `listThreads` into mls-ds just to drive a client-side loop that the server already does atomically across delivery services.
+- **Account purge over mls-ds is server-side** (`deleteAccountData`); see the `purge_account` amendment below for how the client chooses.
 - **`XrpcDirectory::retract` is `purgeMailbox`.** mls-ds drops a head chain only along with the mailbox.
 - **Error map additions.**
   - `AttachmentAlreadyReferenced` → `Conflict`.
@@ -191,6 +190,7 @@ Chose (provisional):
   - `RelayUnavailable`, `ConversationMoved` and `AttachmentsUnavailable` → `Backend`.
 - **Reference server parity.** `MemoryXrpcServer` serves every endpoint the stores call, including `getAttachmentRef` and `deleteAccountData`, with mls-ds's errors (`InvalidRedaction`, `VirtualDeviceNotFound`). It enforces the mls-ds binding rules (`server/binding.rs`): a chat binding by the caller on `createDevice`, a bound caller on epoch writes and revocation, and registered members.
   - The one known difference: re-putting the identical attachment reference succeeds here, where mls-ds answers `RecordAlreadyExists`.
-- `server/pending.rs` now holds only the crate-proposed `listThreads` and `listOwnerThreads`, which have no lexicon.
+- **Lookups (amendment, mls-ds lexicon change `lzsxqrnx`).** `getMessages`, `listThreads`, `listOwnerThreads`, and `reverse`/`since`/`until` on `listBatches`/`listOwnerBatches` are wrapped, overriding the scan-based defaults. Newest-first reads page by *server seq*, not sender timestamp, so `list_batches_before` / `list_owner_batches_before` read every page in the window and sort locally; they never stop early at `limit`. `server/pending.rs` (name historical) now serves the lookups.
+- **`purge_account` prefers the server.** It calls `MailboxStore::delete_account_data` first (mls-ds `deleteAccountData`, atomic across delivery services) and falls back to the client loop only on `NotSupported`. The memory mailbox does not offer it, so the memory path is unchanged.
 
 Reversible until: merge of `labyrinth-1.1`. Override by: edit `src/store/xrpc/*`. The behaviour is pinned by `tests/e2e_xrpc.rs` (every call is validated against the lexicons), `tests/xrpc_server.rs` and `tests/xrpc_pending.rs`.

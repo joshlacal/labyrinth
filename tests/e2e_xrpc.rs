@@ -600,3 +600,93 @@ fn account_purge_over_xrpc_is_server_side() {
 
     assert_seen(&w, &["deleteAccountData", "purgeMailbox"]);
 }
+
+#[test]
+fn lookups_over_xrpc() {
+    let mut w = World::new();
+    let mut alice = w.init(ALICE, 1);
+    let mut bob = w.init(BOB, 3);
+    let group = [ALICE, BOB];
+    // Sender timestamps out of server order: m3 is sent "earlier".
+    for id in ["m1", "m2"] {
+        w.send(&mut alice, &group, id);
+        alice.flush().unwrap();
+    }
+    w.ts -= 100;
+    w.send(&mut bob, &group, "m3");
+    bob.flush().unwrap();
+    w.ts += 200;
+    alice
+        .archive_owner("other-thread", "o1", 5, b"note")
+        .unwrap();
+    alice.flush().unwrap();
+
+    // getMessages.
+    let h = alice.load_message(THREAD, "m2").unwrap();
+    assert_eq!(got(&h), w.expected(&["m2"]));
+
+    // listThreads + listOwnerThreads.
+    let threads = alice.list_threads().unwrap();
+    let ids: Vec<&str> = threads.iter().map(|t| t.thread_id.as_str()).collect();
+    assert_eq!(ids, ["conv-e2e", "other-thread"]);
+    assert!(threads[0].sender_history && threads[1].owner_archive);
+
+    // Newest first by sender time, although the server pages by seq.
+    let page = alice.load_thread_page(THREAD, None, 2).unwrap();
+    let newest: Vec<&str> = page
+        .history
+        .messages
+        .iter()
+        .map(|m| m.message_id.as_str())
+        .collect();
+    assert_eq!(newest, ["m2", "m1"]);
+    let rest = alice
+        .load_thread_page(THREAD, page.next.as_ref(), 2)
+        .unwrap();
+    assert_eq!(rest.history.messages[0].message_id, "m3");
+
+    // The receivedAt window and reverse order, raw.
+    let t = w.transport(ALICE, 1);
+    // Every page, following the cursor (pages hold two items here).
+    let all = |p: &[(&str, String)]| -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut q = p.to_vec();
+            if let Some(c) = &cursor {
+                q.push(("cursor", c.clone()));
+            }
+            let v: Value =
+                serde_json::from_slice(&t.query("blue.catbird.labyrinth.listBatches", &q).unwrap())
+                    .unwrap();
+            out.extend(
+                v["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["order"]["seq"].as_u64().unwrap()),
+            );
+            match v["cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_owned()),
+                None => return out,
+            }
+        }
+    };
+    let th = || ("threadId", THREAD.to_owned());
+    let fwd = all(&[th()]);
+    let mut rev = all(&[th(), ("reverse", "true".into())]);
+    rev.reverse();
+    assert_eq!(fwd, rev);
+    let since = labyrinth::records::datetime_from_ms(1_000_000);
+    assert!(all(&[th(), ("since", since)]).is_empty());
+
+    assert_seen(
+        &w,
+        &[
+            "getMessages",
+            "listThreads",
+            "listOwnerThreads",
+            "listBatches",
+        ],
+    );
+}

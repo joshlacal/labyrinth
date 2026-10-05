@@ -226,9 +226,9 @@ pub struct AttachmentRefOut {
     pub created_at: String,
 }
 
-/// `listThreads` / `listOwnerThreads` output (crate proposal; mls-ds has
-/// neither endpoint).
+/// `listThreads` / `listOwnerThreads` item (`#threadView`).
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ThreadsOut {
-    pub threads: Vec<String>,
+#[serde(rename_all = "camelCase")]
+pub struct ThreadView {
+    pub thread_id: String,
 }

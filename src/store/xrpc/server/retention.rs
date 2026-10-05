@@ -73,13 +73,11 @@ pub(super) fn handle(
         "redactMessage" => redact(s, c, input),
         "purgeMailbox" | "deleteAccountData" => (|| {
             let _: Empty = body(input)?;
-            let mb = s.net.mailbox(&c.did);
             if name == "purgeMailbox" {
-                mb.purge_mailbox()
+                s.net.mailbox(&c.did).purge_mailbox().map_err(err)?;
             } else {
-                mb.delete_account_data()
+                s.net.delete_account_data(&c.did);
             }
-            .map_err(err)?;
             json(&Empty {})
         })(),
         "touchVirtualDevice" | "deleteVirtualDevice" => vdevice(s, c, name, input),

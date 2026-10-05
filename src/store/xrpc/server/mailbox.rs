@@ -177,12 +177,13 @@ pub(super) fn handle(
             let v = mb
                 .list_owner_batches(req(input, "threadId")?, range(input)?)
                 .map_err(err)?;
-            let v: Vec<_> = v
+            let v = super::thread::received(input, v)?;
+            let v: Vec<_> = super::thread::seq_order(v, super::thread::flag(input, "reverse")?)
                 .into_iter()
                 .map(|b| OwnedView {
-                    order: OrderDef::from_order(&b.order.unwrap_or_default()),
+                    order: b.order,
                     rkey: b.rkey,
-                    record: b.value,
+                    record: b.record,
                 })
                 .collect();
             s.page(v, input)

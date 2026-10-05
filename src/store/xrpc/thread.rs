@@ -1,11 +1,15 @@
 //! [`ThreadStore`] over the mls-ds thread endpoints (design §2, "Thread").
 //! `threadId` is the chat conversation id; the server stamps every MEK and
 //! batch with a [`crate::store::ServerOrder`].
+//!
+//! Newest-first reads (`reverse=true`) page by server seq, not by sender
+//! timestamp, so they cannot stop early at `limit` items: the stores read
+//! every page in the window and sort locally by newest item.
 
 use std::sync::Arc;
 
 use super::mailbox::range_params;
-use super::wire::{AuthoredView, RecordBody, RedactIn, RedactOut, RkeyOrderOut};
+use super::wire::{AuthoredView, RecordBody, RedactIn, RedactOut, RkeyOrderOut, ThreadView};
 use super::{Xrpc, XrpcTransport};
 use crate::Result;
 use crate::deletion::Redaction;
@@ -98,5 +102,50 @@ impl ThreadStore for XrpcThreadStore {
         };
         let out: RedactOut = self.x.post("redactMessage", &input)?;
         Ok(out.redacted)
+    }
+
+    /// `getMessages` (100 ids per call), deduplicated by batch.
+    fn get_messages(&self, thread_id: &str, message_ids: &[&str]) -> Result<Vec<Stored<Batch>>> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for chunk in message_ids.chunks(super::MAX_PAGE) {
+            let mut p = vec![("threadId", thread_id.to_owned())];
+            p.extend(chunk.iter().map(|id| ("messageIds", (*id).to_owned())));
+            let v: Vec<AuthoredView<Batch>> = self.x.list_all("getMessages", &p)?;
+            for b in v {
+                if seen.insert((b.author.clone(), b.rkey.clone())) {
+                    out.push(stored(b)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `listBatches` with `reverse=true` and `untilMs`, then sorted by
+    /// newest item (see the module docs; `limit` cannot stop it early).
+    fn list_batches_before(
+        &self,
+        thread_id: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Stored<Batch>>> {
+        let _ = limit;
+        let mut p = vec![
+            ("threadId", thread_id.to_owned()),
+            ("reverse", "true".to_owned()),
+        ];
+        if let Some(b) = before_ms {
+            p.push(("untilMs", b.to_string()));
+        }
+        let v: Vec<AuthoredView<Batch>> = self.x.list_all("listBatches", &p)?;
+        let mut v = v.into_iter().map(stored).collect::<Result<Vec<_>>>()?;
+        v.sort_by_key(|b| core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max()));
+        Ok(v)
+    }
+
+    /// `listThreads` (merged across sequencers by the home DS).
+    fn list_threads(&self) -> Result<Vec<String>> {
+        let v: Vec<ThreadView> = self.x.list_all("listThreads", &[])?;
+        Ok(v.into_iter().map(|t| t.thread_id).collect())
     }
 }

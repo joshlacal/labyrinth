@@ -22,9 +22,9 @@ pub struct PurgeReport {
     /// Extra key publishers that cannot retract yet
     /// ([`Error::NotSupported`]); their published epochs remain.
     pub publishers_not_retracted: usize,
-    /// The thread store cannot list threads (mls-ds), so the server did
-    /// the redaction and purge (`deleteAccountData`); `threads` and
-    /// `redacted` are then unknown and left at zero.
+    /// The server did the redaction and purge (mls-ds
+    /// `deleteAccountData`); `threads` and `redacted` are then unknown and
+    /// left at zero.
     pub server_side: bool,
 }
 
@@ -78,18 +78,29 @@ impl Labyrinth {
     /// attachment references, `mailboxKeys`). Rerunnable after a failure.
     /// Drop this client afterwards.
     ///
-    /// When the thread store cannot list threads (mls-ds has no
-    /// `listThreads`), the server does the redaction and purge instead:
-    /// publishers are retracted, then [`crate::store::MailboxStore::delete_account_data`]
-    /// (mls-ds `deleteAccountData`) runs, and the report says `server_side`.
+    /// When the mailbox offers a server-side account deletion
+    /// ([`crate::store::MailboxStore::delete_account_data`], mls-ds
+    /// `deleteAccountData`), that runs instead, after the publishers are
+    /// retracted: it redacts across delivery services atomically, which a
+    /// client loop cannot. The report then says `server_side`.
     pub fn purge_account(&mut self) -> Result<PurgeReport> {
         self.outbox.clear();
         self.owner_outbox.clear();
-        let threads = match self.b.threads.list_threads() {
-            Ok(t) => t,
-            Err(Error::NotSupported(_)) => return self.purge_account_server_side(),
+        let not_retracted = self.retract_publishers()?;
+        match self.b.mailbox.delete_account_data() {
+            Ok(()) => {
+                self.meks.clear();
+                self.pins.clear();
+                return Ok(PurgeReport {
+                    publishers_not_retracted: not_retracted,
+                    server_side: true,
+                    ..PurgeReport::default()
+                });
+            }
+            Err(Error::NotSupported(_)) => {}
             Err(e) => return Err(e),
-        };
+        }
+        let threads = self.b.threads.list_threads()?;
         let mut report = PurgeReport {
             threads: threads.len(),
             ..PurgeReport::default()
@@ -118,20 +129,8 @@ impl Labyrinth {
                 report.redacted += self.b.threads.redact_item(t, &id, &r)?;
             }
         }
-        report.publishers_not_retracted = self.retract_publishers()?;
+        report.publishers_not_retracted = not_retracted;
         self.b.mailbox.purge_mailbox()?;
-        self.meks.clear();
-        self.pins.clear();
-        Ok(report)
-    }
-
-    fn purge_account_server_side(&mut self) -> Result<PurgeReport> {
-        let report = PurgeReport {
-            publishers_not_retracted: self.retract_publishers()?,
-            server_side: true,
-            ..PurgeReport::default()
-        };
-        self.b.mailbox.delete_account_data()?;
         self.meks.clear();
         self.pins.clear();
         Ok(report)

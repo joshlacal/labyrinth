@@ -87,7 +87,6 @@ The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-an
 - **Deletion is cooperative.** An unsend asks the server to redact, and readers can tell an author's unsend from a server removal. Deleted data survives in server backups for their retention window.
 - **Not yet provided:**
   - the atproto Space store;
-  - `listThreads` / `listOwnerThreads` over XRPC (mls-ds has neither). Account purge over mls-ds therefore runs server-side through `deleteAccountData`; see DECISIONS "XRPC wiring of the gap-closure endpoints";
   - a UniFFI surface.
 
 ## References
