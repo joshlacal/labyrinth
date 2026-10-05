@@ -101,6 +101,11 @@ impl KeyPublisher for MemoryDsPublisher {
     fn publish(&self, record: &MailboxKeysRecord) -> Result<()> {
         self.backend.record_ds_head(&self.did, &record.to_public()?)
     }
+
+    fn retract(&self) -> Result<()> {
+        self.backend.lock().ds_heads.remove(&self.did);
+        Ok(())
+    }
 }
 
 /// Writes one DID's public `mailboxKeys` records.
@@ -121,5 +126,12 @@ impl MemoryPdsPublisher {
 impl KeyPublisher for MemoryPdsPublisher {
     fn publish(&self, record: &MailboxKeysRecord) -> Result<()> {
         self.backend.lock().publish_pds(&self.did, record)
+    }
+
+    fn retract(&self) -> Result<()> {
+        let mut s = self.backend.lock();
+        s.public_keys.remove(&self.did);
+        s.public_history.remove(&self.did);
+        Ok(())
     }
 }

@@ -3,7 +3,7 @@
 use super::MemoryBackend;
 use crate::orf::{EvolveToken, ObliviousId, orf_server_evolve, orf_server_init, orf_server_map};
 use crate::sign::XVerifyingKey;
-use crate::store::OrfServer;
+use crate::store::{AttachmentFetch, AttachmentPut, OrfServer};
 use crate::{Error, Result};
 
 /// [`OrfServer`] handle bound to one DID.
@@ -66,5 +66,31 @@ impl OrfServer for MemoryOrf {
     fn delete(&self, device_key: &XVerifyingKey) -> Result<()> {
         self.backend.lock().orf.remove(&self.key(device_key));
         Ok(())
+    }
+
+    fn put_attachment_ref(&self, device_key: &XVerifyingKey, put: &AttachmentPut) -> Result<()> {
+        self.backend
+            .lock()
+            .put_attachment(&self.did, &device_key.0, put)
+    }
+
+    fn fetch_attachment(
+        &self,
+        device_key: &XVerifyingKey,
+        fetch: &AttachmentFetch,
+    ) -> Result<Vec<u8>> {
+        self.backend
+            .lock()
+            .fetch_attachment(&self.did, &device_key.0, fetch)
+    }
+
+    fn delete_attachment_ref(
+        &self,
+        device_key: &XVerifyingKey,
+        blinded_index: &ObliviousId,
+    ) -> Result<()> {
+        self.backend
+            .lock()
+            .delete_attachment(&self.did, &device_key.0, blinded_index)
     }
 }

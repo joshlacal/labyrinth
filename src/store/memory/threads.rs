@@ -1,6 +1,7 @@
 //! [`ThreadStore`] over the in-memory conversation spaces.
 
 use super::{MemoryBackend, ThreadSpace, create};
+use crate::deletion::Redaction;
 use crate::records::{Batch, MekDistribution};
 use crate::store::{Stored, ThreadStore, TimeRange};
 use crate::{Error, Result};
@@ -120,5 +121,20 @@ impl ThreadStore for MemoryThreads {
                 })
                 .collect())
         })
+    }
+
+    fn list_threads(&self) -> Result<Vec<String>> {
+        Ok(self.backend.lock().threads_of(&self.did))
+    }
+
+    fn redact_item(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        redaction: &Redaction,
+    ) -> Result<usize> {
+        self.backend
+            .lock()
+            .redact(&self.did, thread_id, message_id, redaction)
     }
 }

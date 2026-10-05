@@ -42,7 +42,7 @@ pub use keys::{
     ChatDeviceKey, MemberDeviceKey, ServerOrder, VouchAt, keys_valid_at, keys_valid_for,
 };
 
-use crate::Result;
+use crate::deletion::Redaction;
 use crate::mailbox::EpochPublic;
 use crate::orf::{EvolveToken, ObliviousId};
 use crate::records::{
@@ -50,6 +50,7 @@ use crate::records::{
     VirtualDevice,
 };
 use crate::sign::XVerifyingKey;
+use crate::{Error, Result};
 
 /// A record as read back from a store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +135,78 @@ pub trait MailboxStore {
     /// the immutable per-epoch copy `mailboxKeys/<12-digit epochNumber>`
     /// that [`MailboxDirectory::epoch`] serves ([CB-29]).
     fn publish_mailbox_keys(&self, record: &MailboxKeysRecord) -> Result<()>;
+
+    /// Owner batches of `thread_id` holding any of `message_ids` (owner
+    /// copies and delete-for-me tombstones). The default scans
+    /// [`list_owner_batches`](Self::list_owner_batches); a backend with a
+    /// message index (mls-ds) overrides it.
+    fn get_owner_messages(
+        &self,
+        thread_id: &str,
+        message_ids: &[&str],
+    ) -> Result<Vec<Stored<OwnerBatch>>> {
+        Ok(self
+            .list_owner_batches(thread_id, TimeRange::ALL)?
+            .into_iter()
+            .filter(|b| {
+                b.value
+                    .items
+                    .iter()
+                    .any(|i| message_ids.contains(&i.message_id.as_str()))
+            })
+            .collect())
+    }
+
+    /// Newest-first paging over owner batches: batches of `thread_id`
+    /// holding an item older than `before_ms` (all, if `None`), by their
+    /// newest item, descending. A backend may stop once it has returned
+    /// `limit` such items **and** every unreturned batch is older than all
+    /// of them (see [`ThreadStore::list_batches_before`]); the default
+    /// returns them all.
+    fn list_owner_batches_before(
+        &self,
+        thread_id: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Stored<OwnerBatch>>> {
+        let _ = limit;
+        let range = TimeRange {
+            from_ms: None,
+            until_ms: before_ms,
+        };
+        let mut v = self.list_owner_batches(thread_id, range)?;
+        v.sort_by_key(|b| core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max()));
+        Ok(v)
+    }
+
+    /// Every thread with an owner batch in this mailbox (re-archived or
+    /// delete-for-me history). mls-ds `listOwnerThreads` (not built).
+    fn list_owner_threads(&self) -> Result<Vec<String>> {
+        Err(Error::NotSupported("listOwnerThreads"))
+    }
+
+    /// Refresh a virtual device's `lastUsedAt` ([CB-39]); the server
+    /// stamps its own clock. mls-ds `touchVirtualDevice`.
+    fn touch_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
+        let _ = vdevice_id;
+        Err(Error::NotSupported("touchVirtualDevice"))
+    }
+
+    /// Delete a recovery bundle ([CB-39]) and its ORF state. The caller has
+    /// already rotated its virtual device out and marked it revoked.
+    /// mls-ds `deleteVirtualDevice`.
+    fn delete_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
+        let _ = vdevice_id;
+        Err(Error::NotSupported("deleteVirtualDevice"))
+    }
+
+    /// Erase this mailbox ([CB-38], account deletion): devices, epochs,
+    /// members, virtual devices, owner batches, ORF states, attachment
+    /// references and the published `mailboxKeys` / head chain.
+    /// mls-ds `purgeMailbox`.
+    fn purge_mailbox(&self) -> Result<()> {
+        Err(Error::NotSupported("purgeMailbox"))
+    }
 }
 
 /// The conversation spaces the caller belongs to. Writes go to the
@@ -158,6 +231,67 @@ pub trait ThreadStore {
         sender: Option<&str>,
         range: TimeRange,
     ) -> Result<Vec<Stored<Batch>>>;
+
+    /// Batches of `thread_id` holding any of `message_ids`. The default
+    /// scans [`list_batches`](Self::list_batches); mls-ds `getMessages`
+    /// (an item index) would override it.
+    fn get_messages(&self, thread_id: &str, message_ids: &[&str]) -> Result<Vec<Stored<Batch>>> {
+        Ok(self
+            .list_batches(thread_id, None, TimeRange::ALL)?
+            .into_iter()
+            .filter(|b| {
+                b.value
+                    .items
+                    .iter()
+                    .any(|i| message_ids.contains(&i.message_id.as_str()))
+            })
+            .collect())
+    }
+
+    /// Newest-first paging: batches of `thread_id` holding an item older
+    /// than `before_ms` (all, if `None`), ordered by their newest item,
+    /// descending.
+    ///
+    /// A backend may stop early, but only once the returned batches hold
+    /// at least `limit` items older than `before_ms` and every unreturned
+    /// batch's newest item is older than the `limit`-th newest of those,
+    /// so the client's page is exact. The default returns every such batch.
+    fn list_batches_before(
+        &self,
+        thread_id: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Stored<Batch>>> {
+        let _ = limit;
+        let range = TimeRange {
+            from_ms: None,
+            until_ms: before_ms,
+        };
+        let mut v = self.list_batches(thread_id, None, range)?;
+        v.sort_by_key(|b| core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max()));
+        Ok(v)
+    }
+
+    /// Every thread in which this DID wrote a MEK or is a MEK recipient,
+    /// including conversations it has left (mls-ds keeps leavers' history
+    /// readable, [CB-22]). mls-ds `listThreads` (not built).
+    fn list_threads(&self) -> Result<Vec<String>> {
+        Err(Error::NotSupported("listThreads"))
+    }
+
+    /// Unsend ([CB-38]): replace every item of this handle's DID with
+    /// `message_id` in `thread_id` by `redaction`, keeping its id and
+    /// timestamp. Returns how many items were redacted;
+    /// [`Error::NotFound`] if none. mls-ds `redactMessage`.
+    fn redact_item(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        redaction: &Redaction,
+    ) -> Result<usize> {
+        let _ = (thread_id, message_id, redaction);
+        Err(Error::NotSupported("redactMessage"))
+    }
 }
 
 /// Read-only discovery of other accounts (public `mailboxKeys` records and
@@ -205,6 +339,32 @@ pub trait KeyPublisher {
     /// identical bytes succeeds; a different epoch under a published
     /// number fails with [`crate::Error::Conflict`].
     fn publish(&self, record: &MailboxKeysRecord) -> Result<()>;
+
+    /// Remove every published epoch (account deletion, [CB-38]).
+    fn retract(&self) -> Result<()> {
+        Err(Error::NotSupported("retract mailboxKeys"))
+    }
+}
+
+/// `putAttachmentRef` input ([CB-33]). The two blinded values are
+/// `orf_client_map` outputs over `json([threadId, blobId])` under the
+/// paper's index and token-salt scopes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentPut {
+    pub blinded_index: ObliviousId,
+    pub blinded_token_salt: ObliviousId,
+    pub blob_id: String,
+    pub thread_id: String,
+    pub message_id: String,
+}
+
+/// `getAttachmentBlob` input ([CB-33]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentFetch {
+    pub blinded_index: ObliviousId,
+    pub blinded_token_salt: ObliviousId,
+    pub thread_id: String,
+    pub message_id: String,
 }
 
 /// The ORF server role ([CB-17], SPEC §3.6, §8): one server state per
@@ -227,4 +387,39 @@ pub trait OrfServer {
     fn map(&self, device_key: &XVerifyingKey, domain: &[u8], id: &ObliviousId) -> Result<[u8; 32]>;
     /// Deletes `device_key`'s state (revocation, SPEC §5.6). Idempotent.
     fn delete(&self, device_key: &XVerifyingKey) -> Result<()>;
+
+    /// Store an attachment reference ([CB-33], SPEC §8) under
+    /// `idx = orf_server_map(state, INDEX, blinded_index)` with
+    /// `tokenMac = HMAC(orf_server_map(state, TOKEN, blinded_token_salt),
+    /// json([threadId, messageId]))`. The server checks the caller may
+    /// read the blob in that message, and refuses a second message for
+    /// the same blob (`Conflict`). mls-ds `putAttachmentRef` (new shape).
+    fn put_attachment_ref(&self, device_key: &XVerifyingKey, put: &AttachmentPut) -> Result<()> {
+        let _ = (device_key, put);
+        Err(Error::NotSupported("putAttachmentRef"))
+    }
+
+    /// The blob bytes behind a reference, after the server recomputes the
+    /// token MAC from the presented thread and message, and checks the
+    /// message still exists unredacted where the caller can read it.
+    /// mls-ds `getAttachmentBlob` (new shape).
+    fn fetch_attachment(
+        &self,
+        device_key: &XVerifyingKey,
+        fetch: &AttachmentFetch,
+    ) -> Result<Vec<u8>> {
+        let _ = (device_key, fetch);
+        Err(Error::NotSupported("getAttachmentBlob"))
+    }
+
+    /// Delete one reference (delete-for-me of its message). Idempotent.
+    /// mls-ds `deleteAttachmentRef`.
+    fn delete_attachment_ref(
+        &self,
+        device_key: &XVerifyingKey,
+        blinded_index: &ObliviousId,
+    ) -> Result<()> {
+        let _ = (device_key, blinded_index);
+        Err(Error::NotSupported("deleteAttachmentRef"))
+    }
 }

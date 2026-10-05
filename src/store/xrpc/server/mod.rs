@@ -15,6 +15,7 @@
 //! It does not model service auth, federation, quotas or retention.
 
 mod mailbox;
+mod pending;
 mod thread;
 
 use std::collections::HashMap;
@@ -105,6 +106,7 @@ impl MemoryXrpcServer {
             .ok_or_else(|| XrpcError::named(501, "MethodNotImplemented", nsid))?;
         mailbox::handle(self, c, name, &input)
             .or_else(|| thread::handle(self, c, name, &input))
+            .or_else(|| pending::handle(self, c, name, &input))
             .unwrap_or_else(|| Err(XrpcError::named(501, "MethodNotImplemented", nsid)))
     }
 }

@@ -27,8 +27,10 @@ use crate::records::{Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, 
 use crate::sign::XVerifyingKey;
 use crate::{Error, Result};
 
+mod attachments;
 mod directory;
 mod heads;
+mod lifecycle;
 mod orf;
 mod threads;
 
@@ -89,6 +91,8 @@ struct State {
     ds_heads: HashMap<String, BTreeMap<u64, crate::mailbox::EpochPublic>>,
     /// ORF server states by (owner DID, device key).
     orf: HashMap<(String, [u8; 32]), crate::orf::OrfServerState>,
+    /// Attachment references and chat blobs ([CB-33]).
+    attach: attachments::AttachState,
 }
 
 impl State {
@@ -482,6 +486,23 @@ impl MailboxStore for MemoryMailbox {
 
     fn publish_mailbox_keys(&self, record: &MailboxKeysRecord) -> Result<()> {
         self.backend.lock().publish_pds(&self.did, record)
+    }
+
+    fn list_owner_threads(&self) -> Result<Vec<String>> {
+        Ok(self.backend.lock().owner_threads(&self.did))
+    }
+
+    fn touch_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
+        self.backend.lock().touch_vdevice(&self.did, vdevice_id)
+    }
+
+    fn delete_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
+        self.backend.lock().delete_vdevice(&self.did, vdevice_id)
+    }
+
+    fn purge_mailbox(&self) -> Result<()> {
+        self.backend.lock().purge(&self.did);
+        Ok(())
     }
 }
 
