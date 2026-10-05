@@ -42,7 +42,7 @@ pub mod state;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub use composite::CompositeDirectory;
-pub use delete::PurgeReport;
+pub use delete::{PurgeReport, delete_account_remote};
 pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
 pub use epochs::{RotationReport, SyncReport};
 pub use lookup::{ThreadCursor, ThreadPage, ThreadSummary};
