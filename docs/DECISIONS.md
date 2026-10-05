@@ -194,3 +194,27 @@ Chose (provisional):
 - **`purge_account` prefers the server.** It calls `MailboxStore::delete_account_data` first (mls-ds `deleteAccountData`, atomic across delivery services) and falls back to the client loop only on `NotSupported`. The memory mailbox does not offer it, so the memory path is unchanged.
 
 Reversible until: merge of `labyrinth-1.1`. Override by: edit `src/store/xrpc/*`. The behaviour is pinned by `tests/e2e_xrpc.rs` (every call is validated against the lexicons), `tests/xrpc_server.rs` and `tests/xrpc_pending.rs`.
+
+## 2026-10-05 · labyrinth · Second security review, client half
+Context: the second Labyrinth security review found that one bad roster member aborted every archive flush, that a peer who legitimately reset its mailbox stayed `EpochRollback` forever, that reads were authorized by the service-auth token alone, that a failed remote account deletion left the user unable to delete, and that any unsigned server redaction was labelled "account deleted". The mls-ds lane (`mlsds-review2-fixes`) implements the server half; the wire shapes below were agreed with it and its tests pin the same golden vector.
+
+Chose (provisional):
+- **Per-member roster exclusion.** `resolve_roster_report` excludes, and reports (`RosterExclusion`), a member whose epoch fails a trust check (`EpochRollback`, `Unattested`, `DirectoryFork`, records that don't verify). Transient errors (`Backend`, `Rng`) still fail the roster, so a network blip never drops a member. The strict `resolve_roster` is unchanged.
+  - Rejected: excluding on transient errors (silent, permanent loss of the member's access to those messages).
+- **User-confirmed re-pin ([CB-29]).** `propose_repin(did)` verifies the peer's chain from epoch 0, which must be attested by a *current* chat device of the DID, and shows the old and new safety numbers. `repin_peer(did, head)` replaces the pin only with the head the user saw (`Conflict` otherwise).
+  - A genesis attested by a since-removed chat device cannot be re-pinned, even if the latest epoch is attested by a current one. That is the review's literal rule. It means a peer who reset and then changed devices needs a fresh reset.
+- **Device-signed reads.** `read_auth`: `catbird-labyrinth-read` = base64url-nopad canonical JSON `{"v":1,"nsid","query","did","deviceId","issuedAt"}`. `query` covers every wire parameter (including `actorDeviceId`), sorted by decoded (key, value) bytes and RFC 3986-encoded. `catbird-labyrinth-read-signature` = Ed25519 by the chat device key over `CATBIRD-LABYRINTH-READ\0` || claim. The window is ±300 s.
+  - `XrpcTransport::query_with_headers` is now the required method, so wrappers must forward headers. `SignedReadTransport` signs.
+  - `MemoryXrpcServer` verifies the headers, and with `require_signed_reads` it refuses unsigned queries. The errors match mls-ds: 401 `InvalidSignature` or 400 `InvalidRequest`.
+  - Golden vector: `tests/vectors/labyrinth_read_header.json`, also pinned in mls-ds.
+- **Account deletion never strands the user.** `purge_account` returns `Ok` with `remote_pending` when the remote half fails, and still clears local caches. `delete_account_remote` retries without client state.
+- **Redaction labels ([CB-38]).** `defs#redaction` gains optional `by` and `reason`. `"accountDeleted"` means the sequencer DS signed the redaction over `catbird.labyrinth.ds_redaction:by=…;did=…;message_id=…;reason=accountDeleted;redacted_at=…;thread_id=<hex>`. `account_deleted` is set only when that signature verifies under `MailboxDirectory::sequencer_key` with `by` equal to the reported DS DID. Anything else that isn't a verified unsend is `removed_by_server`.
+  - `XrpcDirectory` has no source for the DS key yet, so returns `None`. Over mls-ds alone, account deletions therefore read as "removed by server" (fail closed) until a key source exists: a DID-document key or an endpoint. **Open item for the mls-ds lane.**
+- **`listThreads` `incomplete`.** `ThreadStore::list_threads_report` and `Labyrinth::list_threads_report` return the partial list plus the unreachable sequencer DIDs. The strict `list_threads` now fails (`Backend`) instead of hiding the gap.
+- **Also added:** `flush_thread` and `discard_pending`, for per-conversation archiving. The reference server now answers `ConversationNotFound` for a conversation with no leaves.
+
+Reversible until: merge of `labyrinth-1.1`. Override by:
+- Roster exclusion and re-pin: edit `src/client/send.rs` and `src/client/pins.rs` (`tests/roster_and_repin.rs`).
+- Signed reads: edit `src/store/xrpc/read_auth.rs` (`tests/signed_reads.rs`).
+- Account deletion: edit `src/client/delete.rs` (`tests/purge_retry.rs`).
+- Redaction labels: edit `src/deletion.rs` and `src/client/read.rs` (`tests/history_ops.rs`, `tests/lexicon_records.rs`).
