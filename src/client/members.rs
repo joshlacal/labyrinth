@@ -176,3 +176,45 @@ impl Labyrinth {
         Ok(audit.excluded)
     }
 }
+
+impl Labyrinth {
+    /// [CB-36] This account's unrevoked physical Labyrinth devices whose
+    /// verified chat binding names `chat_key`: the Labyrinth device(s) a
+    /// chat device enrolled. A binding that does not verify is ignored.
+    pub fn devices_bound_to(&self, chat_key: &[u8; 32]) -> Result<Vec<XVerifyingKey>> {
+        let mut out = Vec::new();
+        for d in self.b.mailbox.list_devices()? {
+            if d.r#virtual || d.revoked_at.is_some() {
+                continue;
+            }
+            let Ok(public) = d.to_public() else { continue };
+            let bound = d
+                .chat_binding()
+                .ok()
+                .flatten()
+                .filter(|b| b.transport_public_key == *chat_key)
+                .is_some_and(|b| b.verify(&self.did, &public.device_key_pub).is_ok());
+            if bound {
+                out.push(public.device_key_pub);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Revoke the Labyrinth device(s) chat device `chat_key` enrolled,
+    /// after the chat device itself was revoked (mls-ds requires that
+    /// order). One rotation per device; this device is never revoked by
+    /// its own call. Returns the rotations (empty if none was bound).
+    pub fn revoke_chat_device(
+        &mut self,
+        chat_key: &[u8; 32],
+    ) -> Result<Vec<super::RotationReport>> {
+        let me = self.device.public().device_key_pub;
+        let targets: Vec<XVerifyingKey> = self
+            .devices_bound_to(chat_key)?
+            .into_iter()
+            .filter(|k| *k != me)
+            .collect();
+        targets.iter().map(|k| self.revoke_device(k)).collect()
+    }
+}

@@ -36,6 +36,8 @@
 pub mod keys;
 pub mod memory;
 #[cfg(feature = "xrpc")]
+pub mod pds;
+#[cfg(feature = "xrpc")]
 pub mod xrpc;
 
 pub use keys::{

@@ -216,3 +216,22 @@ fn version_1_client_state_still_loads() {
     )
     .unwrap();
 }
+
+#[test]
+fn revoking_a_chat_device_revokes_the_labyrinth_device_it_bound() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut phone = init(&net, &clock, A, 1);
+    let laptop = sibling(&net, &clock, &mut phone, 2);
+    let laptop_key = laptop.device_public().device_key_pub;
+    assert_eq!(phone.devices_bound_to(&tpub(2)).unwrap(), vec![laptop_key]);
+    assert!(phone.devices_bound_to(&tpub(9)).unwrap().is_empty());
+    // The chat device goes first, then its Labyrinth device.
+    net.remove_chat_device(A, tpub(2), 1);
+    let reports = phone.revoke_chat_device(&tpub(2)).unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].revoked, laptop_key);
+    assert!(phone.devices_bound_to(&tpub(2)).unwrap().is_empty());
+    // Never itself.
+    assert!(phone.revoke_chat_device(&tpub(1)).unwrap().is_empty());
+}
