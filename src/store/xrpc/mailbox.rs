@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::wire::{
     CreateEpochIn, CreateEpochOut, Empty, EpochView, MarkRevokedIn, OwnedView, PublishHeadIn,
-    RecordBody, RkeyOrderOut, RkeyOut,
+    RecordBody, RkeyOrderOut, RkeyOut, VdeviceIn,
 };
 use super::{Xrpc, XrpcTransport};
 use crate::records::{
@@ -173,6 +173,38 @@ impl MailboxStore for XrpcMailboxStore {
             epoch: record.current.clone(),
         };
         let _: Empty = self.x.post("publishEpochHead", &input)?;
+        Ok(())
+    }
+
+    /// `touchVirtualDevice`.
+    fn touch_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
+        let input = VdeviceIn {
+            vdevice_id: Bytes::from_slice(vdevice_id),
+        };
+        let _: Empty = self.x.post("touchVirtualDevice", &input)?;
+        Ok(())
+    }
+
+    /// `deleteVirtualDevice`.
+    fn delete_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
+        let input = VdeviceIn {
+            vdevice_id: Bytes::from_slice(vdevice_id),
+        };
+        let _: Empty = self.x.post("deleteVirtualDevice", &input)?;
+        Ok(())
+    }
+
+    /// `purgeMailbox`: the mailbox, every ORF state and attachment
+    /// reference, and the head chain. Thread records stay.
+    fn purge_mailbox(&self) -> Result<()> {
+        let _: Empty = self.x.post("purgeMailbox", &Empty {})?;
+        Ok(())
+    }
+
+    /// `deleteAccountData`: `purgeMailbox` plus an unsigned redaction of
+    /// every thread item the DID authored, across delivery services.
+    fn delete_account_data(&self) -> Result<()> {
+        let _: Empty = self.x.post("deleteAccountData", &Empty {})?;
         Ok(())
     }
 }

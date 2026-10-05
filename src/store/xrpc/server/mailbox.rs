@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::binding::{require_bound, require_registered, verify_chat_binding};
 use super::{Caller, Input, MemoryXrpcServer, Reply, bad, body, err, hex_param, json, num, req};
 use crate::orf::EvolveToken;
 use crate::records::{Device, Epoch, EpochMember, OwnerBatch, VirtualDevice};
@@ -53,6 +54,7 @@ pub(super) fn handle(
     let r = match name {
         "createDevice" => (|| {
             let d: RecordBody<Device> = body(input)?;
+            verify_chat_binding(c, &d.record)?;
             mb.create_device(&d.record).map_err(err)?;
             json(&RkeyOut {
                 rkey: hex::encode(&d.record.device_key_pubkey.0),
@@ -61,6 +63,7 @@ pub(super) fn handle(
         "markDeviceRevoked" => (|| {
             let i: MarkRevokedIn = body(input)?;
             let k = key(&i.device_key_pubkey)?;
+            require_bound(s, c, None)?;
             mb.set_device_revoked(&k, &i.revoked_at).map_err(err)?;
             orf.delete(&k).map_err(err)?;
             json(&Empty {})
@@ -81,6 +84,13 @@ pub(super) fn handle(
             if i.members.len() > 256 {
                 return Err(bad("too many members"));
             }
+            require_bound(s, c, Some(&i.epoch.opened_by.0))?;
+            let keys: Vec<&[u8]> = i
+                .members
+                .iter()
+                .map(|m| m.device_key_pubkey.0.as_slice())
+                .collect();
+            require_registered(s, c, &keys)?;
             let public = i.epoch.public.to_public().map_err(err)?;
             s.net.record_ds_head(&c.did, &public).map_err(err)?;
             let id = mb.create_epoch(&i.epoch, &i.members).map_err(err)?;
@@ -111,6 +121,8 @@ pub(super) fn handle(
         })(),
         "createEpochMember" => (|| {
             let m: RecordBody<EpochMember> = body(input)?;
+            require_bound(s, c, None)?;
+            require_registered(s, c, &[&m.record.device_key_pubkey.0])?;
             mb.create_epoch_member(&m.record).map_err(err)?;
             json(&Empty {})
         })(),
@@ -122,6 +134,8 @@ pub(super) fn handle(
             let i: CreateVirtualDeviceIn = body(input)?;
             mb.create_virtual_device(&i.record).map_err(err)?;
             if let Some(m) = &i.member {
+                require_bound(s, c, None)?;
+                require_registered(s, c, &[&m.device_key_pubkey.0])?;
                 mb.create_epoch_member(m).map_err(err)?;
             }
             if let Some(p) = &i.orf {

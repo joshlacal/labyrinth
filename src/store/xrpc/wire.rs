@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
-use crate::records::{Bytes, EpochPublicDef, datetime_from_ms, ms_from_datetime};
+use crate::records::{Bytes, EpochPublicDef, RedactionDef, datetime_from_ms, ms_from_datetime};
 use crate::store::ServerOrder;
 
 /// `defs#serverOrder`.
@@ -174,4 +174,61 @@ pub struct RegisterOrfIn {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceKeyIn {
     pub device_key_pubkey: Bytes,
+}
+
+/// `redactMessage` input. `redaction` carries the author's
+/// `transportPubkey` and `sig`; the server sets `redactedAt`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RedactIn {
+    pub thread_id: String,
+    pub message_id: String,
+    pub redaction: RedactionDef,
+}
+
+/// `redactMessage` output.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RedactOut {
+    pub redacted: usize,
+}
+
+/// `touchVirtualDevice` / `deleteVirtualDevice` input.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VdeviceIn {
+    pub vdevice_id: Bytes,
+}
+
+/// `putAttachmentRef` input.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PutRefIn {
+    pub device_key_pubkey: Bytes,
+    pub blinded_index: Bytes,
+    pub blinded_token_salt: Bytes,
+    pub blob_id: String,
+    pub thread_id: String,
+    pub message_id: String,
+}
+
+/// `deleteAttachmentRef` input.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeleteRefIn {
+    pub device_key_pubkey: Bytes,
+    pub blinded_index: Bytes,
+}
+
+/// `getAttachmentRef` output.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentRefOut {
+    pub created_at: String,
+}
+
+/// `listThreads` / `listOwnerThreads` output (crate proposal; mls-ds has
+/// neither endpoint).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ThreadsOut {
+    pub threads: Vec<String>,
 }

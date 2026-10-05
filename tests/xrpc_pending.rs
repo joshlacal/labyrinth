@@ -1,7 +1,8 @@
 //! The reference server's handlers for the gap-closing endpoints
-//! (`src/store/xrpc/server/pending.rs`): the agreed request shapes and
-//! errors, exercised over a raw transport because the XRPC stores do not
-//! call them until the mls-ds lexicons land.
+//! (`src/store/xrpc/server/{retention,attachments,pending}.rs`) over a raw
+//! transport: the mls-ds request shapes and error names, plus the
+//! crate-proposed `listOwnerThreads`. `tests/e2e_xrpc.rs` drives the same
+//! endpoints through the XRPC stores with lexicon validation.
 
 #![cfg(feature = "xrpc")]
 
@@ -105,9 +106,12 @@ fn pending_endpoints_follow_the_agreed_shapes() {
                    "redaction": {"transportPubkey": b(&r.transport_public_key), "sig": b(&r.sig)}}),
         )
     };
-    assert_eq!(err_name(redact(&other)), "InvalidRequest");
+    assert_eq!(err_name(redact(&other)), "InvalidRedaction");
     let out: Value = serde_json::from_slice(&redact(&r).unwrap()).unwrap();
     assert_eq!(out, json!({"redacted": 1}));
+    // Idempotent, as in mls-ds: nothing left counts zero.
+    let again: Value = serde_json::from_slice(&redact(&r).unwrap()).unwrap();
+    assert_eq!(again, json!({"redacted": 0}));
     // The message is gone, so the attachment is too.
     assert_eq!(err_name(get("m1")), "NotFound");
     call(

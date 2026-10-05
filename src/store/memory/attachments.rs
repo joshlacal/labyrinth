@@ -25,6 +25,7 @@ pub(super) struct AttachState {
 struct Ref {
     blob_id: String,
     token_mac: [u8; 32],
+    created_at_ms: u64,
 }
 
 fn message_digest(thread_id: &str, message_id: &str) -> [u8; 32] {
@@ -98,6 +99,7 @@ impl State {
             Ref {
                 blob_id: p.blob_id.clone(),
                 token_mac: mac,
+                created_at_ms: self.server_now,
             },
         );
         Ok(())
@@ -146,6 +148,23 @@ impl State {
         Ok(())
     }
 
+    /// mls-ds `getAttachmentRef`: when the reference at this blinded index
+    /// was created, or `NotFound("attachment")`.
+    pub(super) fn attachment_created_at(
+        &self,
+        did: &str,
+        device: &[u8; 32],
+        blinded: &crate::orf::ObliviousId,
+    ) -> Result<u64> {
+        let s = self.orf_state(did, device)?;
+        let index = orf_server_map(s, INDEX_DOMAIN, blinded)?;
+        self.attach
+            .refs
+            .get(&(did.to_owned(), index))
+            .map(|r| r.created_at_ms)
+            .ok_or(Error::NotFound("attachment"))
+    }
+
     /// Drops every reference of `did` (mailbox purge).
     pub(super) fn purge_attachments(&mut self, did: &str) {
         self.attach.refs.retain(|(owner, _), _| owner != did);
@@ -159,6 +178,17 @@ impl MemoryBackend {
             .attach
             .blobs
             .insert(blob_id.to_owned(), bytes.to_vec());
+    }
+
+    /// When `did`'s reference at `blinded` (mapped by `device`'s ORF state)
+    /// was created, in server-time ms (mls-ds `getAttachmentRef`).
+    pub fn attachment_ref_created_at(
+        &self,
+        did: &str,
+        device: &[u8; 32],
+        blinded: &crate::orf::ObliviousId,
+    ) -> Result<u64> {
+        self.lock().attachment_created_at(did, device, blinded)
     }
 
     /// How many attachment references `did` holds (for tests).

@@ -207,6 +207,15 @@ pub trait MailboxStore {
     fn purge_mailbox(&self) -> Result<()> {
         Err(Error::NotSupported("purgeMailbox"))
     }
+
+    /// Server-side account deletion ([CB-38]): [`purge_mailbox`](Self::purge_mailbox)
+    /// plus an unsigned (account-deletion) redaction of every thread item
+    /// the owner authored, wherever its conversation is sequenced. Used by
+    /// [`crate::client::Labyrinth::purge_account`] when the thread store
+    /// cannot list threads. mls-ds `deleteAccountData`.
+    fn delete_account_data(&self) -> Result<()> {
+        Err(Error::NotSupported("deleteAccountData"))
+    }
 }
 
 /// The conversation spaces the caller belongs to. Writes go to the
@@ -281,8 +290,10 @@ pub trait ThreadStore {
 
     /// Unsend ([CB-38]): replace every item of this handle's DID with
     /// `message_id` in `thread_id` by `redaction`, keeping its id and
-    /// timestamp. Returns how many items were redacted;
-    /// [`Error::NotFound`] if none. mls-ds `redactMessage`.
+    /// timestamp. Returns how many items were redacted. When none match,
+    /// the memory store fails with [`Error::NotFound`] while mls-ds
+    /// (idempotent) answers `Ok(0)`; callers treat both as "nothing left".
+    /// mls-ds `redactMessage`.
     fn redact_item(
         &self,
         thread_id: &str,
@@ -340,7 +351,10 @@ pub trait KeyPublisher {
     /// number fails with [`crate::Error::Conflict`].
     fn publish(&self, record: &MailboxKeysRecord) -> Result<()>;
 
-    /// Remove every published epoch (account deletion, [CB-38]).
+    /// Remove every published epoch (account deletion, [CB-38]). The
+    /// mls-ds directory has no retract endpoint of its own: its head chain
+    /// goes with `purgeMailbox`, which [`crate::store::xrpc::XrpcDirectory`]
+    /// calls.
     fn retract(&self) -> Result<()> {
         Err(Error::NotSupported("retract mailboxKeys"))
     }
@@ -393,7 +407,7 @@ pub trait OrfServer {
     /// `tokenMac = HMAC(orf_server_map(state, TOKEN, blinded_token_salt),
     /// json([threadId, messageId]))`. The server checks the caller may
     /// read the blob in that message, and refuses a second message for
-    /// the same blob (`Conflict`). mls-ds `putAttachmentRef` (new shape).
+    /// the same blob (`Conflict`). mls-ds `putAttachmentRef`.
     fn put_attachment_ref(&self, device_key: &XVerifyingKey, put: &AttachmentPut) -> Result<()> {
         let _ = (device_key, put);
         Err(Error::NotSupported("putAttachmentRef"))
@@ -404,7 +418,7 @@ pub trait OrfServer {
     /// message still exists unredacted where the caller can read it.
     /// A missing reference, a wrong token and a gone message are all
     /// [`Error::NotFound`] (`"attachment"`), so callers cannot probe.
-    /// mls-ds `getAttachmentBlob` (new shape).
+    /// mls-ds `getAttachmentBlob`.
     fn fetch_attachment(
         &self,
         device_key: &XVerifyingKey,

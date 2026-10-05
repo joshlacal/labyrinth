@@ -5,10 +5,11 @@
 use std::sync::Arc;
 
 use super::mailbox::range_params;
-use super::wire::{AuthoredView, RecordBody, RkeyOrderOut};
+use super::wire::{AuthoredView, RecordBody, RedactIn, RedactOut, RkeyOrderOut};
 use super::{Xrpc, XrpcTransport};
 use crate::Result;
-use crate::records::{Batch, MekDistribution};
+use crate::deletion::Redaction;
+use crate::records::{Batch, MekDistribution, RedactionDef};
 use crate::store::{Stored, ThreadStore, TimeRange};
 
 /// The conversation records on the sequencer DS, writing as one DID.
@@ -76,5 +77,26 @@ impl ThreadStore for XrpcThreadStore {
         range_params(range, &mut p);
         let v: Vec<AuthoredView<Batch>> = self.x.list_all("listBatches", &p)?;
         v.into_iter().map(stored).collect()
+    }
+
+    /// `redactMessage`. mls-ds counts an unknown or already-redacted id as
+    /// zero (idempotent), so this returns `Ok(0)` where the memory store
+    /// says [`crate::Error::NotFound`]. `redaction.redacted_at` must be
+    /// `None`: the server stamps it.
+    fn redact_item(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        redaction: &Redaction,
+    ) -> Result<usize> {
+        let mut def = RedactionDef::from_redaction(redaction);
+        def.redacted_at = None;
+        let input = RedactIn {
+            thread_id: thread_id.to_owned(),
+            message_id: message_id.to_owned(),
+            redaction: def,
+        };
+        let out: RedactOut = self.x.post("redactMessage", &input)?;
+        Ok(out.redacted)
     }
 }

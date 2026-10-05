@@ -6,15 +6,18 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use super::wire::{
-    ChatDeviceKeyView, DeviceKeyIn, Empty, EpochHeadOut, MemberDeviceView, OrfParent,
-    PublishHeadIn, RegisterOrfIn,
+    AttachmentRefOut, ChatDeviceKeyView, DeleteRefIn, DeviceKeyIn, Empty, EpochHeadOut,
+    MemberDeviceView, OrfParent, PublishHeadIn, PutRefIn, RegisterOrfIn,
 };
 use super::{Xrpc, XrpcTransport};
 use crate::mailbox::EpochPublic;
 use crate::orf::{EvolveToken, ObliviousId};
 use crate::records::{Bytes, MailboxKeysRecord, ms_from_datetime};
 use crate::sign::XVerifyingKey;
-use crate::store::{ChatDeviceKey, KeyPublisher, MailboxDirectory, MemberDeviceKey, OrfServer};
+use crate::store::{
+    AttachmentFetch, AttachmentPut, ChatDeviceKey, KeyPublisher, MailboxDirectory, MemberDeviceKey,
+    OrfServer,
+};
 use crate::{Error, Result};
 
 /// mls-ds's verified, append-only head chain of every enrolled DID, plus
@@ -161,6 +164,14 @@ impl KeyPublisher for XrpcDirectory {
         let _: Empty = self.x.post("publishEpochHead", &input)?;
         Ok(())
     }
+
+    /// mls-ds drops a DID's head chain only with its whole mailbox
+    /// (`purgeMailbox`); there is no head-only retract. Use this publisher
+    /// only for an account that is being deleted everywhere.
+    fn retract(&self) -> Result<()> {
+        let _: Empty = self.x.post("purgeMailbox", &Empty {})?;
+        Ok(())
+    }
 }
 
 /// The ORF server role on mls-ds ([CB-17]).
@@ -173,6 +184,24 @@ impl XrpcOrf {
         Self {
             x: Xrpc::new(transport),
         }
+    }
+
+    /// `getAttachmentRef`: when the reference at this blinded index was
+    /// created (ms), or `None`. mls-ds keeps no readable thread, message
+    /// or blob linkage to return (decision J4).
+    pub fn attachment_ref_created_at(
+        &self,
+        device_key: &XVerifyingKey,
+        blinded_index: &ObliviousId,
+    ) -> Result<Option<u64>> {
+        let p = [
+            ("deviceKeyPubkey", hex::encode(device_key.0)),
+            ("blindedIndex", hex::encode(blinded_index.0)),
+        ];
+        self.x
+            .get_opt::<AttachmentRefOut>("getAttachmentRef", &p)?
+            .map(|o| ms_from_datetime(&o.created_at))
+            .transpose()
     }
 }
 
@@ -206,6 +235,48 @@ impl OrfServer for XrpcOrf {
             device_key_pubkey: Bytes::from_slice(&device_key.0),
         };
         let _: Empty = self.x.post("deleteOrfState", &input)?;
+        Ok(())
+    }
+
+    fn put_attachment_ref(&self, device_key: &XVerifyingKey, put: &AttachmentPut) -> Result<()> {
+        let input = PutRefIn {
+            device_key_pubkey: Bytes::from_slice(&device_key.0),
+            blinded_index: Bytes::from_slice(&put.blinded_index.0),
+            blinded_token_salt: Bytes::from_slice(&put.blinded_token_salt.0),
+            blob_id: put.blob_id.clone(),
+            thread_id: put.thread_id.clone(),
+            message_id: put.message_id.clone(),
+        };
+        let _: Empty = self.x.post("putAttachmentRef", &input)?;
+        Ok(())
+    }
+
+    /// `getAttachmentBlob`; every refusal is `NotFound("attachment")`.
+    fn fetch_attachment(
+        &self,
+        device_key: &XVerifyingKey,
+        fetch: &AttachmentFetch,
+    ) -> Result<Vec<u8>> {
+        let p = [
+            ("deviceKeyPubkey", hex::encode(device_key.0)),
+            ("blindedIndex", hex::encode(fetch.blinded_index.0)),
+            ("blindedTokenSalt", hex::encode(fetch.blinded_token_salt.0)),
+            ("threadId", fetch.thread_id.clone()),
+            ("messageId", fetch.message_id.clone()),
+        ];
+        self.x.get_raw("getAttachmentBlob", &p)
+    }
+
+    fn delete_attachment_ref(
+        &self,
+        device_key: &XVerifyingKey,
+        blinded_index: &ObliviousId,
+    ) -> Result<()> {
+        let input = DeleteRefIn {
+            device_key_pubkey: Bytes::from_slice(&device_key.0),
+            blinded_index: Bytes::from_slice(&blinded_index.0),
+        };
+        let _: Empty = self.x.post("deleteAttachmentRef", &input)?;
         Ok(())
     }
 }

@@ -10,17 +10,24 @@
 //!
 //! | Trait | Implementation | Endpoints |
 //! |---|---|---|
-//! | [`crate::store::MailboxStore`] | [`XrpcMailboxStore`] | `createDevice` … `listOwnerBatches`, `publishEpochHead` |
-//! | [`crate::store::ThreadStore`] | [`XrpcThreadStore`] | `createMek`, `findMeks`, `appendBatch`, `listBatches` |
-//! | [`crate::store::MailboxDirectory`], [`crate::store::KeyPublisher`] | [`XrpcDirectory`] | `getEpochHead`, `getChatDeviceKeys`, `getMemberDevices`, `publishEpochHead` |
-//! | [`crate::store::OrfServer`] | [`XrpcOrf`] | `registerOrfState`, `deleteOrfState` |
+//! | [`crate::store::MailboxStore`] | [`XrpcMailboxStore`] | `createDevice` … `listOwnerBatches`, `publishEpochHead`, `touchVirtualDevice`, `deleteVirtualDevice`, `purgeMailbox`, `deleteAccountData` |
+//! | [`crate::store::ThreadStore`] | [`XrpcThreadStore`] | `createMek`, `findMeks`, `appendBatch`, `listBatches`, `redactMessage` |
+//! | [`crate::store::MailboxDirectory`], [`crate::store::KeyPublisher`] | [`XrpcDirectory`] | `getEpochHead`, `getChatDeviceKeys`, `getMemberDevices`, `publishEpochHead`; `retract` is `purgeMailbox` |
+//! | [`crate::store::OrfServer`] | [`XrpcOrf`] | `registerOrfState`, `deleteOrfState`, `putAttachmentRef`, `getAttachmentRef`, `getAttachmentBlob`, `deleteAttachmentRef` |
 //!
-//! Errors map as: `RecordAlreadyExists`/`EpochHeadConflict` →
-//! [`Error::Conflict`]; `NotAuthorized`/`NotRecipient`/`NotParticipant`/
-//! `DeviceRevoked` → [`Error::Forbidden`]; `*NotFound` →
-//! [`Error::NotFound`] (a `get*` query returns `None` instead);
-//! `AttestationNotCurrent` → [`Error::Unattested`]; everything else →
-//! [`Error::Backend`].
+//! `labyrinthRelay` is server-to-server only; no store calls it.
+//!
+//! Errors map as: `RecordAlreadyExists`/`EpochHeadConflict`/
+//! `AttachmentAlreadyReferenced` → [`Error::Conflict`];
+//! `NotAuthorized`/`NotRecipient`/`NotParticipant`/`DeviceRevoked`/
+//! `LabyrinthDeviceNotBound`/`AttachmentNotEntitled` → [`Error::Forbidden`];
+//! `*NotFound` → [`Error::NotFound`] (a `get*` query returns `None`
+//! instead; the bare `NotFound` of the attachment reads is
+//! `NotFound("attachment")`); `MemberDeviceNotRegistered` →
+//! `NotFound("device")`; `InvalidChatBinding`/`InvalidRedaction` →
+//! [`Error::BadSignature`]; `AttestationNotCurrent` → [`Error::Unattested`];
+//! everything else (including the transient `RelayUnavailable`,
+//! `ConversationMoved` and `AttachmentsUnavailable`) → [`Error::Backend`].
 
 mod directory;
 mod mailbox;
@@ -91,11 +98,20 @@ pub trait XrpcTransport: Send + Sync {
 /// Maps an XRPC error to the store error the traits promise.
 pub fn map_error(e: XrpcError) -> Error {
     match e.error.as_deref() {
-        Some("RecordAlreadyExists" | "EpochHeadConflict") => Error::Conflict,
-        Some("NotAuthorized" | "NotRecipient" | "NotParticipant" | "DeviceRevoked") => {
-            Error::Forbidden
+        Some("RecordAlreadyExists" | "EpochHeadConflict" | "AttachmentAlreadyReferenced") => {
+            Error::Conflict
         }
-        Some("DeviceNotFound") => Error::NotFound("device"),
+        Some(
+            "NotAuthorized"
+            | "NotRecipient"
+            | "NotParticipant"
+            | "DeviceRevoked"
+            | "LabyrinthDeviceNotBound"
+            | "AttachmentNotEntitled",
+        ) => Error::Forbidden,
+        Some("DeviceNotFound" | "MemberDeviceNotRegistered") => Error::NotFound("device"),
+        Some("NotFound") => Error::NotFound("attachment"),
+        Some("InvalidChatBinding" | "InvalidRedaction") => Error::BadSignature,
         Some("EpochNotFound") => Error::NotFound("epoch"),
         Some("VirtualDeviceNotFound") => Error::NotFound("virtual device"),
         Some("OrfStateNotFound") => Error::NotFound("orf state"),
@@ -189,6 +205,11 @@ impl Xrpc {
 impl Xrpc {
     pub(crate) fn new(t: Arc<dyn XrpcTransport>) -> Self {
         Self(t)
+    }
+
+    /// A query whose output is raw bytes (`getAttachmentBlob`, `*/*`).
+    pub(crate) fn get_raw(&self, name: &str, params: &[(&str, String)]) -> Result<Vec<u8>> {
+        self.0.query(&nsid(name), params).map_err(map_error)
     }
 
     /// A query outside the Labyrinth namespace, by full NSID.

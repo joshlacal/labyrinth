@@ -22,6 +22,10 @@ pub struct PurgeReport {
     /// Extra key publishers that cannot retract yet
     /// ([`Error::NotSupported`]); their published epochs remain.
     pub publishers_not_retracted: usize,
+    /// The thread store cannot list threads (mls-ds), so the server did
+    /// the redaction and purge (`deleteAccountData`); `threads` and
+    /// `redacted` are then unknown and left at zero.
+    pub server_side: bool,
 }
 
 impl Labyrinth {
@@ -74,12 +78,18 @@ impl Labyrinth {
     /// attachment references, `mailboxKeys`). Rerunnable after a failure.
     /// Drop this client afterwards.
     ///
-    /// mls-ds also offers a server-side `deleteAccountData` doing the same
-    /// across delivery services; this is the backend-neutral path.
+    /// When the thread store cannot list threads (mls-ds has no
+    /// `listThreads`), the server does the redaction and purge instead:
+    /// publishers are retracted, then [`crate::store::MailboxStore::delete_account_data`]
+    /// (mls-ds `deleteAccountData`) runs, and the report says `server_side`.
     pub fn purge_account(&mut self) -> Result<PurgeReport> {
         self.outbox.clear();
         self.owner_outbox.clear();
-        let threads = self.b.threads.list_threads()?;
+        let threads = match self.b.threads.list_threads() {
+            Ok(t) => t,
+            Err(Error::NotSupported(_)) => return self.purge_account_server_side(),
+            Err(e) => return Err(e),
+        };
         let mut report = PurgeReport {
             threads: threads.len(),
             ..PurgeReport::default()
@@ -108,16 +118,35 @@ impl Labyrinth {
                 report.redacted += self.b.threads.redact_item(t, &id, &r)?;
             }
         }
-        for p in &self.b.publishers {
-            match p.retract() {
-                Ok(()) => {}
-                Err(Error::NotSupported(_)) => report.publishers_not_retracted += 1,
-                Err(e) => return Err(e),
-            }
-        }
+        report.publishers_not_retracted = self.retract_publishers()?;
         self.b.mailbox.purge_mailbox()?;
         self.meks.clear();
         self.pins.clear();
         Ok(report)
+    }
+
+    fn purge_account_server_side(&mut self) -> Result<PurgeReport> {
+        let report = PurgeReport {
+            publishers_not_retracted: self.retract_publishers()?,
+            server_side: true,
+            ..PurgeReport::default()
+        };
+        self.b.mailbox.delete_account_data()?;
+        self.meks.clear();
+        self.pins.clear();
+        Ok(report)
+    }
+
+    /// Retracts every extra publisher; returns how many cannot.
+    fn retract_publishers(&self) -> Result<usize> {
+        let mut not_retracted = 0;
+        for p in &self.b.publishers {
+            match p.retract() {
+                Ok(()) => {}
+                Err(Error::NotSupported(_)) => not_retracted += 1,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(not_retracted)
     }
 }

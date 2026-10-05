@@ -64,6 +64,13 @@ impl Lexicons {
         self.object(nsid, &main["output"]["schema"], v, "output", false)
     }
 
+    /// The declared output encoding of `nsid` (`application/json`, or
+    /// `*/*` for raw bytes such as `getAttachmentBlob`).
+    #[allow(dead_code)]
+    pub fn output_encoding(&self, nsid: &str) -> Option<&str> {
+        self.def(nsid, "main").ok()?["output"]["encoding"].as_str()
+    }
+
     /// Validate the query parameters of `nsid`.
     #[allow(dead_code)]
     pub fn validate_params(&self, nsid: &str, params: &[(&str, String)]) -> R {

@@ -2,7 +2,9 @@
 //! (`--features xrpc`), against the memory-backed reference server, with
 //! every request and response validated against the lexicons. Where mls-ds
 //! semantics differ from a Space they are asserted here: server order,
-//! per-MEK read authorization ([CB-16], [CB-22]) and revoked transports.
+//! per-MEK read authorization ([CB-16], [CB-22]), revoked transports, the
+//! chat binding ([CB-36]), unsend and account deletion ([CB-38]),
+//! attachment references ([CB-33]) and the recovery lifecycle ([CB-39]).
 
 #![cfg(feature = "xrpc")]
 
@@ -15,16 +17,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use labyrinth::Error;
+use labyrinth::attachment::blind;
 use labyrinth::client::{Backends, Clock, CompositeDirectory, Labyrinth, MessageSource};
+use labyrinth::orf::orf_client_init;
 use labyrinth::recovery_code::ALPHABET;
 use labyrinth::sign::Ed25519Transport;
+use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::memory::MemoryBackend;
 use labyrinth::store::xrpc::server::MemoryXrpcServer;
 use labyrinth::store::xrpc::{
     NSID_PREFIX, XrpcDirectory, XrpcError, XrpcMailboxStore, XrpcOrf, XrpcThreadStore,
     XrpcTransport,
 };
-use labyrinth::store::{MailboxDirectory, TimeRange};
+use labyrinth::store::{AttachmentPut, MailboxDirectory, MailboxStore, OrfServer, TimeRange};
 use labyrinth::virtual_device::Mechanism;
 use lexicon::Lexicons;
 use serde_json::Value;
@@ -64,7 +69,10 @@ impl Validating {
         }
         self.seen.lock().unwrap().insert(nsid.to_owned());
         match out {
+            // Raw-bytes output (`*/*`): nothing to validate but the encoding.
+            Ok(_) if self.lex.output_encoding(nsid) == Some("*/*") => {}
             Ok(body) => {
+                assert_eq!(self.lex.output_encoding(nsid), Some("application/json"));
                 let v: Value = serde_json::from_slice(body).unwrap();
                 self.lex
                     .validate_output(nsid, &v)
@@ -101,6 +109,16 @@ impl XrpcTransport for Validating {
         let out = self.inner.procedure(nsid, payload, op);
         self.check(nsid, &out);
         out
+    }
+}
+
+fn assert_seen(w: &World, names: &[&str]) {
+    let seen = w.seen.lock().unwrap();
+    for name in names {
+        assert!(
+            seen.contains(&format!("{NSID_PREFIX}{name}")),
+            "{name} not called"
+        );
     }
 }
 
@@ -395,4 +413,190 @@ fn passkey_restore_and_paging_over_xrpc() {
     }
     assert_eq!(bob.flush().unwrap()[0].count, 44);
     assert_eq!(read(&mut tablet).messages.len(), 300);
+}
+
+#[test]
+fn unsend_attachments_and_recovery_lifecycle_over_xrpc() {
+    let mut w = World::new();
+    let mut alice = w.init(ALICE, 1);
+    let mut bob = w.init(BOB, 3);
+    let group = [ALICE, BOB];
+    w.net().put_blob("blob-1", b"gcm ciphertext");
+    assert!(w.send(&mut alice, &group, "a1"));
+    w.send(&mut alice, &group, "a2");
+    w.send(&mut bob, &group, "b1");
+    let b1_ts = w.ts;
+    alice.flush().unwrap();
+    bob.flush().unwrap();
+
+    // Attachments: entitlement, one message per blob, then a restored
+    // device fetches through its evolved ORF state.
+    assert_eq!(
+        alice.attach_reference(THREAD, "zz", "blob-1").unwrap_err(),
+        Error::Forbidden
+    );
+    alice.attach_reference(THREAD, "a1", "blob-1").unwrap();
+    assert_eq!(
+        alice.attach_reference(THREAD, "a2", "blob-1").unwrap_err(),
+        Error::Conflict
+    );
+    let keychain = alice.create_recovery_code(Mechanism::Keychain).unwrap();
+    let code = alice.create_recovery_code(Mechanism::Code).unwrap();
+    let (tablet, _) = Labyrinth::restore_with_recovery_code(
+        ALICE,
+        keychain.code.as_str(),
+        w.chat_device(ALICE, 8),
+        w.backends(ALICE, 8),
+    )
+    .unwrap();
+    assert_eq!(
+        tablet.fetch_attachment(THREAD, "a1", "blob-1").unwrap(),
+        b"gcm ciphertext"
+    );
+    assert_eq!(
+        tablet.fetch_attachment(THREAD, "a2", "blob-1").unwrap_err(),
+        Error::NotFound("attachment")
+    );
+
+    // Recovery lifecycle: the restore touched the keychain bundle; touch
+    // and remove go through touchVirtualDevice / deleteVirtualDevice.
+    let kc = |lab: &Labyrinth| {
+        lab.list_recovery_methods()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.vdevice_id == keychain.vdevice_id)
+    };
+    assert!(kc(&alice).unwrap().last_used_at_ms.is_some());
+    alice.touch_recovery_method(&code.vdevice_id).unwrap();
+    assert_eq!(
+        alice.touch_recovery_method(&[9; 16]).unwrap_err(),
+        Error::NotFound("virtual device")
+    );
+    let rot = alice.remove_recovery_method(&keychain.vdevice_id).unwrap();
+    assert_eq!(rot.new_epoch, 1);
+    assert!(kc(&alice).is_none());
+    assert_eq!(alice.list_recovery_methods().unwrap().len(), 1);
+
+    // A chat device holding no bound Labyrinth device cannot write epochs.
+    w.net().register_chat_device(ALICE, tpub(9));
+    let stray = XrpcMailboxStore::new(ALICE, w.transport(ALICE, 9));
+    assert_eq!(
+        stray.set_device_revoked(
+            &tablet.device_public().device_key_pub,
+            "2026-10-05T00:00:00Z"
+        ),
+        Err(Error::Forbidden)
+    );
+
+    // Unsend: author-only, idempotent, and it takes the attachment along.
+    assert_eq!(alice.unsend(THREAD, "a1").unwrap(), 1);
+    assert_eq!(alice.unsend(THREAD, "a1").unwrap(), 0);
+    let h = read(&mut bob);
+    assert_eq!(got(&h), w.expected(&["a2", "b1"]));
+    let r = h.redacted.iter().find(|r| r.message_id == "a1").unwrap();
+    assert!(r.by_author && !r.account_deleted && r.sender == ALICE);
+    assert_eq!(
+        tablet.fetch_attachment(THREAD, "a1", "blob-1").unwrap_err(),
+        Error::NotFound("attachment")
+    );
+
+    // Delete for me hides b1 from Bob only.
+    bob.delete_for_me(THREAD, "b1", b1_ts, Some(BOB), &[])
+        .unwrap();
+    assert_eq!(read(&mut bob).deleted_for_me, ["b1"]);
+    assert!(
+        read(&mut alice)
+            .messages
+            .iter()
+            .any(|m| m.message_id == "b1")
+    );
+
+    // The raw ORF wrappers: put, getAttachmentRef, delete.
+    let orf = XrpcOrf::new(w.transport(ALICE, 1));
+    let dev = XVerifyingKey([7; 32]);
+    orf.register(&dev, None).unwrap();
+    w.net().put_blob("blob-2", b"two");
+    let state = orf_client_init().unwrap();
+    let (bi, bt) = blind(&state, THREAD, "blob-2");
+    assert_eq!(orf.attachment_ref_created_at(&dev, &bi).unwrap(), None);
+    orf.put_attachment_ref(
+        &dev,
+        &AttachmentPut {
+            blinded_index: bi,
+            blinded_token_salt: bt,
+            blob_id: "blob-2".into(),
+            thread_id: THREAD.into(),
+            message_id: "a2".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        orf.attachment_ref_created_at(&dev, &bi).unwrap(),
+        Some(w.ts)
+    );
+    orf.delete_attachment_ref(&dev, &bi).unwrap();
+    orf.delete_attachment_ref(&dev, &bi).unwrap(); // idempotent
+    assert_eq!(orf.attachment_ref_created_at(&dev, &bi).unwrap(), None);
+
+    assert_seen(
+        &w,
+        &[
+            "redactMessage",
+            "touchVirtualDevice",
+            "deleteVirtualDevice",
+            "markDeviceRevoked",
+            "putAttachmentRef",
+            "getAttachmentRef",
+            "getAttachmentBlob",
+            "deleteAttachmentRef",
+        ],
+    );
+}
+
+#[test]
+fn account_purge_over_xrpc_is_server_side() {
+    let mut w = World::new();
+    let mut alice = w.init(ALICE, 1);
+    let mut bob = w.init(BOB, 3);
+    let group = [ALICE, BOB];
+    w.send(&mut alice, &group, "a1");
+    w.send(&mut alice, &group, "a2");
+    w.send(&mut bob, &group, "b1");
+    alice.flush().unwrap();
+    bob.flush().unwrap();
+    alice.create_recovery_code(Mechanism::Code).unwrap();
+
+    // mls-ds has no listThreads, so the client hands the redaction and
+    // purge to deleteAccountData after retracting the PDS copy.
+    let report = alice.purge_account().unwrap();
+    assert!(report.server_side);
+    assert_eq!(report.publishers_not_retracted, 0);
+    let h = read(&mut bob);
+    assert_eq!(got(&h), w.expected(&["b1"]));
+    assert_eq!(h.redacted.len(), 2);
+    assert!(
+        h.redacted
+            .iter()
+            .all(|r| r.sender == ALICE && r.account_deleted && !r.by_author)
+    );
+    // Both directories forgot Alice, and her mailbox is empty.
+    assert!(w.net().directory().latest(ALICE).unwrap().is_none());
+    let ds = XrpcDirectory::new(w.transport(BOB, 3));
+    assert!(ds.latest(ALICE).unwrap().is_none());
+    let mb = XrpcMailboxStore::new(ALICE, w.transport(ALICE, 1));
+    assert!(mb.list_devices().unwrap().is_empty());
+    assert!(mb.list_virtual_devices().unwrap().is_empty());
+
+    // purgeMailbox alone keeps thread records; Bob purges and re-enrolls.
+    mb.purge_mailbox().unwrap();
+    XrpcMailboxStore::new(BOB, w.transport(BOB, 3))
+        .purge_mailbox()
+        .unwrap();
+    assert_eq!(got(&read(&mut alice)).len(), 0);
+    let mut bob2 = Labyrinth::initialize(BOB, Box::new(signer(3)), w.backends(BOB, 3)).unwrap();
+    assert_eq!(bob2.latest_epoch(), 0);
+    let h = read(&mut bob2);
+    assert!(h.messages.is_empty());
+
+    assert_seen(&w, &["deleteAccountData", "purgeMailbox"]);
 }

@@ -9,13 +9,19 @@
 //! boundary: the caller is a *current* chat device of its DID; thread
 //! writes come from the writer's own key, name a known MEK and keep to one
 //! MEK per batch (Y4); thread reads are authorized per MEK ([CB-16],
-//! [CB-22]); heads form a contiguous attested chain (§1a); procedures
-//! replay their response for a repeated `operationId`.
+//! [CB-22]); heads form a contiguous attested chain (§1a); a physical
+//! device carries a chat binding by the calling chat device, and epoch
+//! writes come from a bound caller naming registered members ([CB-36],
+//! [`binding`]); procedures replay their response for a repeated
+//! `operationId`.
 //!
 //! It does not model service auth, federation, quotas or retention.
 
+mod attachments;
+mod binding;
 mod mailbox;
 mod pending;
+mod retention;
 mod thread;
 
 use std::collections::HashMap;
@@ -106,6 +112,8 @@ impl MemoryXrpcServer {
             .ok_or_else(|| XrpcError::named(501, "MethodNotImplemented", nsid))?;
         mailbox::handle(self, c, name, &input)
             .or_else(|| thread::handle(self, c, name, &input))
+            .or_else(|| retention::handle(self, c, name, &input))
+            .or_else(|| attachments::handle(self, c, name, &input))
             .or_else(|| pending::handle(self, c, name, &input))
             .unwrap_or_else(|| Err(XrpcError::named(501, "MethodNotImplemented", nsid)))
     }

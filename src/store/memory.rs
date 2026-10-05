@@ -504,6 +504,11 @@ impl MailboxStore for MemoryMailbox {
         self.backend.lock().purge(&self.did);
         Ok(())
     }
+
+    fn delete_account_data(&self) -> Result<()> {
+        self.backend.delete_account_data(&self.did);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

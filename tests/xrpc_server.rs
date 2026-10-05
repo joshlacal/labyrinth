@@ -9,7 +9,7 @@ mod lexicon;
 use std::path::Path;
 
 use labyrinth::Error;
-use labyrinth::device::DeviceSecrets;
+use labyrinth::device::{ChatBinding, DeviceSecrets};
 use labyrinth::mek::{Mek, distribute_transport};
 use labyrinth::message::seal_sender;
 use labyrinth::records::{Batch, Device, MekDistribution, datetime_from_ms};
@@ -30,6 +30,12 @@ fn signer(seed: u8) -> Ed25519Transport {
 }
 fn tpub(seed: u8) -> [u8; 32] {
     signer(seed).0.verifying_key().to_bytes()
+}
+
+/// A physical device record bound to chat key `seed` ([CB-36]).
+fn bound(d: &DeviceSecrets, seed: u8, at: &str) -> Device {
+    let b = ChatBinding::sign(A, &d.public().device_key_pub, &signer(seed));
+    Device::bound(d.public(), &b, at.to_owned())
 }
 
 fn server() -> MemoryXrpcServer {
@@ -69,6 +75,22 @@ fn errors_map_to_store_errors() {
         assert_eq!(e(f), Error::Forbidden);
     }
     assert_eq!(e("DeviceNotFound"), Error::NotFound("device"));
+    assert_eq!(e("MemberDeviceNotRegistered"), Error::NotFound("device"));
+    assert_eq!(e("NotFound"), Error::NotFound("attachment"));
+    for f in ["LabyrinthDeviceNotBound", "AttachmentNotEntitled"] {
+        assert_eq!(e(f), Error::Forbidden);
+    }
+    assert_eq!(e("AttachmentAlreadyReferenced"), Error::Conflict);
+    for f in ["InvalidChatBinding", "InvalidRedaction"] {
+        assert_eq!(e(f), Error::BadSignature);
+    }
+    for f in [
+        "RelayUnavailable",
+        "ConversationMoved",
+        "AttachmentsUnavailable",
+    ] {
+        assert!(matches!(e(f), Error::Backend(_)));
+    }
     assert_eq!(e("AttestationNotCurrent"), Error::Unattested);
     assert!(matches!(e("MixedMekBatch"), Error::Backend(m) if m.contains("MixedMekBatch")));
     let no_response = XrpcError {
@@ -88,7 +110,15 @@ fn mailbox_create_get_and_replay() {
     let key = d.public().device_key_pub;
     assert_eq!(mb.get_device(&key).unwrap(), None);
     assert_eq!(mb.get_epoch(0).unwrap(), None);
-    let rec = Device::from_public(d.public(), datetime_from_ms(1));
+    // mls-ds refuses an unbound physical device, and one bound to another
+    // chat key than the caller's (InvalidChatBinding).
+    let unbound = Device::from_public(d.public(), datetime_from_ms(1));
+    assert_eq!(mb.create_device(&unbound), Err(Error::BadSignature));
+    assert_eq!(
+        mb.create_device(&bound(&d, 2, &datetime_from_ms(1))),
+        Err(Error::BadSignature)
+    );
+    let rec = bound(&d, 1, &datetime_from_ms(1));
     mb.create_device(&rec).unwrap();
     assert_eq!(mb.create_device(&rec), Err(Error::Conflict));
     assert_eq!(mb.get_device(&key).unwrap(), Some(rec.clone()));
@@ -102,7 +132,7 @@ fn mailbox_create_get_and_replay() {
 
     // A retried procedure with the same operationId replays its response
     // instead of failing as a second create.
-    let other = Device::from_public(DeviceSecrets::generate().unwrap().public(), "t".into());
+    let other = bound(&DeviceSecrets::generate().unwrap(), 1, "t");
     let payload = serde_json::to_vec(&json!({ "record": other })).unwrap();
     let nsid = format!("{NSID_PREFIX}createDevice");
     let first = t.procedure(&nsid, &payload, [7; 16]).unwrap();
