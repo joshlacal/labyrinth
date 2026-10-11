@@ -126,9 +126,6 @@ impl World {
         let lex = Lexicons::load(&root.join("lexicons/blue/catbird/labyrinth"))
             .with(&root.join("tests/vectors/atproto-space"));
         let host = MemorySpaceHost::new();
-        for did in [ALICE, BOB, CAROL, DAVE] {
-            host.create_space(&SpaceRef::mailbox(did));
-        }
         Self {
             net: MemoryBackend::new(),
             host,
@@ -470,22 +467,17 @@ fn space_store_semantics() {
     assert!(as_bob.get_epoch(0).unwrap().is_none());
     assert_eq!(as_bob.create_device(&device).unwrap_err(), Error::Forbidden);
 
-    // An account whose Space was never created.
+    // A Space nobody created: the owner's PDS still accepts its writes,
+    // and before any it reads as empty.
     let host = MemorySpaceHost::new();
-    let nowhere = SpaceMailboxStore::new(
+    let fresh = SpaceMailboxStore::new(
         DAVE,
         Arc::new(host.client(DAVE)),
         Box::new(w.net.pds_publisher(DAVE)),
     );
-    assert_eq!(
-        nowhere.list_devices().unwrap_err(),
-        Error::NotFound("space")
-    );
-    // A Space with no writes yet reads as empty.
-    host.create_space(&SpaceRef::mailbox(DAVE));
-    assert!(nowhere.list_devices().unwrap().is_empty());
-    assert!(nowhere.get_virtual_device(&[0; 16]).unwrap().is_none());
-    assert_eq!(nowhere.list_owner_threads().unwrap(), Vec::<String>::new());
+    assert!(fresh.list_devices().unwrap().is_empty());
+    assert!(fresh.get_virtual_device(&[0; 16]).unwrap().is_none());
+    assert_eq!(fresh.list_owner_threads().unwrap(), Vec::<String>::new());
 }
 
 #[test]

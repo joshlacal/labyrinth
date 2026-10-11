@@ -11,10 +11,12 @@
 //!
 //! The store reuses [`XrpcTransport`]: the embedding app supplies one
 //! bound to the user's PDS with the account's OAuth session (no service
-//! auth, no `labyrinthWriteBody`; `operation_id` is ignored). Creating the
-//! Space itself is left to the app, because `createSpace` is moving from
-//! `com.atproto.simplespace` into `com.atproto.space` (upstream proposal
-//! #119); a missing Space surfaces as `NotFound("space")`.
+//! auth, no `labyrinthWriteBody`; `operation_id` is ignored). The store
+//! never calls `createSpace`: the owner's PDS accepts writes to a Space no
+//! authority governs and serves them back with `read_self`, which is all an
+//! owner-only mailbox needs (checked live, `tests/live_space_pds.rs`). An
+//! app may still create it, once `createSpace` settles in
+//! `com.atproto.space` (upstream proposal #119).
 //!
 //! What the PDS gives and how the store uses it:
 //!

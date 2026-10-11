@@ -14,14 +14,17 @@
 //!   rkey gets a TID; JSON bodies over 1,000,000 bytes are refused (413);
 //! - `deleteRecord` succeeds whether or not the record exists;
 //! - reads are `read_self` only: another account's repo answers
-//!   `RepoNotFound`, as does a repo that never had a write;
+//!   `RepoNotFound`; the caller's own repo with no writes lists as empty;
+//! - no Space has to be created first: a member's PDS accepts writes to a
+//!   Space no authority governs, and reads them back (checked against the
+//!   live dev PDS, `tests/live_space_pds.rs`);
 //! - `listRecords` orders by record URI, descending unless `reverse`,
 //!   with the last URI as the cursor only when the page is full.
 //!
 //! It does not model space credentials, notifyWrite, rate limits, record
 //! CIDs (a digest stands in) or lexicon validation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
@@ -41,7 +44,6 @@ type Repo = BTreeMap<String, (String, String, Value)>;
 
 #[derive(Default)]
 struct State {
-    spaces: BTreeSet<String>,
     /// `(space ref, author DID)` → records.
     repos: BTreeMap<(String, String), Repo>,
     tid: u64,
@@ -70,11 +72,6 @@ pub struct MemorySpaceHost {
 impl MemorySpaceHost {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Creates a Space (the app's job in production, `createSpace`).
-    pub fn create_space(&self, space: &SpaceRef) {
-        self.s.lock().unwrap().spaces.insert(space.to_string());
     }
 
     /// A transport whose OAuth session is `did`.
@@ -197,24 +194,22 @@ impl SpaceClient {
         s: &State,
         space: &str,
         repo: &str,
-    ) -> core::result::Result<Option<Repo>, XrpcError> {
-        if !s.spaces.contains(space) {
-            return Err(err(400, "SpaceNotFound", space));
-        }
+    ) -> core::result::Result<Repo, XrpcError> {
         // read_self only: no space credentials are modeled.
         if repo != self.did {
             return Err(err(400, "RepoNotFound", repo));
         }
-        Ok(s.repos.get(&(space.to_owned(), repo.to_owned())).cloned())
+        Ok(s.repos
+            .get(&(space.to_owned(), repo.to_owned()))
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn get_record(&self, p: &[(&str, String)]) -> Reply {
         let (space, repo) = (required(p, "space")?, required(p, "repo")?);
         let (collection, rkey) = (required(p, "collection")?, required(p, "rkey")?);
         let s = self.host.s.lock().unwrap();
-        let r = self
-            .read_repo(&s, space, repo)?
-            .ok_or_else(|| err(400, "RepoNotFound", repo))?;
+        let r = self.read_repo(&s, space, repo)?;
         let uri = record_uri(space, repo, collection, rkey);
         let (.., v) = r
             .get(&uri)
@@ -237,9 +232,7 @@ impl SpaceClient {
         let collection = param(p, "collection");
         let cursor = param(p, "cursor");
         let s = self.host.s.lock().unwrap();
-        let r = self
-            .read_repo(&s, space, repo)?
-            .ok_or_else(|| err(400, "RepoNotFound", repo))?;
+        let r = self.read_repo(&s, space, repo)?;
         let matching = r
             .iter()
             .filter(|(_, (c, ..))| collection.is_none_or(|x| x == c));
@@ -287,9 +280,6 @@ impl SpaceClient {
             ));
         }
         let mut s = self.host.s.lock().unwrap();
-        if !s.spaces.contains(&input.space) {
-            return Err(err(400, "SpaceNotFound", &input.space));
-        }
         let key = (input.space.clone(), self.did.clone());
         let mut repo = s.repos.get(&key).cloned().unwrap_or_default();
         let mut results = Vec::new();
@@ -358,9 +348,6 @@ impl SpaceClient {
             return Err(err(403, "Forbidden", "repo must match authenticated user"));
         }
         let mut s = self.host.s.lock().unwrap();
-        if !s.spaces.contains(&input.space) {
-            return Err(err(400, "SpaceNotFound", &input.space));
-        }
         let uri = record_uri(&input.space, &self.did, &input.collection, &input.rkey);
         if let Some(r) = s.repos.get_mut(&(input.space.clone(), self.did.clone())) {
             r.remove(&uri);
