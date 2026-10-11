@@ -149,3 +149,33 @@ fn publish_failure_after_epoch_zero_keeps_the_client() {
     assert_eq!(net.ds_directory().latest(ALICE).unwrap().unwrap().seq, 0);
     lab.create_recovery_code(Mechanism::Code).unwrap();
 }
+
+#[test]
+fn rotation_before_the_retry_still_publishes_epoch_zero_first() {
+    let net = MemoryBackend::new();
+    net.register_chat_device(ALICE, signer(1).0.verifying_key().to_bytes());
+    net.register_chat_device(ALICE, signer(2).0.verifying_key().to_bytes());
+    let (orf_down, pub_down) = (Down::default(), Down::default());
+    pub_down.set(true);
+    let (mut phone, unfinished) = Labyrinth::initialize_with_report(
+        ALICE,
+        Box::new(signer(1)),
+        backends(&net, &orf_down, &pub_down),
+    )
+    .unwrap();
+    assert!(unfinished.is_some());
+    phone.create_recovery_code(Mechanism::Code).unwrap();
+    // Rotate (revoke the recovery bundle) while the publisher is down.
+    let vkey = phone.list_recovery_methods().unwrap()[0].device_key;
+    assert!(phone.revoke_device(&vkey).is_err());
+    assert_eq!(phone.latest_epoch(), 1);
+    assert!(net.ds_directory().latest(ALICE).unwrap().is_none());
+
+    // The retry replays epoch 0 before epoch 1, so the head chain takes both.
+    pub_down.set(false);
+    phone.finish_initialize().unwrap();
+    let ds = net.ds_directory();
+    assert_eq!(ds.epoch(ALICE, 0).unwrap().unwrap().seq, 0);
+    assert_eq!(ds.latest(ALICE).unwrap().unwrap().seq, 1);
+    assert_eq!(net.directory().latest(ALICE).unwrap().unwrap().seq, 1);
+}

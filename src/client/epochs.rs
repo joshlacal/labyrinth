@@ -225,7 +225,15 @@ impl Labyrinth {
 
     /// The steps of [`initialize`](Self::initialize) after epoch 0: register
     /// this genesis device's ORF state (an existing state is kept) and
-    /// publish epoch 0. Safe to repeat until it succeeds.
+    /// publish every epoch from 0 up, in order. Safe to repeat until it
+    /// succeeds.
+    ///
+    /// Publishing from epoch 0 matters when a rotation ran before this
+    /// retry: the mls-ds head chain refuses a newer epoch until it has
+    /// epoch 0, and the PDS needs every per-epoch copy for [CB-29]. Each
+    /// destination accepts an epoch it already has. While older epochs
+    /// are replayed, a PDS's `mailboxKeys/self` briefly names an older
+    /// epoch; the last write restores the newest.
     pub fn finish_initialize(&self) -> Result<()> {
         let key = self.device.public().device_key_pub;
         let orf = match self.b.orf.register(&key, None) {
@@ -233,7 +241,8 @@ impl Labyrinth {
             Err(e) => Err(e),
         };
         // Publish even when the ORF is down: the directories don't need it.
-        let published = self.publish_latest_keys();
+        let published = (0..=self.latest)
+            .try_for_each(|seq| self.publish_keys(&self.epoch_record(seq)?.1.public));
         orf.and(published)
     }
 
