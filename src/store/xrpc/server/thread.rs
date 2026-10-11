@@ -12,7 +12,7 @@ use crate::store::xrpc::wire::{
     AuthoredView, ChatDeviceKeyView, Empty, EpochHeadOut, MemberDeviceView, OrderDef,
     PublishHeadIn, RecordBody, RkeyOrderOut,
 };
-use crate::store::{MailboxDirectory, Stored, ThreadStore, TimeRange};
+use crate::store::{MailboxDirectory, MailboxStore, Stored, ThreadStore, TimeRange};
 
 fn named(status: u16, name: &str, msg: &str) -> XrpcError {
     XrpcError::named(status, name, msg)
@@ -141,6 +141,30 @@ pub(super) fn handle(
         "publishEpochHead" => (|| {
             let i: PublishHeadIn = body(input)?;
             let e = i.epoch.to_public().map_err(err)?;
+            // mls-ds: an account whose mailbox is here only re-publishes an
+            // epoch the mailbox holds, from a bound device. An account with
+            // no mailbox here (its mailbox is in its PDS Space) publishes
+            // the head itself, under the chain checks below.
+            if super::binding::hosts_mailbox(s, &c.did)? {
+                super::binding::require_bound(s, c, None)?;
+                let stored = s
+                    .net
+                    .mailbox(&c.did)
+                    .get_epoch(e.seq)
+                    .map_err(err)?
+                    .ok_or_else(|| named(404, "EpochNotFound", "not in the caller's mailbox"))?;
+                if stored.value.public.to_public().map_err(err)? != e {
+                    return Err(named(409, "EpochHeadConflict", "different head"));
+                }
+            }
+            // mls-ds: only the calling chat device's own key may attest.
+            if e.attestation.transport_public_key != c.device {
+                return Err(named(
+                    400,
+                    "AttestationNotCaller",
+                    "the head is not attested by the calling chat device",
+                ));
+            }
             s.net.record_ds_head(&c.did, &e).map_err(|e| match e {
                 crate::Error::Conflict => named(409, "EpochHeadConflict", "different head"),
                 e => err(e),

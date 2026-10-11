@@ -44,6 +44,16 @@ pub(super) fn verify_chat_binding(c: &Caller, d: &Device) -> Result<(), XrpcErro
     }
 }
 
+/// Whether `did` keeps its mailbox on this server. An account whose mailbox
+/// is in its PDS Space has none here; mls-ds then serves only its head
+/// directory and ORF state, and the binding rules do not apply to it.
+pub(super) fn hosts_mailbox(s: &MemoryXrpcServer, did: &str) -> Result<bool, XrpcError> {
+    let mb = s.net.mailbox(did);
+    Ok(!mb.list_devices().map_err(err)?.is_empty()
+        || !mb.list_epochs().map_err(err)?.is_empty()
+        || !mb.list_virtual_devices().map_err(err)?.is_empty())
+}
+
 /// The caller holds a current, non-virtual device bound to its chat key
 /// (that device exactly, with `key`).
 pub(super) fn require_bound(
