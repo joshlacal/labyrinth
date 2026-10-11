@@ -32,6 +32,9 @@ serde_json = { version = "1", optional = true }
 # Store implementations over mls-ds `blue.catbird.labyrinth.*` XRPC
 # endpoints (docs/MLSDS_BACKEND.md), plus a memory-backed reference server.
 xrpc = ["dep:serde_json"]
+# The personal mailbox in an atproto Space over `com.atproto.space.*`
+# (SPEC §9), plus a memory-backed reference PDS for those endpoints.
+space = ["xrpc"]
 
 [dev-dependencies]
 hex-literal = "1.1"

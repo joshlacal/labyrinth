@@ -1,0 +1,1 @@
+Copied verbatim from `bluesky-social/atproto`, branch `permissioned-data`, commit `5b95b2f2` (2026-10-01), `lexicons/com/atproto/space/`. Upstream is dual-licensed MIT / Apache-2.0. `tests/e2e_space.rs` validates every Space call against these.

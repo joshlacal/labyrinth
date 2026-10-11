@@ -218,3 +218,18 @@ Reversible until: merge of `labyrinth-1.1`. Override by:
 - Signed reads: edit `src/store/xrpc/read_auth.rs` (`tests/signed_reads.rs`).
 - Account deletion: edit `src/client/delete.rs` (`tests/purge_retry.rs`).
 - Redaction labels: edit `src/deletion.rs` and `src/client/read.rs` (`tests/history_ops.rs`, `tests/lexicon_records.rs`).
+
+## 2026-10-11 · labyrinth · Space mailbox store (plan Phase 4, crate half)
+Context: the README listed the atproto Space store as the main missing piece. Decision 2 scopes storage to a per-user mailbox with mls-ds as sequencer, and the plan defers group Spaces until after GA, so only the mailbox side is built. Upstream reference: `bluesky-social/atproto` branch `permissioned-data` at `5b95b2f2` (2026-10-01 alpha).
+
+Chose (provisional):
+- **`store::space::SpaceMailboxStore`** (feature `space`, implies `xrpc`) implements `MailboxStore` over `com.atproto.space.{applyWrites,getRecord,listRecords,deleteRecord}`. It reuses `XrpcTransport`: the app passes one bound to the user's PDS with the OAuth session; `operation_id` is ignored there.
+- **One Space per account:** `at://<did>/space/blue.catbird.labyrinth.mailbox/self`. The app creates it; the store does not call `createSpace`, because #119 moves it from `com.atproto.simplespace` into `com.atproto.space` with a new `policy` token. A missing Space is `NotFound("space")`; a Space with no writes reads as empty (`RepoNotFound`).
+- **Writes:** `#create` with our rkeys, so `RecordAlreadyExists` → `Conflict` is the race guard ([CB-9]); `create_epoch` is one `applyWrites` and is refused (not split) past 200 ops; owner batches are `#create` without an rkey and take the PDS's TID from the result URI; `validate: false`.
+- **Revocation and `lastUsedAt`** are read-then-`#update`. There is no `swapRecord` in Space writes, and both fields are only ever set, so a lost race costs at most a different timestamp. `lastUsedAt` comes from the client's clock (`with_clock`), since no server stamps it ([CB-39] expiry trusts the owner's devices on this backend).
+- **Reads** page `listRecords` ascending (`reverse=true`, 50 per page by default, `with_page_size`) and filter client side; `get_epoch_member` overrides the scan with a `getRecord`.
+- **`mailboxKeys`** goes to the public repo through a `KeyPublisher` passed at construction (`PdsPublisher` in production); the Space keeps no copy. `purge_mailbox` deletes every mailbox record in 200-op batches, then retracts it. ORF states and attachment references stay on mls-ds and go with its `purgeMailbox`, reached through the mls-ds publisher's `retract`.
+- **`MemorySpaceHost`** is a reference PDS for those four endpoints with the upstream limits and errors (own-repo writes, 200 ops, 1,000,000-byte bodies, `read_self` only, URI-ordered listing and cursor). `tests/e2e_space.rs` runs the lifecycle with every mailbox in a Space, the production directory composition (PDS × mls-ds heads), and every call validated against the vendored upstream lexicons in `tests/vectors/atproto-space/`.
+  - Rejected for now: thread-tagged owner-batch rkeys with `excludeValues` scans. Owner batches are rare (re-archive on leave, delete-for-me), and the lexicon fixes the key as a TID.
+
+Reversible until: merge of `labyrinth-1.1`. Override by: edit `src/store/space/*` (`tests/e2e_space.rs`). Revisit when the upstream repo-format rework and #119 land.

@@ -30,6 +30,14 @@ impl Lexicons {
         Self { docs }
     }
 
+    /// Adds every lexicon in `dir` (e.g. the vendored `com.atproto.space`
+    /// ones next to ours).
+    #[allow(dead_code)]
+    pub fn with(mut self, dir: &Path) -> Self {
+        self.docs.extend(Self::load(dir).docs);
+        self
+    }
+
     #[allow(dead_code)]
     pub fn docs(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.docs.iter()

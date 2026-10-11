@@ -37,6 +37,8 @@ pub mod keys;
 pub mod memory;
 #[cfg(feature = "xrpc")]
 pub mod pds;
+#[cfg(feature = "space")]
+pub mod space;
 #[cfg(feature = "xrpc")]
 pub mod xrpc;
 

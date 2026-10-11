@@ -29,7 +29,7 @@ The whitepapers leave many choices open and are written around Facebook identiti
 | `src/recovery_code.rs`, `src/virtual_device/`, `src/otc.rs` | Recovery codes with typo correction, recovery bundles, passkey wrap, CPace one-time codes |
 | `src/mek/`, `src/message.rs` | MEK distribution and opening; owner-mode and sender-mode message encryption |
 | `src/records/` | atproto record types for every lexicon, with lossless conversions to the protocol structs |
-| `src/store/` | Synchronous storage traits (`MailboxStore`, `ThreadStore`, `MailboxDirectory`, `KeyPublisher`, `OrfServer`), the chat-key vouching rule, an in-memory backend, and (feature `xrpc`) stores over the mls-ds `blue.catbird.labyrinth.*` endpoints with a memory-backed reference server |
+| `src/store/` | Synchronous storage traits (`MailboxStore`, `ThreadStore`, `MailboxDirectory`, `KeyPublisher`, `OrfServer`), the chat-key vouching rule, an in-memory backend, (feature `xrpc`) stores over the mls-ds `blue.catbird.labyrinth.*` endpoints with a memory-backed reference server, and (feature `space`) the personal mailbox in an atproto Space over `com.atproto.space.*`, with a memory-backed reference PDS |
 | `src/client/` | `Labyrinth`, the high-level client a chat app calls. It covers initialize, sync, revoke (with membership audit), recover, enroll, archive, and export and restore of its state; loading by range, by id or newest-first page; delete-for-me, unsend and account purge; attachment references; recovery-method lifecycle; and fingerprints. Also `CompositeDirectory`, which cross-checks the PDS and mls-ds epoch heads |
 | `src/deletion.rs`, `src/attachment.rs`, `src/fingerprint.rs` | Signed redactions, attachment-reference derivations, safety numbers |
 | `lexicons/blue/catbird/labyrinth/` | Draft `blue.catbird.labyrinth.*` record lexicons and the mls-ds XRPC queries and procedures |
@@ -66,12 +66,12 @@ let history = alice.load_thread("conv-1", TimeRange::ALL)?;
 
 ```bash
 cargo test --release                  # release mode keeps the ML-KEM and recovery-code tests fast
-cargo test --release --all-features   # adds the xrpc stores and their e2e run
+cargo test --release --all-features   # adds the xrpc and Space stores and their e2e runs
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
-The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-answer vectors for HPKE, ORF and recovery codes, a lexicon validator that checks every emitted record against `lexicons/`, and an end-to-end lifecycle on the memory backend: multi-device accounts, revocation, recovery from a typo'd code, members leaving and joining, and malicious-backend checks. `tests/review_regressions.rs` pins the fixes from the 2026-10-04 security review (revocation, epoch pinning, messageId collisions, state persistence, removed chat keys, with and without server order). `tests/directory_and_orf.rs` covers the PDS × mls-ds directory cross-check and the client's ORF calls; `tests/e2e_xrpc.rs` runs the lifecycle over the XRPC stores with every call validated against the lexicons.
+The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-answer vectors for HPKE, ORF and recovery codes, a lexicon validator that checks every emitted record against `lexicons/`, and an end-to-end lifecycle on the memory backend: multi-device accounts, revocation, recovery from a typo'd code, members leaving and joining, and malicious-backend checks. `tests/review_regressions.rs` pins the fixes from the 2026-10-04 security review (revocation, epoch pinning, messageId collisions, state persistence, removed chat keys, with and without server order). `tests/directory_and_orf.rs` covers the PDS × mls-ds directory cross-check and the client's ORF calls; `tests/e2e_xrpc.rs` runs the lifecycle over the XRPC stores with every call validated against the lexicons. `tests/e2e_space.rs` runs it with every mailbox in a personal Space, validating each `com.atproto.space.*` call against the vendored upstream lexicons (`tests/vectors/atproto-space/`).
 
 ## Security caveats and limitations
 
@@ -85,8 +85,9 @@ The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-an
 - **Client state is secret.** `Labyrinth::export_state()` returns the device's private keys, epoch roots, MEKs, revoked set and pins ([CB-30]). Store it only in the platform keychain or SQLCipher; flush pending batches first, since they are not included.
 - **Revocation can't be wedged by a planted row.** A rotation drops and reports invalid or unbound members instead of aborting ([CB-25], [CB-36]), and a squatted next epoch is reported as `EpochSquatted` ([CB-40]). Clearing a squat still needs the backend.
 - **Deletion is cooperative.** An unsend asks the server to redact, and readers can tell an author's unsend from a server removal. Deleted data survives in server backups for their retention window.
+- **Space mailbox caveats.** In a Space, `lastUsedAt` on a recovery bundle is stamped by the owner's own device clock (no server), device revocation is a read-then-`#update` (Space writes have no `swapRecord`), and per-thread owner reads scan the owner-batch collection. Creating the Space is left to the app until `createSpace` settles upstream (proposal #119).
 - **Not yet provided:**
-  - the atproto Space store;
+  - the conversation-Space thread store (sender MEKs and batches in a group Space; deferred until after Spaces GA, plan Phase 7);
   - a UniFFI surface.
 
 ## References
