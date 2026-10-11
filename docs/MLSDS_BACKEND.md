@@ -33,11 +33,7 @@ Today a sender who has never addressed a DID accepts any epoch attested by one o
 3. Recomputing `epochHash`/`epochHead` per SPEC §5.3 yields `epochHead`. This needs only sha256 and hex.
 4. The [CB-18] attestation verifies as Ed25519 over `"catbird.labyrinth.epoch_head_attest:" || did || ":" || epochHead`.
 5. The attesting key is the `signing_public_key` of a `chat.device_keys` row for `did` with `revoked_at IS NULL` and `chat.devices.status='active'`. Those tables are at `migrations/20260722000001_chat_protocol_core.sql:305` and `:337`.
-6. The caller is a chat device of `did`, and the attesting key is the caller's own key.
-
-Who may publish depends on where the DID's mailbox lives:
-- **Mailbox in mls-ds** (the DID has a `labyrinth.mailboxes` row): the caller must be a bound device, and the head must be an epoch the mailbox already holds. `publishEpochHead` only re-publishes.
-- **Mailbox in a Space** (no row): mls-ds holds nothing to compare against, so it records the head itself under checks 1–6. No binding is needed, and `deleteOrfState` likewise needs none. A compromised chat device of the DID could publish the next head first, but that is the same reach it already has over the DID's chat, and the client sees it as a `DirectoryFork` against the PDS head.
+6. The caller is a chat device of `did`.
 
 Re-sending identical bytes for an existing `(did, n)` succeeds. Different bytes fail with `EpochHeadConflict`. mls-ds does **not** verify the XEdDSA `selfSig`/`prevSig`, because clients already verify them (`src/client/pins.rs:79-92`). Checks 1–5 are enough to make the server-side head chain monotone and anchored to live MLS identity.
 
@@ -119,7 +115,7 @@ Errors common to every endpoint: `NotAuthorized`, `AccountSessionExpired`, `Devi
 
 | NSID | Kind | Input → output | Extra errors |
 |---|---|---|---|
-| `publishEpochHead` | proc | `{epoch: defs#epochPublic}` → `{}` (the §1a checks) | `InvalidEpochChain`, `EpochHeadConflict`, `AttestationNotCurrent`, `AttestationNotCaller`; for an mls-ds mailbox also `EpochNotFound`, `LabyrinthDeviceNotBound` |
+| `publishEpochHead` | proc | `{epoch: defs#epochPublic}` → `{}` (the §1a checks) | `InvalidEpochChain`, `EpochHeadConflict`, `AttestationNotCurrent` |
 | `getEpochHead` | query | `did, epochNumber?` (absent means latest) → `{epoch, receivedAt}` | `EpochNotFound` |
 | `getChatDeviceKeys` | query | `did` → `{keyId, signingPublicKey, createdAt, revokedAt?}[]` | — |
 

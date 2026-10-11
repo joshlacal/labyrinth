@@ -12,14 +12,14 @@ use labyrinth::Error;
 use labyrinth::device::{ChatBinding, DeviceSecrets};
 use labyrinth::mek::{Mek, distribute_transport};
 use labyrinth::message::seal_sender;
-use labyrinth::records::{Batch, Device, MailboxKeysRecord, MekDistribution, datetime_from_ms};
+use labyrinth::records::{Batch, Device, MekDistribution, datetime_from_ms};
 use labyrinth::sign::Ed25519Transport;
 use labyrinth::store::memory::MemoryBackend;
 use labyrinth::store::xrpc::server::MemoryXrpcServer;
 use labyrinth::store::xrpc::{
     NSID_PREFIX, XrpcDirectory, XrpcError, XrpcMailboxStore, XrpcThreadStore, map_error,
 };
-use labyrinth::store::{KeyPublisher, MailboxDirectory, MailboxStore, ThreadStore, TimeRange};
+use labyrinth::store::{MailboxDirectory, MailboxStore, ThreadStore, TimeRange};
 use serde_json::json;
 
 const A: &str = "did:plc:alice";
@@ -148,50 +148,6 @@ fn mailbox_create_get_and_replay() {
     // A revoked chat device is refused everywhere.
     s.backend().remove_chat_device(A, tpub(1), 5);
     assert_eq!(mb.list_devices(), Err(Error::Forbidden));
-}
-
-/// An account whose mailbox is in its PDS Space keeps none on mls-ds: any
-/// of its chat devices publishes its own heads and may purge, with no
-/// bound device. Once it keeps a mailbox here, the binding rules apply.
-#[test]
-fn a_space_account_publishes_heads_without_a_mailbox_here() {
-    let s = server();
-    s.backend().register_chat_device(A, tpub(2));
-    let dir = |seed: u8| XrpcDirectory::new(s.transport(A, tpub(seed)));
-    let head = |seed: u8, d: &DeviceSecrets| {
-        let g = labyrinth::epoch::open_genesis(A, d, &signer(seed)).unwrap();
-        g.1.record.public
-    };
-    let keys = |e: &labyrinth::mailbox::EpochPublic| {
-        MailboxKeysRecord::from_public(e, None, datetime_from_ms(1))
-    };
-    let d = DeviceSecrets::generate().unwrap();
-    let genesis = head(1, &d);
-
-    dir(1).publish(&keys(&genesis)).unwrap();
-    assert_eq!(dir(2).latest(A).unwrap(), Some(genesis.clone()));
-    // Only the calling device's own key attests; a second genesis is a fork.
-    assert!(matches!(
-        dir(2).publish(&keys(&genesis)),
-        Err(Error::Backend(m)) if m.contains("AttestationNotCaller")
-    ));
-    let fork = head(1, &DeviceSecrets::generate().unwrap());
-    assert_eq!(dir(1).publish(&keys(&fork)), Err(Error::Conflict));
-    // Account deletion needs no bound device either.
-    dir(2).retract().unwrap();
-    assert_eq!(dir(1).latest(A).unwrap(), None);
-
-    // With a mailbox here, a head must be one of its epochs, re-published
-    // by a bound device.
-    let mb = XrpcMailboxStore::new(A, s.transport(A, tpub(1)));
-    mb.create_device(&bound(&d, 1, &datetime_from_ms(1)))
-        .unwrap();
-    assert_eq!(
-        dir(1).publish(&keys(&genesis)),
-        Err(Error::NotFound("epoch"))
-    );
-    assert_eq!(dir(2).publish(&keys(&genesis)), Err(Error::Forbidden));
-    assert_eq!(dir(2).retract(), Err(Error::Forbidden));
 }
 
 #[test]

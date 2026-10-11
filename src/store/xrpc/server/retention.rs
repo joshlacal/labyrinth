@@ -73,10 +73,6 @@ pub(super) fn handle(
         "redactMessage" => redact(s, c, input),
         "purgeMailbox" | "deleteAccountData" => (|| {
             let _: Empty = body(input)?;
-            // mls-ds: a bound device, unless the mailbox is in the PDS Space.
-            if super::binding::hosts_mailbox(s, &c.did)? {
-                super::binding::require_bound(s, c, None)?;
-            }
             if name == "purgeMailbox" {
                 s.net.mailbox(&c.did).purge_mailbox().map_err(err)?;
             } else {
