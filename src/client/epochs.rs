@@ -170,13 +170,37 @@ impl Labyrinth {
     /// Create a new mailbox for `did`: a genesis device, epoch 0, and the
     /// public `mailboxKeys` record. Fails with [`Error::Conflict`] if the
     /// mailbox already has an epoch 0.
+    ///
+    /// Creating epoch 0 is the point of no return: after it, only this
+    /// client holds the keys that open the mailbox. So the steps after it,
+    /// the ORF registration and publishing, do not fail the call (that
+    /// would discard the only copy of the genesis keys and leave epoch 0
+    /// squatted). Use [`initialize_with_report`](Self::initialize_with_report)
+    /// to see such a failure, and retry with
+    /// [`finish_initialize`](Self::finish_initialize).
     pub fn initialize(
         did: &str,
         transport: Box<dyn TransportSigner + Send>,
         b: Backends,
     ) -> Result<Self> {
+        Self::initialize_with_report(did, transport, b).map(|(me, _)| me)
+    }
+
+    /// [`initialize`](Self::initialize), also returning the first error of
+    /// the steps after epoch 0 was created (`None` when the ORF state was
+    /// registered and every destination took the new `mailboxKeys`).
+    pub fn initialize_with_report(
+        did: &str,
+        transport: Box<dyn TransportSigner + Send>,
+        b: Backends,
+    ) -> Result<(Self, Option<Error>)> {
+        if b.mailbox.owner() != did || b.threads.author() != did {
+            return Err(Error::Malformed("store handles belong to another DID"));
+        }
         let device = DeviceSecrets::generate()?;
         let (pending, new) = open_genesis(did, &device, transport.as_ref())?;
+        let mut salt = [0u8; 32];
+        random(&mut salt)?;
         let now = crate::records::datetime_from_ms(b.clock.now_ms());
         let members: Vec<_> = new
             .members
@@ -193,13 +217,24 @@ impl Labyrinth {
         let id = b
             .mailbox
             .create_epoch(&Epoch::from_record(&new.record, now), &members)?;
-        b.orf.register(&key, None)?;
-        let mut salt = [0u8; 32];
-        random(&mut salt)?;
         let mut me = Self::assemble(did, device, transport, b, salt, [pending.assign_id(id)])?;
         me.remember_verified(0, [key.0]);
-        me.publish_keys(&new.record.public)?;
-        Ok(me)
+        let unfinished = me.finish_initialize().err();
+        Ok((me, unfinished))
+    }
+
+    /// The steps of [`initialize`](Self::initialize) after epoch 0: register
+    /// this genesis device's ORF state (an existing state is kept) and
+    /// publish epoch 0. Safe to repeat until it succeeds.
+    pub fn finish_initialize(&self) -> Result<()> {
+        let key = self.device.public().device_key_pub;
+        let orf = match self.b.orf.register(&key, None) {
+            Ok(()) | Err(Error::Conflict) => Ok(()),
+            Err(e) => Err(e),
+        };
+        // Publish even when the ORF is down: the directories don't need it.
+        let published = self.publish_latest_keys();
+        orf.and(published)
     }
 
     pub(super) fn epoch_record(&self, seq: u64) -> Result<(String, EpochRecord)> {
