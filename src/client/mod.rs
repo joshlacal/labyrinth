@@ -1,0 +1,265 @@
+//! High-level Labyrinth client over the [`crate::store`] traits.
+//!
+//! [`Labyrinth`] is one enrolled device of one account. It owns the
+//! device's secrets and its cache of epoch secrets, and turns the protocol
+//! layers into the operations a chat client needs:
+//!
+//! | Operation | Module |
+//! |---|---|
+//! | [`Labyrinth::initialize`], [`Labyrinth::sync_epochs`], [`Labyrinth::revoke_device`], [`Labyrinth::check_epoch_integrity`] | [`epochs`] |
+//! | recovery codes, passkey wrap, one-time-code enrollment | [`enroll`] |
+//! | [`Labyrinth::archive_outgoing`], [`Labyrinth::flush`] | [`send`] |
+//! | [`Labyrinth::load_thread`], [`Labyrinth::archive_owner`], [`Labyrinth::rearchive_thread_before_leave`] | [`read`] |
+//! | [`Labyrinth::peer_pin`] (epoch pinning, [CB-29]), [`Labyrinth::propose_repin`] / [`Labyrinth::repin_peer`] | [`pins`] |
+//! | [`CompositeDirectory`] (PDS × mls-ds cross-check, [CB-28]) | [`composite`] |
+//! | [`Labyrinth::export_state`], [`Labyrinth::from_state`] | [`state`] |
+//!
+//! The client is synchronous and holds no locks; callers serialize access
+//! to one instance (the store traits explain why). Its state (device
+//! secrets, epoch cache, revoked set, peer pins, MEK cache) survives a
+//! restart through [`Labyrinth::export_state`] / [`Labyrinth::from_state`]
+//! ([`state`]); the exported bytes are secret and belong in the keychain or
+//! SQLCipher.
+//!
+//! Before using anyone's epoch keys the client checks [CB-18]: the
+//! epoch's attestation key must be one of that DID's chat devices as the
+//! [`MailboxDirectory`] reports them.
+
+pub mod archive;
+pub mod attach;
+pub mod composite;
+pub mod delete;
+pub mod enroll;
+pub mod epochs;
+pub mod lookup;
+pub mod members;
+pub mod pins;
+pub mod read;
+pub mod recovery;
+pub mod send;
+pub mod state;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+pub use composite::CompositeDirectory;
+pub use delete::{PurgeReport, delete_account_remote};
+pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
+pub use epochs::{RotationReport, SyncReport};
+pub use lookup::{ThreadCursor, ThreadList, ThreadPage, ThreadSummary};
+pub use members::{ExcludedMember, ExclusionReason};
+pub use pins::{PeerPin, RepinProposal};
+pub use read::{LoadedMessage, MessageSource, RedactedMessage, ThreadHistory, Undecryptable};
+pub use recovery::{AUTO_RECOVERY_TTL_MS, RecoveryMethod, recovery_expiry};
+pub use send::{ArchiveOutcome, FlushedBatch, ResolvedRoster, RosterExclusion};
+
+use crate::device::{DevicePublic, DeviceSecrets};
+use crate::epoch::{EpochKeys as _, EpochSecret};
+use crate::mailbox::EpochPublic;
+use crate::mek::Mek;
+use crate::message::{OwnerMessage, SealedMessage};
+use crate::records::datetime_from_ms;
+use crate::sign::TransportSigner;
+use crate::store::{
+    KeyPublisher, MailboxDirectory, MailboxStore, OrfServer, ThreadStore, VouchAt, keys_valid_for,
+};
+use crate::{Error, Result};
+
+/// Wall-clock source (milliseconds since the Unix epoch) for `createdAt`.
+pub trait Clock {
+    fn now_ms(&self) -> u64;
+}
+
+/// [`Clock`] backed by [`std::time::SystemTime`].
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64)
+    }
+}
+
+/// Everything the client talks to.
+pub struct Backends {
+    /// The account's own personal mailbox.
+    pub mailbox: Box<dyn MailboxStore + Send>,
+    /// The conversation spaces, writing as this account.
+    pub threads: Box<dyn ThreadStore + Send>,
+    /// Discovery of other accounts and of MLS chat devices; a
+    /// [`CompositeDirectory`] over the PDS and mls-ds in production.
+    pub directory: Box<dyn MailboxDirectory + Send>,
+    /// The ORF server (mls-ds, [CB-17]). The client registers each new
+    /// device's evolved state and deletes a revoked device's state.
+    pub orf: Box<dyn OrfServer + Send>,
+    /// Where every new epoch is published besides
+    /// [`MailboxStore::publish_mailbox_keys`]: the mls-ds directory for a
+    /// Space mailbox, the PDS `mailboxKeys` record for an mls-ds mailbox,
+    /// so both directories stay current ([CB-28]).
+    pub publishers: Vec<Box<dyn KeyPublisher + Send>>,
+    pub clock: Box<dyn Clock + Send>,
+}
+
+/// One enrolled device of one account.
+pub struct Labyrinth {
+    did: String,
+    device: DeviceSecrets,
+    transport: Box<dyn TransportSigner + Send>,
+    b: Backends,
+    mailbox_root_salt: [u8; 32],
+    /// Epoch secrets this device holds, by sequence number.
+    epochs: BTreeMap<u64, EpochSecret>,
+    /// Newest epoch this device has reached.
+    latest: u64,
+    /// My epoch heads → sequence numbers (filled lazily from the store).
+    heads: HashMap<[u8; 32], u64>,
+    /// `deviceKeyPub`s this client revoked; every rotation excludes them,
+    /// whatever the store says about `revokedAt`.
+    revoked: BTreeSet<[u8; 32]>,
+    /// Members of one epoch (the sequence number) this client verified;
+    /// a later verification failure for one of them is store tampering
+    /// ([`Error::MemberTampered`]), not a planted row.
+    verified: (u64, BTreeSet<[u8; 32]>),
+    /// Newest accepted epoch of every peer this client addressed ([CB-29]).
+    pins: BTreeMap<String, PeerPin>,
+    /// MEKs minted or opened here, per thread, newest last.
+    meks: HashMap<String, Vec<Mek>>,
+    outbox: BTreeMap<String, Vec<SealedMessage>>,
+    owner_outbox: BTreeMap<String, Vec<OwnerMessage>>,
+}
+
+impl core::fmt::Debug for Labyrinth {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Labyrinth")
+            .field("did", &self.did)
+            .field("latest", &self.latest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Labyrinth {
+    fn assemble(
+        did: &str,
+        device: DeviceSecrets,
+        transport: Box<dyn TransportSigner + Send>,
+        b: Backends,
+        mailbox_root_salt: [u8; 32],
+        epochs: impl IntoIterator<Item = EpochSecret>,
+    ) -> Result<Self> {
+        if b.mailbox.owner() != did || b.threads.author() != did {
+            return Err(Error::Malformed("store handles belong to another DID"));
+        }
+        let epochs: BTreeMap<u64, EpochSecret> = epochs.into_iter().map(|e| (e.seq, e)).collect();
+        let latest = *epochs.keys().next_back().ok_or(Error::NotFound("epoch"))?;
+        Ok(Self {
+            did: did.to_owned(),
+            device,
+            transport,
+            b,
+            mailbox_root_salt,
+            epochs,
+            latest,
+            heads: HashMap::new(),
+            revoked: BTreeSet::new(),
+            verified: (latest, BTreeSet::new()),
+            pins: BTreeMap::new(),
+            meks: HashMap::new(),
+            outbox: BTreeMap::new(),
+            owner_outbox: BTreeMap::new(),
+        })
+    }
+
+    /// The account DID.
+    pub fn did(&self) -> &str {
+        &self.did
+    }
+
+    /// This device's public record.
+    pub fn device_public(&self) -> &DevicePublic {
+        self.device.public()
+    }
+
+    /// This device's chat transport key ([CB-3]).
+    pub fn transport_public_key(&self) -> [u8; 32] {
+        self.transport.transport_public_key()
+    }
+
+    /// Sequence number of the newest epoch this device has reached.
+    pub fn latest_epoch(&self) -> u64 {
+        self.latest
+    }
+
+    /// The published data of the newest epoch this device has reached.
+    pub fn latest_public(&self) -> Result<EpochPublic> {
+        Ok(self.epoch_record(self.latest)?.1.public)
+    }
+
+    fn now(&self) -> String {
+        datetime_from_ms(self.b.clock.now_ms())
+    }
+
+    /// Verifies `epoch` for `did` and checks [CB-18]: its attestation key is
+    /// one of the DID's chat devices that may vouch at `at` — a current one
+    /// for [`VouchAt::Current`], otherwise one not yet revoked when the
+    /// record that carries the epoch was written ([CB-27]).
+    fn check_attested(&self, did: &str, epoch: &EpochPublic, at: VouchAt) -> Result<()> {
+        epoch.verify(did, None)?;
+        let keys = self.transport_keys(did, None, at)?;
+        if keys.contains(&epoch.attestation.transport_public_key) {
+            Ok(())
+        } else {
+            Err(Error::Unattested)
+        }
+    }
+
+    /// `did`'s chat transport keys that may vouch for a record written at
+    /// `at` ([CB-27]). With `thread` set and a server stamp, the key must
+    /// also have had a leaf in that conversation at the stamp's chat seq
+    /// (when the directory reports the conversation's leaves).
+    fn transport_keys(
+        &self,
+        did: &str,
+        thread: Option<&str>,
+        at: VouchAt,
+    ) -> Result<Vec<[u8; 32]>> {
+        let keys = self.b.directory.device_transport_keys(did)?;
+        let leaves = match (thread, at) {
+            (Some(t), VouchAt::Server(_)) => self.b.directory.member_device_keys(t, did)?,
+            _ => None,
+        };
+        Ok(keys_valid_for(&keys, leaves.as_deref(), at))
+    }
+
+    /// [`check_attested`](Self::check_attested) against the DID's
+    /// *current* chat devices, then the [CB-29] pin: the epoch a MEK is
+    /// about to be addressed to.
+    fn accept_for_addressing(&mut self, did: &str, epoch: &EpochPublic) -> Result<()> {
+        self.check_attested(did, epoch, VouchAt::Current)?;
+        self.pin_peer(did, epoch)
+    }
+
+    /// The full ORF evaluation for this device (SPEC §3.6, §8):
+    /// `orf_client_map` under this device's client state and
+    /// `client_domain`, then the ORF server's map under this device's
+    /// server state and `server_domain`. Evolving to a restored or newly
+    /// enrolled device preserves the output, so indexes derived from it
+    /// survive device changes.
+    pub fn orf_evaluate(
+        &self,
+        client_domain: &[u8],
+        server_domain: &[u8],
+        input: &[u8],
+    ) -> Result<[u8; 32]> {
+        let id = crate::orf::orf_client_map(&self.device.orf, client_domain, input);
+        self.b
+            .orf
+            .map(&self.device.public().device_key_pub, server_domain, &id)
+    }
+
+    /// My epoch `seq` (backward-chained if needed) and its mailbox keys.
+    fn my_keys(&mut self, seq: u64) -> Result<(EpochSecret, crate::mailbox::MailboxKeys)> {
+        let e = self.epoch_secret(seq)?;
+        let keys = e.mailbox_keys();
+        Ok((e, keys))
+    }
+}
