@@ -235,3 +235,10 @@ Chose (provisional):
 - **Live check.** `tests/live_space_pds.rs` (opt-in, `LABYRINTH_SPACE_PDS`) runs enrollment, revocation, restore, re-archive, recovery-method removal and purge against the upstream dev PDS started by `scripts/space-pds/start.mjs`, with `mailboxKeys` in the public repo over `com.atproto.repo.*` and the production directory composition. It passed on 2026-10-11 against `5b95b2f2`, and corrected two assumptions in the reference host: writes need no prior `createSpace`, and an unwritten own repo lists as empty rather than `RepoNotFound`.
 
 Reversible until: merge of `labyrinth-1.1`. Override by: edit `src/store/space/*` (`tests/e2e_space.rs`, `tests/live_space_pds.rs`). Revisit when the upstream repo-format rework and #119 land.
+
+## 2026-10-11 · labyrinth · Initialization keeps the genesis keys
+Context: a review (Codex, on #1) found that `initialize` discarded the only copy of the genesis device and epoch-0 secrets when ORF registration, randomness or publishing failed after epoch 0 was created, leaving epoch 0 squatted and the mailbox unusable.
+
+Chose: the DID check and randomness move before the first mailbox write. The wire order is unchanged (`createDevice`, `createEpoch`, `registerOrfState`, publish), so the mls-ds trace fixture still replays. The steps after epoch 0, ORF registration and publishing, no longer fail `initialize`: `initialize_with_report` returns the first error, and `finish_initialize` retries both (an existing ORF state counts as done). It publishes every epoch from 0 up, so a rotation made before the retry cannot leave the mls-ds head chain without epoch 0. During the replay a PDS's `mailboxKeys/self` briefly names an older epoch. Until then the device cannot use attachment references, and peers see the account as not enrolled in any directory that missed the publish.
+
+Reversible until: merge of `labyrinth-1.1`. Override by: edit `Labyrinth::initialize_with_report` in `src/client/epochs.rs` (`tests/init_recovery.rs`).
