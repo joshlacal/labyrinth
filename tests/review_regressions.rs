@@ -862,3 +862,123 @@ fn a_peer_minted_mek_is_never_reused_for_outgoing() {
         .unwrap();
     assert!(out.mek_written.is_none());
 }
+
+// ---- 2026-10-13 review, I3: the starting epoch record's signatures ----
+
+/// Mailbox whose stored epoch records come back with a corrupted
+/// `selfSig` while the flag is set (head and keys left intact).
+struct TamperedSelfSig(MemoryMailbox, Arc<AtomicBool>);
+impl MailboxStore for TamperedSelfSig {
+    fn owner(&self) -> &str {
+        self.0.owner()
+    }
+    fn create_device(&self, d: &Device) -> labyrinth::Result<()> {
+        self.0.create_device(d)
+    }
+    fn set_device_revoked(&self, k: &XVerifyingKey, at: &str) -> labyrinth::Result<()> {
+        self.0.set_device_revoked(k, at)
+    }
+    fn get_device(&self, k: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
+        self.0.get_device(k)
+    }
+    fn list_devices(&self) -> labyrinth::Result<Vec<Device>> {
+        self.0.list_devices()
+    }
+    fn create_epoch(&self, e: &Epoch, m: &[EpochMember]) -> labyrinth::Result<String> {
+        self.0.create_epoch(e, m)
+    }
+    fn get_epoch(&self, s: u64) -> labyrinth::Result<Option<Stored<Epoch>>> {
+        let mut e = self.0.get_epoch(s)?;
+        if self.1.load(Ordering::Relaxed)
+            && let Some(e) = e.as_mut()
+        {
+            e.value.public.self_sig.0[0] ^= 1;
+        }
+        Ok(e)
+    }
+    fn list_epochs(&self) -> labyrinth::Result<Vec<Stored<Epoch>>> {
+        self.0.list_epochs()
+    }
+    fn create_epoch_member(&self, m: &EpochMember) -> labyrinth::Result<()> {
+        self.0.create_epoch_member(m)
+    }
+    fn list_epoch_members(&self, s: u64) -> labyrinth::Result<Vec<EpochMember>> {
+        self.0.list_epoch_members(s)
+    }
+    fn create_virtual_device(&self, v: &VirtualDevice) -> labyrinth::Result<()> {
+        self.0.create_virtual_device(v)
+    }
+    fn get_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<Option<VirtualDevice>> {
+        self.0.get_virtual_device(id)
+    }
+    fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
+        self.0.list_virtual_devices()
+    }
+    fn append_owner_batch(&self, b: &OwnerBatch) -> labyrinth::Result<String> {
+        self.0.append_owner_batch(b)
+    }
+    fn list_owner_batches(
+        &self,
+        t: &str,
+        r: TimeRange,
+    ) -> labyrinth::Result<Vec<Stored<OwnerBatch>>> {
+        self.0.list_owner_batches(t, r)
+    }
+    fn publish_mailbox_keys(&self, r: &MailboxKeysRecord) -> labyrinth::Result<()> {
+        self.0.publish_mailbox_keys(r)
+    }
+}
+
+#[test]
+fn a_tampered_starting_epoch_record_is_not_adopted() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    let mut alice = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let state = alice.export_state().unwrap();
+    let tamper = Arc::new(AtomicBool::new(true));
+    let tampered = || Box::new(TamperedSelfSig(net.mailbox(A), tamper.clone()));
+
+    // Restart: the stored latest epoch record must verify.
+    let restored = Labyrinth::from_state(
+        &state,
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, tampered()),
+    );
+    assert!(restored.is_err(), "restart adopted a tampered epoch record");
+
+    // OTC enrollment: no forward epochs, so only the starting record.
+    let mut r = alice.otc_offer().unwrap();
+    let typed = r.code().as_str().to_owned();
+    let (init, hello) = Labyrinth::otc_start(A, &typed).unwrap();
+    let reply = alice.otc_respond(&mut r, &hello).unwrap();
+    net.register_chat_device(A, tpub(5));
+    let enrolled = Labyrinth::enroll_via_otc(
+        A,
+        init,
+        &reply.message,
+        &reply.sealed_payload,
+        Box::new(signer(5)),
+        backends(&net, &clock, A, tampered()),
+    );
+    assert!(
+        enrolled.is_err(),
+        "enrollment adopted a tampered epoch record"
+    );
+
+    // Untampered, both succeed.
+    tamper.store(false, Ordering::Relaxed);
+    Labyrinth::from_state(
+        &state,
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, tampered()),
+    )
+    .unwrap();
+}

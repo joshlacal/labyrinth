@@ -359,6 +359,7 @@ impl Labyrinth {
             return Err(Error::Malformed("state epoch id does not match store"));
         }
         verify_public(newest, &record.public)?;
+        record.public.verify(&me.did, None)?;
         me.revoked = revoked;
         me.verified = verified;
         me.pins = pins;
