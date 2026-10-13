@@ -769,3 +769,96 @@ fn restarted_client_still_enforces_peer_pins() {
         }
     );
 }
+
+// ---- 2026-10-13 review, I2: peer-minted MEKs are not reused ----
+
+/// Mallory's thread handle: every MEK she distributes carries a corrupted
+/// ciphertext for Bob, which only Bob can detect.
+struct BlackholesBob(labyrinth::store::memory::MemoryThreads);
+impl labyrinth::store::ThreadStore for BlackholesBob {
+    fn author(&self) -> &str {
+        self.0.author()
+    }
+    fn create_mek(&self, mek: &labyrinth::records::MekDistribution) -> labyrinth::Result<()> {
+        let mut mek = mek.clone();
+        for r in mek.recipients.iter_mut().filter(|r| r.did == B) {
+            r.ciphertext.0[0] ^= 1;
+        }
+        self.0.create_mek(&mek)
+    }
+    fn find_meks(
+        &self,
+        t: &str,
+        id: &[u8; 12],
+    ) -> labyrinth::Result<Vec<Stored<labyrinth::records::MekDistribution>>> {
+        self.0.find_meks(t, id)
+    }
+    fn append_batch(&self, b: &labyrinth::records::Batch) -> labyrinth::Result<String> {
+        self.0.append_batch(b)
+    }
+    fn list_batches(
+        &self,
+        t: &str,
+        s: Option<&str>,
+        r: TimeRange,
+    ) -> labyrinth::Result<Vec<Stored<labyrinth::records::Batch>>> {
+        self.0.list_batches(t, s, r)
+    }
+}
+
+#[test]
+fn a_peer_minted_mek_is_never_reused_for_outgoing() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    const M: &str = "did:plc:mallory";
+    net.register_chat_device(A, tpub(1));
+    net.register_chat_device(B, tpub(3));
+    net.register_chat_device(M, tpub(2));
+    let mk = |did: &str, seed: u8| {
+        Labyrinth::initialize(
+            did,
+            Box::new(signer(seed)),
+            backends(&net, &clock, did, Box::new(net.mailbox(did))),
+        )
+        .unwrap()
+    };
+    let mut alice = mk(A, 1);
+    let mut bob = mk(B, 3);
+    let mut mal = Labyrinth::initialize(
+        M,
+        Box::new(signer(2)),
+        Backends {
+            threads: Box::new(BlackholesBob(net.threads(M))),
+            ..backends(&net, &clock, M, Box::new(net.mailbox(M)))
+        },
+    )
+    .unwrap();
+    let group = [A, B, M];
+
+    let roster = mal.resolve_roster(&group).unwrap();
+    mal.archive_outgoing("t", &roster, "m1", 1000, b"from mallory")
+        .unwrap();
+    mal.flush().unwrap();
+    // Alice opens Mallory's MEK through her own (intact) entry.
+    let h = alice.load_thread("t", TimeRange::ALL).unwrap();
+    assert!(h.messages.iter().any(|m| m.frame == b"from mallory"));
+
+    // Alice's next message must not ride on Mallory's MEK.
+    let roster = alice.resolve_roster(&group).unwrap();
+    let out = alice
+        .archive_outgoing("t", &roster, "a1", 2000, b"from alice")
+        .unwrap();
+    assert!(out.mek_written.is_some(), "reused a peer-minted MEK");
+    alice.flush().unwrap();
+    let h = bob.load_thread("t", TimeRange::ALL).unwrap();
+    assert!(
+        h.messages.iter().any(|m| m.frame == b"from alice"),
+        "Bob was blackholed from Alice's message"
+    );
+
+    // Alice still reuses the MEK she minted herself.
+    let out = alice
+        .archive_outgoing("t", &roster, "a2", 3000, b"again")
+        .unwrap();
+    assert!(out.mek_written.is_none());
+}
