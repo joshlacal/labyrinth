@@ -93,6 +93,15 @@ pub(super) fn handle(
                 .collect();
             require_registered(s, c, &keys)?;
             let public = i.epoch.public.to_public().map_err(err)?;
+            // mls-ds `record_head`: only the calling chat device's own key
+            // may attest, as for publishEpochHead.
+            if public.attestation.transport_public_key != c.device {
+                return Err(XrpcError::named(
+                    400,
+                    "AttestationNotCaller",
+                    "the head is not attested by the calling chat device",
+                ));
+            }
             s.net.record_ds_head(&c.did, &public).map_err(err)?;
             let id = mb.create_epoch(&i.epoch, &i.members).map_err(err)?;
             json(&CreateEpochOut {

@@ -12,7 +12,9 @@ use labyrinth::Error;
 use labyrinth::device::{ChatBinding, DeviceSecrets};
 use labyrinth::mek::{Mek, distribute_transport};
 use labyrinth::message::seal_sender;
-use labyrinth::records::{Batch, Device, MailboxKeysRecord, MekDistribution, datetime_from_ms};
+use labyrinth::records::{
+    Batch, Device, Epoch, EpochMember, MailboxKeysRecord, MekDistribution, datetime_from_ms,
+};
 use labyrinth::sign::Ed25519Transport;
 use labyrinth::store::memory::MemoryBackend;
 use labyrinth::store::xrpc::server::MemoryXrpcServer;
@@ -192,6 +194,39 @@ fn a_space_account_publishes_heads_without_a_mailbox_here() {
     );
     assert_eq!(dir(2).publish(&keys(&genesis)), Err(Error::Forbidden));
     assert_eq!(dir(2).retract(), Err(Error::Forbidden));
+}
+
+/// mls-ds `record_head` lets only the calling chat device's own key attest
+/// a head, on createEpoch as on publishEpochHead: another current chat
+/// device of the same DID cannot open the epoch for it.
+#[test]
+fn create_epoch_needs_the_callers_own_attestation() {
+    let s = server();
+    s.backend().register_chat_device(A, tpub(2));
+    let d = DeviceSecrets::generate().unwrap();
+    let mb = XrpcMailboxStore::new(A, s.transport(A, tpub(1)));
+    mb.create_device(&bound(&d, 1, &datetime_from_ms(1)))
+        .unwrap();
+    let opened = |seed: u8| {
+        let new = labyrinth::epoch::open_genesis(A, &d, &signer(seed))
+            .unwrap()
+            .1;
+        let at = datetime_from_ms(1);
+        let members: Vec<EpochMember> = new
+            .members
+            .iter()
+            .map(|m| EpochMember::from_record(m, at.clone()))
+            .collect();
+        (Epoch::from_record(&new.record, at), members)
+    };
+    let (foreign, members) = opened(2);
+    assert!(matches!(
+        mb.create_epoch(&foreign, &members),
+        Err(Error::Backend(m)) if m.contains("AttestationNotCaller")
+    ));
+    assert_eq!(mb.get_epoch(0).unwrap(), None);
+    let (own, members) = opened(1);
+    mb.create_epoch(&own, &members).unwrap();
 }
 
 #[test]
