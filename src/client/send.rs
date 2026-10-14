@@ -121,7 +121,7 @@ impl Labyrinth {
     /// must pass the DID's [CB-29] pin ([`crate::Error::EpochRollback`]).
     ///
     /// A cached MEK is reused only under the reuse rules (p.38–39,
-    /// [CB-23]); otherwise a fresh MEK is distributed to the roster and its
+    /// [CB-23], [CB-42]); otherwise a fresh MEK is distributed to the roster and its
     /// record written first. The sealed message is buffered and flushed as
     /// a `batch` record at [`MAX_BATCH_ITEMS`] items or
     /// [`BATCH_BYTE_BUDGET`] bytes, or on [`flush`](Self::flush). Every
@@ -146,10 +146,12 @@ impl Labyrinth {
         let heads: Vec<[u8; 32]> = full.iter().map(|(_, e)| e.head).collect();
 
         let mut out = ArchiveOutcome::default();
-        let cached = self
-            .meks
-            .get(thread_id)
-            .and_then(|v| v.iter().rev().find(|m| m.reusable_for(&heads)).cloned());
+        let cached = self.meks.get(thread_id).and_then(|v| {
+            v.iter()
+                .rev()
+                .find(|m| m.reusable_for(&me, &heads))
+                .cloned()
+        });
         let mek = match cached {
             Some(m) => m,
             None => {

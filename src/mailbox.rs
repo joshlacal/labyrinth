@@ -177,6 +177,11 @@ impl EpochPublic {
             }
             return Ok(());
         }
+        // [CB-35]: above epoch 0 the chain link is mandatory, whether or not
+        // the caller has the previous record to check it against.
+        if self.prev_head.is_none() {
+            return Err(Error::Malformed("missing prev_head"));
+        }
         if self.prev_sig.is_none() {
             return Err(Error::Malformed("missing prev_sig"));
         }
@@ -236,6 +241,34 @@ mod tests {
         let forged =
             EpochPublic::sign(did, 1, &k1, Some(e0.head), Some(&k2.sig_secret), &t).unwrap();
         assert!(forged.verify(did, Some(&e0)).is_err());
+    }
+
+    /// [CB-35]: a record above epoch 0 with a null previous head is rejected
+    /// even by a standalone verifier that has no previous record to link to.
+    #[test]
+    fn null_prev_head_above_epoch_zero_is_rejected_standalone() {
+        let did = "did:plc:testvector";
+        let t = transport();
+        let k1 = MailboxKeys::derive(&[2u8; 32], 1);
+        let keys = k1.public();
+        let head = epoch_head(1, &keys, None, did);
+        let forged = EpochPublic {
+            seq: 1,
+            keys,
+            prev_head: None,
+            head,
+            self_sig: k1
+                .sig_secret
+                .sign(&prefixed(SELF_SIG_PREFIX, &head))
+                .unwrap(),
+            prev_sig: Some([0u8; 64]),
+            attestation: TransportAttestation {
+                transport_public_key: t.transport_public_key(),
+                sig: t.sign_transport(&attest_message(did, &head)),
+            },
+        };
+        assert!(forged.verify(did, None).is_err());
+        assert!(EpochPublic::sign(did, 1, &k1, None, None, &t).is_err());
     }
 
     #[test]

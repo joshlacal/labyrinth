@@ -402,7 +402,8 @@ ct  = hawk_encrypt(recip.encPub, ephPriv, ephPub, aad, mek)
   - That is what stops a removed member from reading anything new, and stops a new member from reading anything older than their join.
 - **Reuse rule (p.38–39).** A sender reuses a cached MEK only if both hold (`Mek::reusable_for(currentHeads)`):
   1. its roster hash equals `rosterHash(currentHeads)`, the caller's view of every roster member's latest head;
-  2. it is authenticated to some participant's latest epoch keys. A Labyrinth MEK is authenticated by the sender's epoch auth key, so rule 2 holds iff its `senderEpochHead` is in `currentHeads`. This applies equally to the device that distributed it and to a member who opened it.
+  2. it is authenticated to some participant's latest epoch keys. A Labyrinth MEK is authenticated by the sender's epoch auth key, so rule 2 holds iff its `senderEpochHead` is in `currentHeads`.
+  - **[CB-42]** Only a Labyrinth MEK this account minted (`senderDid` = own DID, from any of its devices) is reused (`Mek::reusable_for(myDid, currentHeads)`). A member who opened someone else's MEK can check only its own recipient entry, so the minter could have sent another member a ciphertext that does not open; reusing that MEK would silently cut that member out of the reader's messages until the roster changes. Readers mint and distribute their own MEK instead.
   - **[CB-23]** A transport MEK is authenticated by no epoch key. Only the device that minted it may reuse it (under rule 1); members who opened it never reuse it and mint their own Labyrinth MEK instead. A freshly generated, undistributed MEK is never reusable.
 
 ### 7.4 Loading (p.41)

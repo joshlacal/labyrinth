@@ -51,20 +51,22 @@ fn three_members_share_a_labyrinth_mek() {
     assert_eq!(open_sender(&sealed, THREAD, &for_bob).unwrap(), b"hi all");
     assert_eq!(open_sender(&sealed, THREAD, &for_carol).unwrap(), b"hi all");
 
-    // Bob reuses the MEK he received to reply (rule 1 and rule 2 hold).
+    // Rules 1 and 2 hold for everyone, but only Alice, who minted the MEK,
+    // reuses it ([CB-42]); Bob replies under a MEK of his own.
     let current = heads(&[&carol, &alice, &bob]);
-    assert!(for_bob.reusable_for(&current));
-    let reply = seal_sender(
-        &for_bob,
+    assert!(for_alice.reusable_for(&alice.did, &current));
+    assert!(!for_bob.reusable_for(&bob.did, &current));
+    let follow_up = seal_sender(
+        &for_alice,
         THREAD,
         "msg-2",
         1_700_000_000_456,
         b"hey",
-        &bob.transport,
+        &alice.transport,
     )
     .unwrap();
-    assert_eq!(open_sender(&reply, THREAD, &mek).unwrap(), b"hey");
-    assert!(verify_sender_device(&reply, &[alice.transport_pub()]).is_err());
+    assert_eq!(open_sender(&follow_up, THREAD, &for_bob).unwrap(), b"hey");
+    assert!(verify_sender_device(&follow_up, &[bob.transport_pub()]).is_err());
 }
 
 #[test]
@@ -135,13 +137,13 @@ fn changing_a_recipient_head_breaks_the_roster() {
 fn removing_carol_forces_a_new_mek_she_cannot_open() {
     let (alice, bob, carol) = trio();
     let (old, _) = labyrinth_mek(&alice, &[&alice, &bob, &carol]);
-    assert!(old.reusable_for(&heads(&[&alice, &bob, &carol])));
+    assert!(old.reusable_for(&alice.did, &heads(&[&alice, &bob, &carol])));
 
     let after = heads(&[&alice, &bob]);
-    assert!(!old.reusable_for(&after));
+    assert!(!old.reusable_for(&alice.did, &after));
     let (new, record) = labyrinth_mek(&alice, &[&alice, &bob]);
     assert_ne!(new.roster_hash(), old.roster_hash());
-    assert!(new.reusable_for(&after));
+    assert!(new.reusable_for(&alice.did, &after));
     assert_eq!(
         carol.open(&record, Some(&alice)).unwrap_err(),
         Error::NotRecipient
@@ -161,7 +163,7 @@ fn a_member_rotating_epochs_invalidates_the_mek() {
     let (alice, bob, carol) = trio();
     let (mek, _) = labyrinth_mek(&alice, &[&alice, &bob, &carol]);
     let bob2 = Member::at_epoch("bob", 2, 0x77);
-    assert!(!mek.reusable_for(&heads(&[&alice, &bob2, &carol])));
+    assert!(!mek.reusable_for(&alice.did, &heads(&[&alice, &bob2, &carol])));
     // Distributing a MEK minted for the old roster to the new one is refused.
     let mut stale = mek.clone();
     let r = mek::distribute_labyrinth(
@@ -209,7 +211,10 @@ fn transport_sender_mek() {
     let mut mek = Mek::generate(&heads(&members)).unwrap();
     let record =
         mek::distribute_transport(THREAD, &mut mek, &device.transport, &roster(&members)).unwrap();
-    assert!(mek.reusable_for(&heads(&members)), "creator may reuse");
+    assert!(
+        mek.reusable_for(&device.did, &heads(&members)),
+        "creator may reuse"
+    );
 
     let for_bob = bob.open(&record, None).unwrap();
     assert_eq!(for_bob.secret(), mek.secret());
@@ -221,7 +226,7 @@ fn transport_sender_mek() {
         }
     );
     assert!(
-        !for_bob.reusable_for(&heads(&members)),
+        !for_bob.reusable_for(&bob.did, &heads(&members)),
         "not epoch-authenticated"
     );
 

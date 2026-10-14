@@ -131,15 +131,20 @@ impl Mek {
     ///    holds iff `sender_epoch_head` is one of `current_heads` (a rotated
     ///    sender epoch fails rule 1 as well). A transport MEK is authenticated
     ///    by no epoch; only the device that minted it may reuse it ([CB-23]).
-    pub fn reusable_for(&self, current_heads: &[[u8; 32]]) -> bool {
+    ///
+    /// On top of the paper's rules, only a MEK that `my_did` minted (any of
+    /// its devices) is reusable ([CB-42]): a reader can check only its own
+    /// recipient entry, so a peer's MEK may be blackholed for another member.
+    pub fn reusable_for(&self, my_did: &str, current_heads: &[[u8; 32]]) -> bool {
         if roster_hash(current_heads) != self.roster_hash {
             return false;
         }
         match &self.provenance {
             MekProvenance::Unsent => false,
             MekProvenance::Labyrinth {
-                sender_epoch_head, ..
-            } => current_heads.contains(sender_epoch_head),
+                sender_did,
+                sender_epoch_head,
+            } => sender_did == my_did && current_heads.contains(sender_epoch_head),
             MekProvenance::Transport { created_here, .. } => *created_here,
         }
     }
@@ -171,23 +176,27 @@ mod tests {
     fn reuse_rule() {
         let heads = [[1u8; 32], [2u8; 32]];
         let mut m = Mek::generate(&heads).unwrap();
-        assert!(!m.reusable_for(&heads), "unsent MEK");
+        assert!(!m.reusable_for("did:plc:a", &heads), "unsent MEK");
         m.set_provenance(MekProvenance::Labyrinth {
             sender_did: "did:plc:a".into(),
             sender_epoch_head: heads[0],
         });
-        assert!(m.reusable_for(&[heads[1], heads[0]]));
-        assert!(!m.reusable_for(&heads[..1]));
-        assert!(!m.reusable_for(&[heads[0], [3u8; 32]]));
+        assert!(m.reusable_for("did:plc:a", &[heads[1], heads[0]]));
+        assert!(
+            !m.reusable_for("did:plc:b", &[heads[1], heads[0]]),
+            "peer-minted"
+        );
+        assert!(!m.reusable_for("did:plc:a", &heads[..1]));
+        assert!(!m.reusable_for("did:plc:a", &[heads[0], [3u8; 32]]));
         m.set_provenance(MekProvenance::Transport {
             transport_pub: [9; 32],
             created_here: false,
         });
-        assert!(!m.reusable_for(&heads));
+        assert!(!m.reusable_for("did:plc:a", &heads));
         m.set_provenance(MekProvenance::Transport {
             transport_pub: [9; 32],
             created_here: true,
         });
-        assert!(m.reusable_for(&heads));
+        assert!(m.reusable_for("did:plc:a", &heads));
     }
 }

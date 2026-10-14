@@ -201,6 +201,9 @@ impl Labyrinth {
         let (id, start_record) = epoch_record(b.mailbox.as_ref(), seq)?;
         let start = PendingEpoch::new(seq, *restored.epoch.root()).assign_id(id);
         verify_public(&start, &start_record.public)?;
+        // The forward walk verifies every later record against its
+        // predecessor; the starting one needs its own signatures checked.
+        start_record.public.verify(did, None)?;
         let reached = chain_forward(
             b.mailbox.as_ref(),
             did,
@@ -303,6 +306,7 @@ impl Labyrinth {
             ));
         }
         verify_public(epoch, &record.public)?;
+        record.public.verify(did, None)?;
         check_integrity(b.directory.as_ref(), did, epoch.seq, &record.public.head)?;
         let (device, public, evolve_token, member) = payload.enroll()?;
         let now = datetime_from_ms(b.clock.now_ms());
