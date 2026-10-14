@@ -101,4 +101,4 @@ The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own known-an
 
 ## License
 
-MIT OR Apache-2.0 (see `Cargo.toml`); the `LICENSE` file carries the MIT text.
+MIT OR Apache-2.0, at your option (see `Cargo.toml`). `LICENSE` carries the MIT text and `LICENSE-APACHE` the Apache-2.0 text.

@@ -107,7 +107,7 @@ Reversible until: merge of `labyrinth-1.1`. Override by: reverting the individua
 
 ## 2026-10-04 · labyrinth · mls-ds backend (design Y1–Y8)
 The crate side of `docs/MLSDS_BACKEND.md` is built: server order on stored records, the per-conversation leaf view, the stamped removed-key rule ([CB-27]), `CompositeDirectory` ([CB-28], [CB-29]), ORF and head publishing from the client, single-MEK batches, and the `xrpc` feature (stores over the `blue.catbird.labyrinth.*` endpoints, plus a memory-backed reference server). The mls-ds server side (tables, endpoints, federation relay) is **not** built. Chose (provisional), as the design recommends:
-- **Y1.** labyrinth stays private; mls-ds re-implements the sha256 head recomputation and the Ed25519 attestation check and leaves XEdDSA to clients. *Override:* make labyrinth public and depend on its verifier.
+- **Y1.** labyrinth stays private; mls-ds re-implements the sha256 head recomputation and the Ed25519 attestation check and leaves XEdDSA to clients. *Override:* make labyrinth public and depend on its verifier. *Update 2026-10-14:* labyrinth is being made public, so the override is open; mls-ds still carries its own check.
 - **Y2.** No client-claimed "last seen seq" bound into batches or messages in v1; server stamps are enough, and a seq assigned after signing can't be signed. Revisit with MLS-authenticated heads.
 - **Y3.** Thread records live on the conversation's sequencer DS, with a home-DS relay (`labyrinthRelay`) for remote devices.
 - **Y4.** Batches are single-MEK (`MixedMekBatch`), so per-MEK read authorization is a row filter. The client now starts a new batch whenever the MEK changes (`src/client/send.rs`). *Cost:* more batch records when the roster churns.

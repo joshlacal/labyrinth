@@ -2,7 +2,7 @@
 
 **What this is.** This crate implements Labyrinth 1.1, Meta's protocol for encrypted chat *history*, in a Catbird profile (see `docs/SPEC.md`). It talks to storage only through three synchronous traits: `MailboxStore`, `ThreadStore` and `MailboxDirectory` (`src/store/mod.rs`). Today the only implementation is in memory. This document designs a second backend inside `mls-ds`, Catbird's Rust/Axum MLS delivery service (DS), along with the client store that talks to it. The design also closes the three residual risks left after the 2026-10-04 security review (SPEC §10; DECISIONS "security review fixes"). **Status:** the crate side (the trait changes in §6, `CompositeDirectory`, and the `xrpc` feature with a memory-backed reference server) is built; see DECISIONS "mls-ds backend (design Y1–Y8)" for where it deviates. The mls-ds server side is not built. The decisions in §6 are provisional (Yellow tier) and can be overridden before the `labyrinth-1.1` bookmark merges.
 
-All mls-ds references point at the merged line in `/Users/joshlacalamito/Developer/.workspaces/mls-ds-line-merge-20261004/mls-ds/`. Paths are relative to its `server/` directory.
+All mls-ds references point at the merged mls-ds line of 2026-10-04 (now the `labyrinth-backend-20261004` branch of `joshlacal/mls-ds`). Paths are relative to its `server/` directory, and line numbers may have drifted since.
 
 Glossary:
 - **MEK** (message encryption key): the per-roster key that senders use to encrypt history.
@@ -263,7 +263,7 @@ Rejected: putting the store inside catbird-mls. That would duplicate record know
 
 These should be appended to `docs/DECISIONS.md` when the design is accepted.
 
-- **Y1.** labyrinth stays private for now. mls-ds re-implements the small sha256 head recomputation and the Ed25519 attestation check itself, and leaves XEdDSA to clients. *Override:* make labyrinth public and depend on its verifier.
+- **Y1.** labyrinth stays private for now. mls-ds re-implements the small sha256 head recomputation and the Ed25519 attestation check itself, and leaves XEdDSA to clients. *Override:* make labyrinth public and depend on its verifier. *Update 2026-10-14:* labyrinth is being made public, so the override is open; mls-ds still carries its own check.
 - **Y2.** No client-claimed "last seen seq" bound into batches or messages in v1. Server stamps are enough, and the seq can't be bound into the signature because it is assigned after signing. Revisit with MLS-authenticated heads.
 - **Y3.** Thread records live on the sequencer DS, with a home-DS relay for remote devices.
 - **Y4.** Batches are single-MEK (`MixedMekBatch`). That makes per-MEK read authorization a row filter, not item surgery. *Cost:* more batch records when the roster churns.

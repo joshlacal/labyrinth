@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, labyrinth-1.1]
+    branches: [main]
   pull_request:
 
 permissions:
