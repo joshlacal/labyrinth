@@ -111,6 +111,14 @@ pub struct Labyrinth {
     epochs: BTreeMap<u64, EpochSecret>,
     /// Newest epoch this device has reached.
     latest: u64,
+    /// Verified copy of my own record for epoch `latest` ([CB-43]). Every
+    /// read of my newest epoch goes through it, so a mailbox host cannot
+    /// serve a clean record when it is checked and a tampered one later.
+    own_latest: Option<EpochPublic>,
+    /// Whether `own_latest`'s attesting key was found in the directory. A
+    /// restart with the directory unreachable leaves it unchecked until the
+    /// next sync or roster resolution.
+    own_attester_checked: bool,
     /// My epoch heads → sequence numbers (filled lazily from the store).
     heads: HashMap<[u8; 32], u64>,
     /// `deviceKeyPub`s this client revoked; every rotation excludes them,
@@ -159,6 +167,8 @@ impl Labyrinth {
             mailbox_root_salt,
             epochs,
             latest,
+            own_latest: None,
+            own_attester_checked: false,
             heads: HashMap::new(),
             revoked: BTreeSet::new(),
             verified: (latest, BTreeSet::new()),
@@ -189,9 +199,56 @@ impl Labyrinth {
         self.latest
     }
 
-    /// The published data of the newest epoch this device has reached.
+    /// The published data of the newest epoch this device has reached:
+    /// the copy verified when the device reached it ([CB-43]), not a fresh
+    /// read from the mailbox.
     pub fn latest_public(&self) -> Result<EpochPublic> {
-        Ok(self.epoch_record(self.latest)?.1.public)
+        self.own_latest
+            .as_ref()
+            .filter(|p| p.seq == self.latest)
+            .cloned()
+            .ok_or(Error::NotFound("verified latest epoch record"))
+    }
+
+    /// Verifies my record for epoch `latest` in full ([`epochs::verified_own`])
+    /// and keeps it as the copy [`latest_public`](Self::latest_public)
+    /// returns. When that copy is already held, only finishes a deferred
+    /// attester check.
+    fn adopt_latest(&mut self) -> Result<()> {
+        if self
+            .own_latest
+            .as_ref()
+            .is_some_and(|p| p.seq == self.latest)
+        {
+            if !self.own_attester_checked {
+                let public = self.latest_public()?;
+                epochs::check_own_attester(self.b.directory.as_ref(), &self.did, &public)?;
+                self.own_attester_checked = true;
+            }
+            return Ok(());
+        }
+        let secret = self.epoch_secret(self.latest)?;
+        let public = epochs::verified_own(
+            self.b.mailbox.as_ref(),
+            self.b.directory.as_ref(),
+            &self.did,
+            &secret,
+        )?;
+        self.adopted(public);
+        Ok(())
+    }
+
+    /// Keeps `public`, fully verified or made here, as my newest epoch.
+    fn adopted(&mut self, public: EpochPublic) {
+        self.own_latest = Some(public);
+        self.own_attester_checked = true;
+    }
+
+    /// [`latest_public`](Self::latest_public) after finishing a deferred
+    /// attester check: the copy that goes into a roster.
+    fn own_latest_checked(&mut self) -> Result<EpochPublic> {
+        self.adopt_latest()?;
+        self.latest_public()
     }
 
     fn now(&self) -> String {

@@ -172,6 +172,12 @@ prev_sig = XEdDSA(prevSigPriv, "minos.unstructured_signature.epoch_prev:" || epo
   - `attestation = Ed25519(transportKey, "catbird.labyrinth.epoch_head_attest:" || did || ":" || epochHead)`.
   - A sender accepts a recipient's head only if the attesting key belongs to one of that DID's devices in the MLS group.
   - This anchors the head chain to MLS identity, so neither a storage backend nor mls-ds can substitute mailbox keys.
+- **[CB-43] Own epoch records.** A device adopts its own newest epoch record only after checking all of it (`epochs::verified_own`, on restart, sync, recovery restore and one-time-code enrollment):
+  - its keys match the epoch secret, and its self signature and attestation verify;
+  - above epoch 0, its `prev_sig` verifies under epoch `seq − 1`'s mailbox signing key, re-derived by backward-chaining from the secret;
+  - its attesting key is one of the account's chat devices in the `MailboxDirectory`, current or removed (a removed sibling may have opened it; peers still apply [CB-18]).
+  - The client then keeps that verified copy (`Labyrinth::latest_public`) instead of re-reading the mailbox, so a host can't serve a clean record when it is checked and a tampered one afterwards. The copy is in memory only; a restart re-verifies, so the persisted state format is unchanged.
+  - A restart must work offline, so `from_state` checks the mailbox-only parts and, if the directory can't be reached, defers the attester lookup. The next `sync_epochs` or roster resolution (`resolve_roster`, `resolve_roster_report`, `archive_outgoing`) finishes it before this epoch goes into any roster.
 - **[CB-19] Discovery.** The latest `epochPublic` is published as `blue.catbird.labyrinth.mailboxKeys/self` in the account's **public** repo, so any PDS works.
   - Every published epoch is also kept, immutable, at `mailboxKeys/<12-digit epochNumber>`, so a sender can walk the `prev_sig` chain ([CB-29]).
   - Cost: it shows publicly that the account uses Labyrinth, and when it rotates epochs.

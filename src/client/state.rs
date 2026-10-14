@@ -42,7 +42,7 @@ use zeroize::Zeroizing;
 
 use super::{Backends, Labyrinth, PeerPin};
 use crate::device::{DevicePublic, DeviceSecrets};
-use crate::epoch::{EpochKeys as _, EpochSecret, verify_public};
+use crate::epoch::{EpochKeys as _, EpochSecret};
 use crate::hpke::labyrinth::{X25519Public, X25519Secret};
 use crate::mek::{Mek, MekProvenance};
 use crate::orf::OrfClientState;
@@ -353,13 +353,20 @@ impl Labyrinth {
         if me.latest != latest {
             return Err(Error::Malformed("state latest epoch is not cached"));
         }
-        let (id, record) = me.epoch_record(latest)?;
-        let newest = me.epochs.get(&latest).expect("latest is cached");
-        if id != newest.epoch_id {
-            return Err(Error::Malformed("state epoch id does not match store"));
-        }
-        verify_public(newest, &record.public)?;
-        record.public.verify(&me.did, None)?;
+        // [CB-43] Everything the mailbox alone can prove is checked now.
+        // The attester lookup may wait for the directory: a restart must
+        // work offline, and nothing is addressed to this epoch until a
+        // sync or roster resolution finishes the check.
+        let newest = me.epoch_secret(latest)?;
+        let public =
+            super::epochs::verified_own_signatures(me.b.mailbox.as_ref(), &me.did, &newest)?;
+        me.own_latest = Some(public.clone());
+        me.own_attester_checked =
+            match super::epochs::check_own_attester(me.b.directory.as_ref(), &me.did, &public) {
+                Ok(()) => true,
+                Err(Error::Unattested) => return Err(Error::Unattested),
+                Err(_) => false,
+            };
         me.revoked = revoked;
         me.verified = verified;
         me.pins = pins;
