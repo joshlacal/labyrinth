@@ -84,7 +84,8 @@ impl Labyrinth {
                 }),
             }
         }
-        out.roster.push((self.did.clone(), self.latest_public()?));
+        out.roster
+            .push((self.did.clone(), self.own_latest_checked()?));
         Ok(out)
     }
 
@@ -107,7 +108,7 @@ impl Labyrinth {
                 roster.push(((*did).to_owned(), epoch));
             }
         }
-        roster.push((self.did.clone(), self.latest_public()?));
+        roster.push((self.did.clone(), self.own_latest_checked()?));
         Ok(roster)
     }
 
@@ -135,7 +136,7 @@ impl Labyrinth {
         timestamp: u64,
         frame: &[u8],
     ) -> Result<ArchiveOutcome> {
-        let me_public = self.latest_public()?;
+        let me_public = self.own_latest_checked()?;
         let mut full = Vec::with_capacity(roster.len() + 1);
         let me = self.did.clone();
         for (did, epoch) in roster.iter().filter(|(d, _)| *d != me) {

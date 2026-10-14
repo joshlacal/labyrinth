@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 
-use super::epochs::{chain_forward, check_integrity, epoch_record};
+use super::epochs::{chain_forward, check_integrity, epoch_record, verified_own};
 use super::{Backends, Labyrinth};
 use crate::device::ChatBinding;
 use crate::epoch::{EpochKeys as _, EpochSecret, PendingEpoch, verify_public};
@@ -213,8 +213,8 @@ impl Labyrinth {
             &Default::default(),
         )?;
         let latest = reached.last().expect("non-empty");
-        let head = epoch_record(b.mailbox.as_ref(), latest.seq)?.1.public.head;
-        check_integrity(b.directory.as_ref(), did, latest.seq, &head)?;
+        let latest_public = verified_own(b.mailbox.as_ref(), b.directory.as_ref(), did, latest)?;
+        check_integrity(b.directory.as_ref(), did, latest.seq, &latest_public.head)?;
         // [CB-39] The bundle was used: keep it from expiring. Before any
         // write, so a failure leaves nothing half-enrolled.
         match b.mailbox.touch_virtual_device(&record.vdevice_id) {
@@ -234,7 +234,7 @@ impl Labyrinth {
             &public.device_key_pub,
             Some((&restored.device.public().device_key_pub, &evolve_token)),
         )?;
-        let me = Self::assemble(
+        let mut me = Self::assemble(
             did,
             device,
             transport,
@@ -242,6 +242,7 @@ impl Labyrinth {
             restored.mailbox_root_salt,
             reached,
         )?;
+        me.adopted(latest_public);
         Ok((
             me,
             Enrollment {
@@ -299,15 +300,8 @@ impl Labyrinth {
         let isk = initiator.finish(response)?;
         let payload = OtcPayload::open(&isk, sealed_payload)?;
         let epoch: &EpochSecret = &payload.epoch;
-        let (id, record) = epoch_record(b.mailbox.as_ref(), epoch.seq)?;
-        if id != epoch.epoch_id {
-            return Err(Error::Malformed(
-                "transferred epoch id does not match store",
-            ));
-        }
-        verify_public(epoch, &record.public)?;
-        record.public.verify(did, None)?;
-        check_integrity(b.directory.as_ref(), did, epoch.seq, &record.public.head)?;
+        let epoch_public = verified_own(b.mailbox.as_ref(), b.directory.as_ref(), did, epoch)?;
+        check_integrity(b.directory.as_ref(), did, epoch.seq, &epoch_public.head)?;
         let (device, public, evolve_token, member) = payload.enroll()?;
         let now = datetime_from_ms(b.clock.now_ms());
         let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());
@@ -319,7 +313,7 @@ impl Labyrinth {
         b.orf
             .register(&public.device_key_pub, Some((&temp, &evolve_token)))?;
         b.orf.delete(&temp)?;
-        let me = Self::assemble(
+        let mut me = Self::assemble(
             did,
             device,
             transport,
@@ -327,6 +321,7 @@ impl Labyrinth {
             payload.mailbox_root_salt,
             [payload.epoch.clone()],
         )?;
+        me.adopted(epoch_public);
         Ok((
             me,
             Enrollment {

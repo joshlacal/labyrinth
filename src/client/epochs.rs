@@ -12,6 +12,7 @@ use crate::epoch::{
     open_genesis, open_next, verify_member, verify_public,
 };
 use crate::hpke::labyrinth::X25519Secret;
+use crate::mailbox::EpochPublic;
 use crate::records::{Device, Epoch, EpochMember, MailboxKeysRecord};
 use crate::sign::{TransportSigner, XVerifyingKey};
 use crate::store::{MailboxDirectory, MailboxStore};
@@ -57,6 +58,69 @@ pub(super) fn epoch_record(mb: &dyn MailboxStore, seq: u64) -> Result<(String, E
         return Err(Error::Malformed("epoch record under the wrong key"));
     }
     Ok((s.rkey, s.value.to_record()?))
+}
+
+/// Reads my own epoch `secret.seq` from the mailbox and authenticates the
+/// whole record before it is adopted ([CB-43]): [`verified_own_signatures`]
+/// and [`check_own_attester`].
+pub(super) fn verified_own(
+    mb: &dyn MailboxStore,
+    dir: &dyn MailboxDirectory,
+    did: &str,
+    secret: &EpochSecret,
+) -> Result<EpochPublic> {
+    let public = verified_own_signatures(mb, did, secret)?;
+    check_own_attester(dir, did, &public)?;
+    Ok(public)
+}
+
+/// The part of [`verified_own`] that needs only the mailbox: the record's
+/// id and keys match the secret, its self signature and attestation
+/// verify, and above epoch 0 its `prev_sig` verifies under the previous
+/// epoch's mailbox key (recovered by backward-chaining, so a substituted
+/// predecessor fails too).
+pub(super) fn verified_own_signatures(
+    mb: &dyn MailboxStore,
+    did: &str,
+    secret: &EpochSecret,
+) -> Result<EpochPublic> {
+    let (id, record) = epoch_record(mb, secret.seq)?;
+    if id != secret.epoch_id {
+        return Err(Error::Malformed("epoch id does not match store"));
+    }
+    verify_public(secret, &record.public)?;
+    let prev = match secret.seq.checked_sub(1) {
+        None => None,
+        Some(prev_seq) => {
+            let (prev_id, prev_record) = epoch_record(mb, prev_seq)?;
+            let prev = backward_chain(secret, &record, &prev_id)?;
+            verify_public(&prev, &prev_record.public)?;
+            Some(prev_record.public)
+        }
+    };
+    record.public.verify(did, prev.as_ref())?;
+    Ok(record.public)
+}
+
+/// [`Error::Unattested`] unless my epoch's attestation key is one of the
+/// account's chat devices in `dir`. A removed device still counts: it may
+/// have opened the epoch before it was removed, and peers apply their own,
+/// stricter [CB-18] check.
+pub(super) fn check_own_attester(
+    dir: &dyn MailboxDirectory,
+    did: &str,
+    public: &EpochPublic,
+) -> Result<()> {
+    let attester = public.attestation.transport_public_key;
+    if dir
+        .device_transport_keys(did)?
+        .iter()
+        .any(|k| k.key == attester)
+    {
+        Ok(())
+    } else {
+        Err(Error::Unattested)
+    }
 }
 
 fn member(
@@ -218,6 +282,8 @@ impl Labyrinth {
             .mailbox
             .create_epoch(&Epoch::from_record(&new.record, now), &members)?;
         let mut me = Self::assemble(did, device, transport, b, salt, [pending.assign_id(id)])?;
+        // Made here, so it needs no checking.
+        me.adopted(new.record.public.clone());
         me.remember_verified(0, [key.0]);
         let unfinished = me.finish_initialize().err();
         Ok((me, unfinished))
@@ -292,6 +358,7 @@ impl Labyrinth {
             self.latest = self.latest.max(e.seq);
             self.epochs.insert(e.seq, e);
         }
+        self.adopt_latest()?;
         self.check_epoch_integrity()?;
         let latest = self.epoch_secret(self.latest)?;
         let audit = self.audit_epoch(&latest)?;
@@ -318,7 +385,7 @@ impl Labyrinth {
     /// [`Error::EpochTruncated`] if the directory's published latest epoch
     /// for this account is ahead of the newest epoch this device reached.
     pub fn check_epoch_integrity(&self) -> Result<()> {
-        let head = self.epoch_record(self.latest)?.1.public.head;
+        let head = self.latest_public()?.head;
         check_integrity(self.b.directory.as_ref(), &self.did, self.latest, &head)
     }
 
@@ -458,6 +525,8 @@ impl Labyrinth {
         let e = pending.assign_id(id);
         self.latest = e.seq;
         self.epochs.insert(e.seq, e);
+        // Made here, so it needs no checking.
+        self.adopted(new.record.public.clone());
         self.remember_verified(self.latest, new.members.iter().map(|m| m.device_key_pub.0));
         self.publish_keys(&new.record.public)?;
         let excluded = audit

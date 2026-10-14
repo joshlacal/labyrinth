@@ -2,7 +2,7 @@
 //! "security review fixes"). Each test asserts the *secure* behaviour.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use labyrinth::Error;
 use labyrinth::client::{Backends, Clock, Labyrinth};
@@ -865,10 +865,24 @@ fn a_peer_minted_mek_is_never_reused_for_outgoing() {
 
 // ---- 2026-10-13 review, I3: the starting epoch record's signatures ----
 
-/// Mailbox whose stored epoch records come back with a corrupted
-/// `selfSig` while the flag is set (head and keys left intact).
-struct TamperedSelfSig(MemoryMailbox, Arc<AtomicBool>);
-impl MailboxStore for TamperedSelfSig {
+/// What [`Tampered`] does to every epoch record it returns (head and keys
+/// are always left intact).
+const CLEAN: u8 = 0;
+/// Corrupt `selfSig`.
+const SELF_SIG: u8 = 1;
+/// Replace the attestation with a validly signed one from a key that is
+/// not one of the account's chat devices.
+const FOREIGN_ATTESTATION: u8 = 2;
+/// Corrupt `prevSig` (epochs above 0).
+const PREV_SIG: u8 = 3;
+
+fn attacker() -> Ed25519Transport {
+    signer(99)
+}
+
+/// Mailbox whose stored epoch records come back tampered as its mode says.
+struct Tampered(MemoryMailbox, Arc<AtomicU8>);
+impl MailboxStore for Tampered {
     fn owner(&self) -> &str {
         self.0.owner()
     }
@@ -889,10 +903,27 @@ impl MailboxStore for TamperedSelfSig {
     }
     fn get_epoch(&self, s: u64) -> labyrinth::Result<Option<Stored<Epoch>>> {
         let mut e = self.0.get_epoch(s)?;
-        if self.1.load(Ordering::Relaxed)
-            && let Some(e) = e.as_mut()
-        {
-            e.value.public.self_sig.0[0] ^= 1;
+        if let Some(e) = e.as_mut() {
+            let p = &mut e.value.public;
+            match self.1.load(Ordering::Relaxed) {
+                SELF_SIG => p.self_sig.0[0] ^= 1,
+                FOREIGN_ATTESTATION => {
+                    use labyrinth::sign::TransportSigner as _;
+                    let msg = [
+                        format!("catbird.labyrinth.epoch_head_attest:{}:", self.owner()).as_bytes(),
+                        p.epoch_head.0.as_slice(),
+                    ]
+                    .concat();
+                    p.attestation.transport_pubkey.0 = attacker().transport_public_key().to_vec();
+                    p.attestation.sig.0 = attacker().sign_transport(&msg).to_vec();
+                }
+                PREV_SIG => {
+                    if let Some(sig) = p.prev_sig.as_mut() {
+                        sig.0[0] ^= 1;
+                    }
+                }
+                _ => {}
+            }
         }
         Ok(e)
     }
@@ -941,8 +972,8 @@ fn a_tampered_starting_epoch_record_is_not_adopted() {
     )
     .unwrap();
     let state = alice.export_state().unwrap();
-    let tamper = Arc::new(AtomicBool::new(true));
-    let tampered = || Box::new(TamperedSelfSig(net.mailbox(A), tamper.clone()));
+    let tamper = Arc::new(AtomicU8::new(SELF_SIG));
+    let tampered = || Box::new(Tampered(net.mailbox(A), tamper.clone()));
 
     // Restart: the stored latest epoch record must verify.
     let restored = Labyrinth::from_state(
@@ -973,7 +1004,7 @@ fn a_tampered_starting_epoch_record_is_not_adopted() {
     );
 
     // Untampered, both succeed.
-    tamper.store(false, Ordering::Relaxed);
+    tamper.store(CLEAN, Ordering::Relaxed);
     Labyrinth::from_state(
         &state,
         A,
@@ -981,4 +1012,164 @@ fn a_tampered_starting_epoch_record_is_not_adopted() {
         backends(&net, &clock, A, tampered()),
     )
     .unwrap();
+}
+
+// ---- 2026-10-13 review, labyrinth #5 follow-up: [CB-43] ----
+
+/// Alice's phone and laptop, with the laptop revoked so that the newest
+/// epoch is 1 (opened and attested by the phone).
+fn alice_at_epoch_one(net: &MemoryBackend, clock: &TestClock) -> Labyrinth {
+    net.register_chat_device(A, tpub(1));
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(net, clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let laptop = enroll_sibling(net, clock, &mut phone, 2, Box::new(net.mailbox(A)));
+    let rot = phone
+        .revoke_device(&laptop.device_public().device_key_pub)
+        .unwrap();
+    assert_eq!(rot.new_epoch, 1);
+    phone
+}
+
+#[test]
+fn a_foreign_attestation_or_broken_link_on_my_own_epoch_is_not_adopted() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut phone = alice_at_epoch_one(&net, &clock);
+    let state = phone.export_state().unwrap();
+    let tamper = Arc::new(AtomicU8::new(CLEAN));
+    let tampered = || Box::new(Tampered(net.mailbox(A), tamper.clone()));
+
+    for mode in [FOREIGN_ATTESTATION, PREV_SIG] {
+        tamper.store(mode, Ordering::Relaxed);
+        let restored = Labyrinth::from_state(
+            &state,
+            A,
+            Box::new(signer(1)),
+            backends(&net, &clock, A, tampered()),
+        );
+        assert!(
+            restored.is_err(),
+            "restart adopted epoch 1 under mode {mode}"
+        );
+
+        let mut r = phone.otc_offer().unwrap();
+        let typed = r.code().as_str().to_owned();
+        let (init, hello) = Labyrinth::otc_start(A, &typed).unwrap();
+        let reply = phone.otc_respond(&mut r, &hello).unwrap();
+        net.register_chat_device(A, tpub(5));
+        let enrolled = Labyrinth::enroll_via_otc(
+            A,
+            init,
+            &reply.message,
+            &reply.sealed_payload,
+            Box::new(signer(5)),
+            backends(&net, &clock, A, tampered()),
+        );
+        assert!(
+            enrolled.is_err(),
+            "enrollment adopted epoch 1 under mode {mode}"
+        );
+    }
+
+    tamper.store(CLEAN, Ordering::Relaxed);
+    let restored = Labyrinth::from_state(
+        &state,
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, tampered()),
+    )
+    .unwrap();
+    assert_eq!(restored.latest_epoch(), 1);
+}
+
+#[test]
+fn my_latest_epoch_is_the_verified_copy_not_a_fresh_mailbox_read() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let phone = alice_at_epoch_one(&net, &clock);
+    let state = phone.export_state().unwrap();
+    let tamper = Arc::new(AtomicU8::new(CLEAN));
+    let mut restored = Labyrinth::from_state(
+        &state,
+        A,
+        Box::new(signer(1)),
+        backends(
+            &net,
+            &clock,
+            A,
+            Box::new(Tampered(net.mailbox(A), tamper.clone())),
+        ),
+    )
+    .unwrap();
+    let verified = restored.latest_public().unwrap();
+    assert_eq!(verified.attestation.transport_public_key, tpub(1));
+
+    // The host swaps the record after the restart checked it.
+    tamper.store(FOREIGN_ATTESTATION, Ordering::Relaxed);
+    assert_eq!(restored.latest_public().unwrap(), verified);
+    restored.sync_epochs().unwrap();
+    assert_eq!(restored.latest_public().unwrap(), verified);
+    restored.check_epoch_integrity().unwrap();
+}
+
+/// Directory that fails every lookup while the flag is set.
+struct Flaky(MemoryDirectory, Arc<AtomicBool>);
+impl Flaky {
+    fn check(&self) -> labyrinth::Result<()> {
+        if self.1.load(Ordering::Relaxed) {
+            Err(Error::Backend("directory unreachable".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+impl MailboxDirectory for Flaky {
+    fn latest(&self, did: &str) -> labyrinth::Result<Option<EpochPublic>> {
+        self.check()?;
+        self.0.latest(did)
+    }
+    fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
+        self.check()?;
+        self.0.epoch(did, seq)
+    }
+    fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
+        self.check()?;
+        self.0.device_transport_keys(did)
+    }
+}
+
+#[test]
+fn an_offline_restart_defers_the_attester_check_until_the_roster_needs_it() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let phone = alice_at_epoch_one(&net, &clock);
+    let state = phone.export_state().unwrap();
+    let tamper = Arc::new(AtomicU8::new(FOREIGN_ATTESTATION));
+    let down = Arc::new(AtomicBool::new(true));
+    let mut b = backends(
+        &net,
+        &clock,
+        A,
+        Box::new(Tampered(net.mailbox(A), tamper.clone())),
+    );
+    b.directory = Box::new(Flaky(net.directory(), down.clone()));
+
+    // Offline, the restart works: the signatures and link verify.
+    let mut restored = Labyrinth::from_state(&state, A, Box::new(signer(1)), b).unwrap();
+    // Back online, the foreign attester is caught before anything is
+    // addressed to this epoch, and keeps being caught.
+    down.store(false, Ordering::Relaxed);
+    assert_eq!(
+        restored.resolve_roster(&[A]).unwrap_err(),
+        Error::Unattested
+    );
+    assert_eq!(restored.sync_epochs().unwrap_err(), Error::Unattested);
+    assert_eq!(
+        restored.resolve_roster(&[A]).unwrap_err(),
+        Error::Unattested
+    );
 }
