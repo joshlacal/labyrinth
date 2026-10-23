@@ -40,6 +40,21 @@ pub(super) fn handle(
 ) -> Option<Reply> {
     let th = s.net.threads(&c.did);
     let r = match name {
+        "getThreadStorage" => (|| {
+            let thread = req(input, "threadId")?;
+            // This reference service models legacy DS placement. Derive a
+            // stable generation for its in-memory conversation identity.
+            let digest = hex::encode(crate::encoding::sha256(thread.as_bytes()));
+            let generation = format!(
+                "{}-{}-{}-{}-{}",
+                &digest[..8],
+                &digest[8..12],
+                &digest[12..16],
+                &digest[16..20],
+                &digest[20..32]
+            );
+            json(&serde_json::json!({"placement": "mlsds", "generation": generation}))
+        })(),
         "createMek" => (|| {
             let m: RecordBody<MekDistribution> = body(input)?;
             let m = m.record;

@@ -47,6 +47,7 @@
 //! endpoints, matching the reference implementation's limits and errors.
 
 pub mod host;
+pub mod thread;
 
 use std::sync::Arc;
 
@@ -82,6 +83,7 @@ pub mod endpoint {
     pub const APPLY_WRITES: &str = "com.atproto.space.applyWrites";
     pub const GET_RECORD: &str = "com.atproto.space.getRecord";
     pub const LIST_RECORDS: &str = "com.atproto.space.listRecords";
+    pub const LIST_SPACES: &str = "com.atproto.space.listSpaces";
     pub const DELETE_RECORD: &str = "com.atproto.space.deleteRecord";
 }
 
@@ -146,9 +148,15 @@ impl core::fmt::Display for SpaceRef {
 /// Maps a `com.atproto.space.*` error to the store error.
 pub fn map_space_error(e: XrpcError) -> Error {
     match e.error.as_deref() {
+        Some("MethodNotImplemented") if e.status == 501 => {
+            Error::NotSupported("personal Space mailbox")
+        }
         Some("RecordAlreadyExists") => Error::Conflict,
         Some("RecordNotFound") => Error::NotFound("record"),
         Some("SpaceNotFound") => Error::NotFound("space"),
+        // Deletion is terminal for this generation. It must never become
+        // an absent mailbox that initialization silently recreates.
+        Some("SpaceDeleted") => Error::Forbidden,
         Some("RepoNotFound") => Error::NotFound("repo"),
         _ if e.status == 403 => Error::Forbidden,
         name => Error::Backend(format!(

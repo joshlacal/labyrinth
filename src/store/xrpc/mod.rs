@@ -34,7 +34,7 @@ mod mailbox;
 pub mod read_auth;
 pub mod server;
 mod thread;
-mod wire;
+pub(crate) mod wire;
 
 use std::sync::Arc;
 
