@@ -121,6 +121,7 @@ pub fn map_error(e: XrpcError) -> Error {
             | "NotParticipant"
             | "DeviceRevoked"
             | "LabyrinthDeviceNotBound"
+            | "SpaceDeleted"
             | "AttachmentNotEntitled",
         ) => Error::Forbidden,
         Some("DeviceNotFound" | "MemberDeviceNotRegistered") => Error::NotFound("device"),
