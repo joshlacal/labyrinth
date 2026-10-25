@@ -144,12 +144,11 @@ fn record_uri(space: &str, did: &str, collection: &str, rkey: &str) -> String {
 }
 
 fn cid(v: &Value) -> String {
-    if v["$type"] == crate::records::nsid::BATCH {
-        if let Ok(batch) = serde_json::from_value::<crate::records::Batch>(v.clone()) {
-            if let Ok(cid) = super::thread::batch_cid(&batch) {
-                return cid;
-            }
-        }
+    if v["$type"] == crate::records::nsid::BATCH
+        && let Ok(batch) = serde_json::from_value::<crate::records::Batch>(v.clone())
+        && let Ok(cid) = super::thread::batch_cid(&batch)
+    {
+        return cid;
     }
     format!(
         "bafyrei{}",
