@@ -22,7 +22,8 @@
 //!   with the last URI as the cursor only when the page is full.
 //!
 //! It does not model space credentials, notifyWrite, rate limits, record
-//! CIDs (a digest stands in) or lexicon validation.
+//! CIDs for mailbox records (a digest stands in), or lexicon validation.
+//! Conversation batches use canonical DRISL CIDs.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -143,6 +144,13 @@ fn record_uri(space: &str, did: &str, collection: &str, rkey: &str) -> String {
 }
 
 fn cid(v: &Value) -> String {
+    if v["$type"] == crate::records::nsid::BATCH {
+        if let Ok(batch) = serde_json::from_value::<crate::records::Batch>(v.clone()) {
+            if let Ok(cid) = super::thread::batch_cid(&batch) {
+                return cid;
+            }
+        }
+    }
     format!(
         "bafyrei{}",
         &hex::encode(Sha256::digest(v.to_string().as_bytes()))[..40]
@@ -189,6 +197,34 @@ pub struct SpaceClient {
 }
 
 impl SpaceClient {
+    fn list_spaces(&self, p: &[(&str, String)]) -> Reply {
+        let state = self.host.s.lock().unwrap();
+        let cursor = param(p, "cursor");
+        let limit: usize = param(p, "limit")
+            .unwrap_or("50")
+            .parse()
+            .ok()
+            .filter(|n| (1..=100).contains(n))
+            .ok_or_else(|| err(400, "InvalidRequest", "limit"))?;
+        let matching: Vec<_> = state
+            .repos
+            .keys()
+            .filter(|(uri, did)| {
+                did == &self.did
+                    && cursor.is_none_or(|c| uri.as_str() > c)
+                    && SpaceRef::parse(uri)
+                        .is_ok_and(|s| param(p, "spaceType").is_none_or(|t| s.space_type == t))
+            })
+            .map(|(uri, _)| uri.clone())
+            .take(limit)
+            .collect();
+        let cursor = (matching.len() == limit)
+            .then(|| matching.last().cloned())
+            .flatten();
+        ok(
+            json!({"spaces": matching.iter().map(|uri| json!({"uri": uri})).collect::<Vec<_>>(), "cursor": cursor}),
+        )
+    }
     fn read_repo(
         &self,
         s: &State,
@@ -366,6 +402,7 @@ impl XrpcTransport for SpaceClient {
         match nsid {
             endpoint::GET_RECORD => self.get_record(params),
             endpoint::LIST_RECORDS => self.list_records(params),
+            endpoint::LIST_SPACES => self.list_spaces(params),
             _ => Err(err(404, "MethodNotImplemented", nsid)),
         }
     }

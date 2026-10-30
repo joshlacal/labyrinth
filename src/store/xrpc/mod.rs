@@ -34,7 +34,7 @@ mod mailbox;
 pub mod read_auth;
 pub mod server;
 mod thread;
-mod wire;
+pub(crate) mod wire;
 
 use std::sync::Arc;
 
@@ -121,6 +121,7 @@ pub fn map_error(e: XrpcError) -> Error {
             | "NotParticipant"
             | "DeviceRevoked"
             | "LabyrinthDeviceNotBound"
+            | "SpaceDeleted"
             | "AttachmentNotEntitled",
         ) => Error::Forbidden,
         Some("DeviceNotFound" | "MemberDeviceNotRegistered") => Error::NotFound("device"),

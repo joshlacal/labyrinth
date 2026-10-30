@@ -1,12 +1,12 @@
 //! The Space mailbox store against a real atproto PDS from the upstream
 //! `permissioned-data` branch. Opt-in: it runs only when
 //! `LABYRINTH_SPACE_PDS` names the session file written by
-//! `scripts/space-pds/start.mjs`, and passes trivially otherwise.
+//! `scripts/space-pds/start.mjs`. Explicitly ignored without a live test run.
 //!
 //! ```bash
 //! node scripts/space-pds/start.mjs ../atproto /tmp/space-pds.json &
 //! LABYRINTH_SPACE_PDS=/tmp/space-pds.json \
-//!   cargo test --release --features space --test live_space_pds -- --test-threads=1
+//!   cargo test --release --features space --test live_space_pds -- --ignored --test-threads=1
 //! ```
 //!
 //! Each run uses a fresh network (the accounts' mailboxes must start
@@ -287,11 +287,10 @@ fn got(h: &labyrinth::client::ThreadHistory) -> Vec<(String, Option<String>, Vec
 }
 
 #[test]
+#[ignore = "requires an explicitly provisioned local PDS and LABYRINTH_SPACE_PDS session file"]
 fn lifecycle_on_a_live_space_pds() {
-    let Some((pds, accts)) = session() else {
-        eprintln!("LABYRINTH_SPACE_PDS not set; skipping the live Space PDS test");
-        return;
-    };
+    let (pds, accts) =
+        session().expect("LABYRINTH_SPACE_PDS must name the local test session file");
     let [alice_a, bob_a, carol_a, dave_a] = <[Account; 4]>::try_from(accts).unwrap();
     let mut w = World {
         pds,

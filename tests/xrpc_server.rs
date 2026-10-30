@@ -73,6 +73,7 @@ fn errors_map_to_store_errors() {
         "NotRecipient",
         "NotParticipant",
         "DeviceRevoked",
+        "SpaceDeleted",
     ] {
         assert_eq!(e(f), Error::Forbidden);
     }
