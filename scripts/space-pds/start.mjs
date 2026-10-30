@@ -1,5 +1,6 @@
 // Starts the upstream atproto dev network (PLC + one PDS, no AppView) from a
-// built checkout of bluesky-social/atproto branch `permissioned-data`,
+// built checkout of bluesky-social/atproto (the October 29, 2026 Spaces
+// alpha, 5d88b414, or later: `createSpace` takes a `policy` union),
 // creates test accounts with a personal Labyrinth mailbox Space each, and
 // writes their sessions to a JSON file for `tests/live_space_pds.rs`.
 //
@@ -51,13 +52,11 @@ for (const name of NAMES) {
   })
   // The owner-only mailbox: nobody else is on the member list.
   const space = await xrpc(
-    'com.atproto.simplespace.createSpace',
+    'com.atproto.space.createSpace',
     {
       spaceType: SPACE_TYPE,
       skey: SKEY,
-      readPolicy: { $type: 'com.atproto.simplespace.defs#memberListPolicy' },
-      writePolicy: { $type: 'com.atproto.simplespace.defs#memberListPolicy' },
-      appAccess: { $type: 'com.atproto.simplespace.defs#open' },
+      policy: { $type: 'com.atproto.memberspace.policy' },
     },
     s.accessJwt,
   )
