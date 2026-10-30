@@ -312,3 +312,78 @@ fn explicit_space_placement_requires_platform_transport() {
         Err(Error::NotSupported(_))
     ));
 }
+
+/// Answers `getRecord` with a named error; everything else reaches the host.
+struct RefusingRecords {
+    host: crate::store::space::host::SpaceClient,
+    error: &'static str,
+}
+impl XrpcTransport for RefusingRecords {
+    fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> core::result::Result<Vec<u8>, XrpcError> {
+        if nsid == endpoint::GET_RECORD {
+            return Err(XrpcError::named(400, self.error, "refused"));
+        }
+        self.host.query_with_headers(nsid, params, headers)
+    }
+    fn procedure(
+        &self,
+        nsid: &str,
+        payload: &[u8],
+        operation_id: [u8; 16],
+    ) -> core::result::Result<Vec<u8>, XrpcError> {
+        self.host.procedure(nsid, payload, operation_id)
+    }
+}
+
+fn reader_refused_with(error: &'static str) -> Result<Vec<Stored<Batch>>> {
+    let (writer, ds, host) = setup();
+    writer.append_batch(&batch()).unwrap();
+    let reader = SequencedSpaceThreadStore::new(
+        "did:plc:bob",
+        ds,
+        Some(Arc::new(RefusingRecords {
+            host: host.client("did:plc:bob"),
+            error,
+        })),
+        Arc::new(Pins::default()),
+    );
+    reader.list_batches("thread", None, TimeRange::ALL)
+}
+
+#[test]
+fn space_not_found_on_a_member_repo_is_a_read_refusal() {
+    // The repo host cannot say "gone" apart from "not yours": either way the
+    // reader degrades to its owner archive rather than failing the thread.
+    assert!(matches!(
+        reader_refused_with("SpaceNotFound"),
+        Err(Error::Forbidden)
+    ));
+    assert!(matches!(
+        reader_refused_with("SpaceDeleted"),
+        Err(Error::Forbidden)
+    ));
+    // A single missing record is still not a refusal of the whole Space.
+    assert!(matches!(
+        reader_refused_with("RecordNotFound"),
+        Err(Error::NotFound("record"))
+    ));
+}
+
+#[test]
+fn mailbox_mapping_still_reports_an_absent_space() {
+    // Only member-repo reads fold `SpaceNotFound` into `Forbidden`; the
+    // mailbox path keeps the distinct error its initialization relies on.
+    assert_eq!(
+        map_space_error(XrpcError::named(400, "SpaceNotFound", "")),
+        Error::NotFound("space")
+    );
+    assert_eq!(
+        map_space_error(XrpcError::named(400, "SpaceDeleted", "")),
+        Error::Forbidden
+    );
+}

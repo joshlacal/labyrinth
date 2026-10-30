@@ -15,7 +15,7 @@ use crate::deletion::Redaction;
 use crate::encoding::sha256;
 use crate::records::{Batch, Bytes, MekDistribution, RedactionDef, SealedMessageDef, nsid};
 use crate::store::xrpc::wire::{OrderDef, RkeyOrderOut};
-use crate::store::xrpc::{Xrpc, XrpcThreadStore, XrpcTransport};
+use crate::store::xrpc::{Xrpc, XrpcError, XrpcThreadStore, XrpcTransport};
 use crate::store::{Stored, ThreadListing, ThreadStore, TimeRange};
 use crate::{Error, Result};
 
@@ -51,6 +51,21 @@ impl ThreadPlacement {
             }
             _ => Err(Error::Malformed("conversation storage placement")),
         }
+    }
+}
+
+/// Maps an error from reading a member's repo in a conversation Space.
+///
+/// The repo host answers `SpaceNotFound` both when the Space (or that
+/// member's repo in it) is gone and when the caller may not read it; the
+/// lexicon does not tell them apart. To a reader either is a refusal, not a
+/// missing mailbox, so it becomes `Forbidden` and the read degrades to the
+/// owner archive instead of failing the whole thread. `SpaceDeleted` stays
+/// terminal (`Forbidden`) through [`map_space_error`].
+fn map_space_read_error(e: XrpcError) -> Error {
+    match e.error.as_deref() {
+        Some("SpaceNotFound") => Error::Forbidden,
+        _ => map_space_error(e),
     }
 }
 
@@ -226,7 +241,7 @@ impl SequencedSpaceThreadStore {
         let body = self
             .space_transport()?
             .query(endpoint::GET_RECORD, &params)
-            .map_err(map_space_error)?;
+            .map_err(map_space_read_error)?;
         let record: GetRecord = serde_json::from_slice(&body)
             .map_err(|_| Error::Malformed("conversation Space record response"))?;
         let expected_uri = format!("{space}/{author}/{}/{rkey}", nsid::BATCH);
