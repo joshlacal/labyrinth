@@ -15,8 +15,7 @@
 //! never calls `createSpace`: the owner's PDS accepts writes to a Space no
 //! authority governs and serves them back with `read_self`, which is all an
 //! owner-only mailbox needs (checked live, `tests/live_space_pds.rs`). An
-//! app may still create it, once `createSpace` settles in
-//! `com.atproto.space` (upstream proposal #119).
+//! app may still create it with `com.atproto.space.createSpace`.
 //!
 //! What the PDS gives and how the store uses it:
 //!
