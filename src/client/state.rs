@@ -43,15 +43,15 @@ use zeroize::Zeroizing;
 use super::{Backends, Labyrinth, PeerPin};
 use crate::device::{DevicePublic, DeviceSecrets};
 use crate::epoch::{EpochKeys as _, EpochSecret};
-use crate::hpke::labyrinth::{X25519Public, X25519Secret};
+use crate::hpke::hawk::{HAWK_ENC_PUBLIC_LEN, HAWK_ENC_SECRET_LEN, HawkEncPublic, HawkEncSecret};
+use crate::hpke::{X25519Public, X25519Secret};
 use crate::mek::{Mek, MekProvenance};
-use crate::orf::OrfClientState;
 use crate::sign::{TransportSigner, XSigningKey, XVerifyingKey};
 use crate::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"LBYS";
-/// Version byte of the state encoding.
-pub const STATE_VERSION: u8 = 0x02;
+/// Version byte of the PQ clean-slate state encoding (`I16`, `2A`).
+pub const STATE_VERSION: u8 = 0x03;
 
 /// Writer. A first pass with `buf = None` only measures, so the real
 /// buffer is allocated once at its final size and never reallocates
@@ -114,6 +114,11 @@ impl<'a> R<'a> {
     fn secret(&mut self) -> Result<Zeroizing<[u8; 32]>> {
         let mut out = Zeroizing::new([0u8; 32]);
         out.copy_from_slice(self.take(32)?);
+        Ok(out)
+    }
+    fn secret_n<const N: usize>(&mut self) -> Result<Zeroizing<[u8; N]>> {
+        let mut out = Zeroizing::new([0u8; N]);
+        out.copy_from_slice(self.take(N)?);
         Ok(out)
     }
     fn u8(&mut self) -> Result<u8> {
@@ -180,11 +185,10 @@ impl Labyrinth {
             .as_ref()
             .map(|a| Zeroizing::new(a.to_bytes()));
         w.opt(auth.as_ref().map(|a| a.as_slice()));
-        w.bytes(Zeroizing::new(d.orf.to_bytes()).as_slice());
         let p = d.public();
         w.bytes(&p.device_key_pub.0);
-        w.bytes(&p.epoch_storage_key_pub.0);
-        w.bytes(&p.sig_0x30);
+        w.bytes(&p.epoch_storage_key_pub.to_bytes());
+        w.bytes(&p.sig_storage);
         w.opt(
             p.epoch_storage_auth_key_pub
                 .as_ref()
@@ -265,7 +269,7 @@ impl Labyrinth {
             return Err(Error::Malformed("not a labyrinth client state"));
         }
         let version = r.u8()?;
-        if version != STATE_VERSION && version != 0x01 {
+        if version != STATE_VERSION {
             return Err(Error::Unsupported(version));
         }
         if r.str()? != did {
@@ -276,22 +280,21 @@ impl Labyrinth {
         }
 
         let device_key = XSigningKey::from_bytes(*r.secret()?);
-        let storage = X25519Secret::from_bytes(*r.secret()?);
+        let storage = HawkEncSecret::from_bytes(*r.secret_n::<HAWK_ENC_SECRET_LEN>()?);
         let storage_auth = if r.bool()? {
             Some(X25519Secret::from_bytes(*r.secret()?))
         } else {
             None
         };
-        let orf = OrfClientState::from_bytes(*r.secret()?)?;
         let public = DevicePublic {
             device_key_pub: XVerifyingKey(r.arr()?),
-            epoch_storage_key_pub: X25519Public(r.arr()?),
-            sig_0x30: r.arr()?,
+            epoch_storage_key_pub: HawkEncPublic::from_bytes(r.take(HAWK_ENC_PUBLIC_LEN)?)?,
+            sig_storage: r.arr()?,
             epoch_storage_auth_key_pub: r.opt()?.map(X25519Public),
             sig_0x31: r.opt()?,
             is_virtual: r.bool()?,
         };
-        let device = DeviceSecrets::from_parts(device_key, storage, storage_auth, orf, public)?;
+        let device = DeviceSecrets::from_parts(device_key, storage, storage_auth, public)?;
 
         let salt = *r.secret()?;
         let latest = r.u64()?;
@@ -305,12 +308,9 @@ impl Labyrinth {
         for _ in 0..r.count(32)? {
             revoked.insert(r.arr::<32>()?);
         }
-        let mut verified = (latest, BTreeSet::new());
-        if version >= 0x02 {
-            verified.0 = r.u64()?;
-            for _ in 0..r.count(32)? {
-                verified.1.insert(r.arr::<32>()?);
-            }
+        let mut verified = (r.u64()?, BTreeSet::new());
+        for _ in 0..r.count(32)? {
+            verified.1.insert(r.arr::<32>()?);
         }
         let mut pins = BTreeMap::new();
         for _ in 0..r.count(2 + 8 + 64)? {

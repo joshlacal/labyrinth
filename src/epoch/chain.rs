@@ -1,4 +1,4 @@
-//! Forward and backward chaining (SPEC §5.1, §5.4–5.5, paper p.30, p.35–36).
+//! Forward and backward chaining (SPEC §5.1, §5.4–5.5, Gate 2, `I16`).
 
 use zeroize::Zeroizing;
 
@@ -8,7 +8,7 @@ use super::{
 };
 use crate::aead::{self, Suite};
 use crate::device::DevicePublic;
-use crate::hpke::labyrinth::{self as lhpke, X25519Secret};
+use crate::hpke::hawk::{HawkEncSecret, hawk_decrypt_with_psk};
 use crate::mailbox::EpochPublic;
 use crate::{Error, Result};
 
@@ -21,24 +21,21 @@ pub struct OpenedEpoch<'a> {
     pub my_member: &'a EpochMemberRecord,
     /// The opener's device record (`record.opened_by`).
     pub opener: &'a DevicePublic,
-    /// The opener's membership of the previous epoch.
-    pub opener_prev_member: &'a EpochMemberRecord,
+    /// The opener's membership of the previous epoch (`Some` for normal rotations;
+    /// `None` only when `opener` was newly enrolled via atomic Gate 3 `E -> E+1`
+    /// rotation, which is still authenticated by `prev_sig` under `prev`'s mailbox
+    /// signing key + `dist_psk` + `back_link` + chat attestation!).
+    pub opener_prev_member: Option<&'a EpochMemberRecord>,
 }
 
-/// Derive the epoch after `prev` from entropy addressed to `my_storage`.
-///
-/// Checks, in order: the opener is a verified physical device that was a
-/// member of `prev`; the entropy decrypts under `my_storage` and the
-/// opener's auth key with `distPsk`; the derived mailbox keys match the
-/// published `EpochPublic`, whose head, signatures and chain link to
-/// `prev_public` verify; `my_member`'s MAC verifies under the new epoch; and
-/// the encrypted back-link decrypts to `prev`.
+/// Derive the epoch after `prev` from `Hawk + PSK` entropy addressed to `my_storage`.
 pub fn forward_chain(
     did: &str,
     prev: &EpochSecret,
     prev_public: &EpochPublic,
     opened: &OpenedEpoch<'_>,
-    my_storage: &X25519Secret,
+    my_storage: &HawkEncSecret,
+    my_is_virtual: bool,
 ) -> Result<EpochSecret> {
     let record = opened.record;
     let seq = prev
@@ -52,12 +49,15 @@ pub fn forward_chain(
 
     let opener = opened.opener;
     let opener_auth = opener.verified_auth_key()?;
-    if opener.device_key_pub != record.opened_by
-        || opened.opener_prev_member.device_key_pub != opener.device_key_pub
-    {
+    if opener.device_key_pub != record.opened_by {
         return Err(Error::Malformed("epoch opener mismatch"));
     }
-    verify_member(prev, opened.opener_prev_member)?;
+    if let Some(opener_prev) = opened.opener_prev_member {
+        if opener_prev.device_key_pub != opener.device_key_pub {
+            return Err(Error::Malformed("epoch opener mismatch"));
+        }
+        verify_member(prev, opener_prev, opener.is_virtual)?;
+    }
 
     let ct = opened
         .my_member
@@ -65,7 +65,7 @@ pub fn forward_chain(
         .as_deref()
         .ok_or(Error::NotEpochMember)?;
     let (chain_key, psk) = prev.chaining_keys();
-    let pt = Zeroizing::new(lhpke::decrypt(
+    let pt = Zeroizing::new(hawk_decrypt_with_psk(
         &my_storage.public(),
         my_storage,
         &opener_auth,
@@ -81,7 +81,7 @@ pub fn forward_chain(
 
     verify_public(&epoch, &record.public)?;
     record.public.verify(did, Some(prev_public))?;
-    verify_member(&epoch, opened.my_member)?;
+    verify_member(&epoch, opened.my_member, my_is_virtual)?;
     let (back_seq, back_root) = decrypt_back_link(&epoch, record)?;
     if back_seq != prev.seq || back_root.as_slice() != prev.root() {
         return Err(Error::Malformed("epoch back-link does not match"));
@@ -90,11 +90,6 @@ pub fn forward_chain(
 }
 
 /// Recover the epoch before `cur` from `cur`'s record (p.36).
-///
-/// `record` must be `cur`'s own epoch record; the decrypted sequence number
-/// must be a decimal of at most 11 characters equal to `cur.seq - 1`.
-/// Callers can then authenticate the previous epoch's published record with
-/// [`super::verify_public`].
 pub fn backward_chain(
     cur: &EpochSecret,
     record: &EpochRecord,

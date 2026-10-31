@@ -142,24 +142,18 @@ impl State {
 
     pub(super) fn delete_vdevice(&mut self, did: &str, id: &[u8; 16]) -> Result<()> {
         let m = self.mailboxes.get_mut(did);
-        let vd = m
+        let _vd = m
             .and_then(|m| m.vdevices.remove(&hex::encode(id)))
             .ok_or(Error::NotFound("virtual device"))?;
-        if let Ok(k) = vd.device_key_pubkey.array::<32>("key") {
-            self.orf.remove(&(did.to_owned(), k));
-        }
         Ok(())
     }
 
-    /// Erases `did`'s mailbox, public keys, head chain, ORF states and
-    /// attachment references.
+    /// Erases `did`'s mailbox, public keys, and head chain.
     pub(super) fn purge(&mut self, did: &str) {
         self.mailboxes.remove(did);
         self.public_keys.remove(did);
         self.public_history.remove(did);
         self.ds_heads.remove(did);
-        self.orf.retain(|(owner, _), _| owner != did);
-        self.purge_attachments(did);
     }
 }
 

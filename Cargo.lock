@@ -784,6 +784,7 @@ dependencies = [
  "hex-literal",
  "hkdf",
  "hmac 0.13.0",
+ "labyrinth-protocol",
  "ml-kem",
  "proptest",
  "rand 0.10.3",

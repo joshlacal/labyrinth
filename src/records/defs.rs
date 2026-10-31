@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::Bytes;
 use crate::deletion::{Redaction, ServerRedaction, StoredRedaction};
+use crate::hpke::X25519Public;
 use crate::hpke::hawk::HawkEncPublic;
-use crate::hpke::labyrinth::X25519Public;
 use crate::mailbox::{EpochPublic, MailboxPublicKeys, TransportAttestation};
 use crate::mek::MekRecipient;
 use crate::message::{OwnerMessage, SealedMessage};
@@ -20,7 +20,7 @@ pub struct TransportAttestationDef {
     pub sig: Bytes,
 }
 
-/// `defs#epochPublic` (SPEC §5.2–5.3).
+/// `defs#epochPublic` (SPEC §5.2–5.3, Gate 2/3 `membersHash`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EpochPublicDef {
@@ -28,6 +28,7 @@ pub struct EpochPublicDef {
     pub auth_pubkey: Bytes,
     pub encryption_pubkey: Bytes,
     pub signing_pubkey: Bytes,
+    pub members_hash: Bytes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_epoch_head: Option<Bytes>,
     pub epoch_head: Bytes,
@@ -44,6 +45,7 @@ impl EpochPublicDef {
             auth_pubkey: Bytes::from_slice(&p.keys.auth.0),
             encryption_pubkey: Bytes(p.keys.enc.to_bytes()),
             signing_pubkey: Bytes::from_slice(&p.keys.sig.0),
+            members_hash: Bytes::from_slice(&p.members_hash),
             previous_epoch_head: p.prev_head.map(|h| Bytes::from_slice(&h)),
             epoch_head: Bytes::from_slice(&p.head),
             self_sig: Bytes::from_slice(&p.self_sig),
@@ -65,6 +67,7 @@ impl EpochPublicDef {
                 enc: HawkEncPublic::from_bytes(&self.encryption_pubkey.0)?,
                 sig: XVerifyingKey(self.signing_pubkey.array("signingPubkey length")?),
             },
+            members_hash: self.members_hash.array("membersHash length")?,
             prev_head: self
                 .previous_epoch_head
                 .as_ref()

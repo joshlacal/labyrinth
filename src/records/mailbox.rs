@@ -6,7 +6,8 @@ use super::defs::{EpochPublicDef, OwnerMessageDef, TransportAttestationDef};
 use super::{Bytes, check_type, nsid};
 use crate::device::{ChatBinding, DevicePublic};
 use crate::epoch::{EpochMemberRecord, EpochRecord};
-use crate::hpke::labyrinth::X25519Public;
+use crate::hpke::X25519Public;
+use crate::hpke::hawk::HawkEncPublic;
 use crate::mailbox::EpochPublic;
 use crate::message::OwnerMessage;
 use crate::sign::XVerifyingKey;
@@ -40,8 +41,8 @@ impl Device {
         Self {
             type_: nsid::DEVICE.into(),
             device_key_pubkey: Bytes::from_slice(&p.device_key_pub.0),
-            epoch_storage_key_pubkey: Bytes::from_slice(&p.epoch_storage_key_pub.0),
-            epoch_storage_key_sig: Bytes::from_slice(&p.sig_0x30),
+            epoch_storage_key_pubkey: Bytes(p.epoch_storage_key_pub.to_bytes()),
+            epoch_storage_key_sig: Bytes::from_slice(&p.sig_storage),
             epoch_storage_auth_key_pubkey: p
                 .epoch_storage_auth_key_pub
                 .map(|k| Bytes::from_slice(&k.0)),
@@ -81,11 +82,8 @@ impl Device {
         check_type(&self.type_, nsid::DEVICE)?;
         Ok(DevicePublic {
             device_key_pub: XVerifyingKey(self.device_key_pubkey.array("deviceKeyPubkey")?),
-            epoch_storage_key_pub: X25519Public(
-                self.epoch_storage_key_pubkey
-                    .array("epochStorageKeyPubkey")?,
-            ),
-            sig_0x30: self.epoch_storage_key_sig.array("epochStorageKeySig")?,
+            epoch_storage_key_pub: HawkEncPublic::from_bytes(&self.epoch_storage_key_pubkey.0)?,
+            sig_storage: self.epoch_storage_key_sig.array("epochStorageKeySig")?,
             epoch_storage_auth_key_pub: self
                 .epoch_storage_auth_key_pubkey
                 .as_ref()
@@ -221,7 +219,6 @@ pub struct VirtualDevice {
     pub epoch_storage_key_sig: Bytes,
     pub encrypted_device_key_priv: Bytes,
     pub encrypted_epoch_storage_key_priv: Bytes,
-    pub encrypted_orf_client_state: Bytes,
     pub encrypted_mailbox_root_salt: Bytes,
     pub encrypted_epoch_root_key: Bytes,
     pub encrypted_epoch_number: Bytes,
@@ -247,11 +244,10 @@ impl VirtualDevice {
             type_: nsid::VIRTUAL_DEVICE.into(),
             vdevice_id: Bytes::from_slice(&r.vdevice_id),
             device_key_pubkey: Bytes::from_slice(&r.public.device_key_pub.0),
-            epoch_storage_key_pubkey: Bytes::from_slice(&r.public.epoch_storage_key_pub.0),
-            epoch_storage_key_sig: Bytes::from_slice(&r.public.sig_0x30),
+            epoch_storage_key_pubkey: Bytes(r.public.epoch_storage_key_pub.to_bytes()),
+            epoch_storage_key_sig: Bytes::from_slice(&r.public.sig_storage),
             encrypted_device_key_priv: Bytes(r.encrypted_device_key_priv.clone()),
             encrypted_epoch_storage_key_priv: Bytes(r.encrypted_epoch_storage_key_priv.clone()),
-            encrypted_orf_client_state: Bytes(r.encrypted_orf_client_state.clone()),
             encrypted_mailbox_root_salt: Bytes(r.encrypted_mailbox_root_salt.clone()),
             encrypted_epoch_root_key: Bytes(r.encrypted_epoch_root_key.clone()),
             encrypted_epoch_number: Bytes(r.encrypted_epoch_number.clone()),
@@ -267,11 +263,8 @@ impl VirtualDevice {
         check_type(&self.type_, nsid::VIRTUAL_DEVICE)?;
         let public = DevicePublic {
             device_key_pub: XVerifyingKey(self.device_key_pubkey.array("deviceKeyPubkey")?),
-            epoch_storage_key_pub: X25519Public(
-                self.epoch_storage_key_pubkey
-                    .array("epochStorageKeyPubkey")?,
-            ),
-            sig_0x30: self.epoch_storage_key_sig.array("epochStorageKeySig")?,
+            epoch_storage_key_pub: HawkEncPublic::from_bytes(&self.epoch_storage_key_pubkey.0)?,
+            sig_storage: self.epoch_storage_key_sig.array("epochStorageKeySig")?,
             epoch_storage_auth_key_pub: None,
             sig_0x31: None,
             is_virtual: true,
@@ -290,7 +283,6 @@ impl VirtualDevice {
             public,
             encrypted_device_key_priv: self.encrypted_device_key_priv.0.clone(),
             encrypted_epoch_storage_key_priv: self.encrypted_epoch_storage_key_priv.0.clone(),
-            encrypted_orf_client_state: self.encrypted_orf_client_state.0.clone(),
             encrypted_mailbox_root_salt: self.encrypted_mailbox_root_salt.0.clone(),
             encrypted_epoch_root_key: self.encrypted_epoch_root_key.0.clone(),
             encrypted_epoch_number: self.encrypted_epoch_number.0.clone(),

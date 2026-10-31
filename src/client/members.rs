@@ -124,7 +124,7 @@ impl Labyrinth {
             .ok()
             .filter(|p| p.verify().is_ok() && p.device_key_pub == record.device_key_pub)
             .ok_or(ExclusionReason::InvalidDeviceRecord)?;
-        verify_member(epoch, record).map_err(|_| ExclusionReason::InvalidMac)?;
+        verify_member(epoch, record, public.is_virtual).map_err(|_| ExclusionReason::InvalidMac)?;
         if !public.is_virtual {
             let binding = device
                 .chat_binding()

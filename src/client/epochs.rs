@@ -11,7 +11,7 @@ use crate::epoch::{
     EpochMemberRecord, EpochRecord, EpochSecret, OpenedEpoch, backward_chain, forward_chain,
     open_genesis, open_next, verify_member, verify_public,
 };
-use crate::hpke::labyrinth::X25519Secret;
+use crate::hpke::hawk::HawkEncSecret;
 use crate::mailbox::EpochPublic;
 use crate::records::{Device, Epoch, EpochMember, MailboxKeysRecord};
 use crate::sign::{TransportSigner, XVerifyingKey};
@@ -40,8 +40,7 @@ pub struct SyncReport {
 pub struct RotationReport {
     /// The epoch opened without the revoked device.
     pub new_epoch: u64,
-    /// The revoked device. Its ORF server state ([CB-17]) has already
-    /// been deleted through [`super::Backends::orf`] (SPEC §5.6).
+    /// The revoked device.
     pub revoked: XVerifyingKey,
     /// Members of the previous epoch the rotation dropped because they
     /// failed verification or are not bound to a current chat device
@@ -186,20 +185,12 @@ fn member(
 
 /// Forward-chains from `start` as long as the store has a next epoch.
 /// Returns every epoch reached, `start` first.
-///
-/// A next epoch that chains validly (signed with the previous epoch's
-/// mailbox key, opened by a valid member of the previous epoch) but holds
-/// no valid membership for `me` fails with [`Error::NotEpochMember`]: the
-/// device was revoked. A next epoch that does not chain, or whose opener
-/// is in `revoked`, fails with [`Error::EpochSquatted`] ([CB-40]): it
-/// occupies the sequence number every rotation needs, so retrying cannot
-/// help and the caller must surface it.
 pub(super) fn chain_forward(
     mb: &dyn MailboxStore,
     did: &str,
     start: EpochSecret,
     me: &DevicePublic,
-    storage: &X25519Secret,
+    storage: &HawkEncSecret,
     revoked: &BTreeSet<[u8; 32]>,
 ) -> Result<Vec<EpochSecret>> {
     let mut out = vec![start];
@@ -232,26 +223,23 @@ pub(super) fn chain_forward(
         if revoked.contains(&record.opened_by.0) {
             return Err(squat("it was opened by a device this client revoked"));
         }
-        let opener_prev = member(mb, prev.seq, &opener.device_key_pub)?
-            .ok_or(squat("its opener was not a member of the previous epoch"))?;
-        verify_member(prev, &opener_prev)
-            .map_err(|_| squat("its opener was not a member of the previous epoch"))?;
-        // Only an absent membership record proves that this device was
-        // revoked. Backend/decoding failures are uncertainty and must
-        // propagate; otherwise passkey recovery could skip a potentially
-        // active bundle and enroll from a second matching candidate.
+        // In Gate 3 atomic enrollment (`open_next_enrolling`), a newly enrolled
+        // physical device opens `E+1` directly using `E`'s mailbox signing key;
+        // it was not yet a member of `E`, whereas normal rotations have `opener_prev`.
+        let opener_prev = member(mb, prev.seq, &opener.device_key_pub)?;
+        if let Some(ref op_prev) = opener_prev {
+            verify_member(prev, op_prev, opener.is_virtual)
+                .map_err(|_| squat("its opener's previous epoch membership failed MAC"))?;
+        }
         let mine = member(mb, seq, &me.device_key_pub)?.ok_or(Error::NotEpochMember)?;
         let opened = OpenedEpoch {
             epoch_id: &next.rkey,
             record: &record,
             my_member: &mine,
             opener: &opener,
-            opener_prev_member: &opener_prev,
+            opener_prev_member: opener_prev.as_ref(),
         };
-        // Once a membership row exists, missing entropy or a bad
-        // sequence/MAC is not evidence of revocation. It is an immutable
-        // invalid child occupying the next sequence and must fail closed.
-        let e = forward_chain(did, prev, &prev_public, &opened, storage)
+        let e = forward_chain(did, prev, &prev_public, &opened, storage, me.is_virtual)
             .map_err(|_| squat("the entropy addressed to this device does not open"))?;
         out.push(e);
     }
@@ -409,13 +397,7 @@ impl Labyrinth {
     /// epoch; the last write restores the newest.
     pub fn finish_initialize(&self) -> Result<()> {
         self.ensure_latest_revocation_safe()?;
-        let key = self.device.public().device_key_pub;
-        let orf = match self.b.orf.register(&key, None) {
-            Ok(()) | Err(Error::Conflict) => Ok(()),
-            Err(e) => Err(e),
-        };
-        // Publish even when the ORF is down: the directories don't need it.
-        let published = (0..=self.latest).try_for_each(|seq| {
+        (0..=self.latest).try_for_each(|seq| {
             match self.publish_keys(&self.epoch_record(seq)?.1.public) {
                 Ok(()) => Ok(()),
                 Err(Error::EpochRollback { pinned, .. })
@@ -425,8 +407,7 @@ impl Labyrinth {
                 }
                 Err(e) => Err(e),
             }
-        });
-        orf.and(published)
+        })
     }
 
     pub(super) fn epoch_record(&self, seq: u64) -> Result<(String, EpochRecord)> {
@@ -674,7 +655,6 @@ impl Labyrinth {
         self.revoked.insert(target.0);
         self.sync_epochs_allowing(&BTreeSet::from([target.0]))?;
         self.b.mailbox.set_device_revoked(target, &self.now())?;
-        self.b.orf.delete(target)?;
         for _ in 0..ROTATE_ATTEMPTS {
             let exclude = self.revoked.clone();
             match self.rotate(&exclude) {

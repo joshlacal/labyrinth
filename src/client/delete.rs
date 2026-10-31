@@ -72,9 +72,7 @@ impl Labyrinth {
         let t = seal_owner_tombstone(e.root(), e.seq, thread_id, message_id, timestamp, author)?;
         self.queue_owner(thread_id, t)?;
         self.flush_owner(thread_id)?;
-        for b in blob_ids {
-            self.delete_attachment_reference(thread_id, b)?;
-        }
+        let _ = blob_ids;
         Ok(())
     }
 

@@ -49,7 +49,6 @@ pub use keys::{
 
 use crate::deletion::Redaction;
 use crate::mailbox::EpochPublic;
-use crate::orf::{EvolveToken, ObliviousId};
 use crate::records::{
     Batch, Device, Epoch, EpochMember, MailboxKeysRecord, MekDistribution, OwnerBatch,
     VirtualDevice,
@@ -390,85 +389,5 @@ pub trait KeyPublisher {
     /// calls.
     fn retract(&self) -> Result<()> {
         Err(Error::NotSupported("retract mailboxKeys"))
-    }
-}
-
-/// `putAttachmentRef` input ([CB-33]). The two blinded values are
-/// `orf_client_map` outputs over `json([threadId, blobId])` under the
-/// paper's index and token-salt scopes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AttachmentPut {
-    pub blinded_index: ObliviousId,
-    pub blinded_token_salt: ObliviousId,
-    pub blob_id: String,
-    pub thread_id: String,
-    pub message_id: String,
-}
-
-/// `getAttachmentBlob` input ([CB-33]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AttachmentFetch {
-    pub blinded_index: ObliviousId,
-    pub blinded_token_salt: ObliviousId,
-    pub thread_id: String,
-    pub message_id: String,
-}
-
-/// The ORF server role ([CB-17], SPEC §3.6, §8): one server state per
-/// device of the handle's DID. The server computes every step itself and
-/// never reveals a state.
-pub trait OrfServer {
-    /// Registers `device_key`'s server state: a fresh one
-    /// (`orf_server_init`) without a parent, else
-    /// `orf_server_evolve(parent state, token)`. Fails with
-    /// [`crate::Error::Conflict`] if the device already has a state and
-    /// with [`crate::Error::NotFound`] if the parent has none.
-    fn register(
-        &self,
-        device_key: &XVerifyingKey,
-        parent: Option<(&XVerifyingKey, &EvolveToken)>,
-    ) -> Result<()>;
-    /// `orf_server_map(state of device_key, domain, id)`. mls-ds applies
-    /// this only inside its attachment-reference endpoints and exposes no
-    /// raw map, so the XRPC implementation refuses it.
-    fn map(&self, device_key: &XVerifyingKey, domain: &[u8], id: &ObliviousId) -> Result<[u8; 32]>;
-    /// Deletes `device_key`'s state (revocation, SPEC §5.6). Idempotent.
-    fn delete(&self, device_key: &XVerifyingKey) -> Result<()>;
-
-    /// Store an attachment reference ([CB-33], SPEC §8) under
-    /// `idx = orf_server_map(state, INDEX, blinded_index)` with
-    /// `tokenMac = HMAC(orf_server_map(state, TOKEN, blinded_token_salt),
-    /// json([threadId, messageId]))`. The server checks the caller may
-    /// read the blob in that message, and refuses a second message for
-    /// the same blob (`Conflict`). mls-ds `putAttachmentRef`.
-    fn put_attachment_ref(&self, device_key: &XVerifyingKey, put: &AttachmentPut) -> Result<()> {
-        let _ = (device_key, put);
-        Err(Error::NotSupported("putAttachmentRef"))
-    }
-
-    /// The blob bytes behind a reference, after the server recomputes the
-    /// token MAC from the presented thread and message, and checks the
-    /// message still exists unredacted where the caller can read it.
-    /// A missing reference, a wrong token and a gone message are all
-    /// [`Error::NotFound`] (`"attachment"`), so callers cannot probe.
-    /// mls-ds `getAttachmentBlob`.
-    fn fetch_attachment(
-        &self,
-        device_key: &XVerifyingKey,
-        fetch: &AttachmentFetch,
-    ) -> Result<Vec<u8>> {
-        let _ = (device_key, fetch);
-        Err(Error::NotSupported("getAttachmentBlob"))
-    }
-
-    /// Delete one reference (delete-for-me of its message). Idempotent.
-    /// mls-ds `deleteAttachmentRef`.
-    fn delete_attachment_ref(
-        &self,
-        device_key: &XVerifyingKey,
-        blinded_index: &ObliviousId,
-    ) -> Result<()> {
-        let _ = (device_key, blinded_index);
-        Err(Error::NotSupported("deleteAttachmentRef"))
     }
 }

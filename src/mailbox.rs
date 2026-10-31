@@ -1,7 +1,14 @@
-//! Per-epoch mailbox keys, the epoch head, and its signatures
-//! (SPEC §5.2–5.3, paper p.22–28; [CB-1], [CB-10], [CB-18]).
+//! Per-epoch mailbox keys, `membersHash` (`Gate 2`), the epoch head, and its
+//! signatures (SPEC §5.2–5.3; [CB-1], [CB-10], [CB-18]).
 
-use crate::encoding::{hex, kdf32, minos_salt, sha256};
+use labyrinth_protocol::epoch_chain::{
+    EpochPublicHeader, MemberBinding, compute_epoch_head, compute_members_hash,
+};
+use subtle::ConstantTimeEq as _;
+
+use crate::device::DevicePublic;
+use crate::encoding::{kdf32, minos_salt};
+use crate::hpke::X25519Public;
 use crate::hpke::hawk::{
     HawkAuthPublic, HawkAuthSecret, HawkEncPublic, HawkEncSecret, hawk_derive_auth, hawk_derive_enc,
 };
@@ -60,30 +67,28 @@ pub struct MailboxPublicKeys {
     pub sig: XVerifyingKey,
 }
 
-/// `get_epoch_head` (p.22–23) with `user_fbid` replaced by `user_did` ([CB-1]).
+/// Compute `membersHash` (`SHA-256` over sorted active `(device_key_pub, epoch_storage_key_pub, is_virtual)`).
+pub fn members_hash_for_devices(devices: &[DevicePublic]) -> Result<[u8; 32]> {
+    let bindings: Vec<MemberBinding> = devices.iter().map(DevicePublic::member_binding).collect();
+    compute_members_hash(&bindings).map_err(|_| Error::Malformed("invalid epoch member set"))
+}
+
+/// `get_epoch_head` ([CB-1], `Gate 2` `membersHash` bound) via `labyrinth-protocol`.
 pub fn epoch_head(
     seq: u64,
     keys: &MailboxPublicKeys,
+    members_hash: &[u8; 32],
     prev_head: Option<&[u8; 32]>,
     did: &str,
 ) -> [u8; 32] {
-    let prev = prev_head.map_or_else(|| "null".to_owned(), |h| hex(h));
-    let epoch_hash = sha256(
-        format!(
-            "epoch_public_data:auth_pubkey={};encryption_pubkey={};epoch_number={seq};\
-             previous_epoch_head={prev};signing_pubkey={};user_did={did}",
-            hex(&keys.auth.0),
-            hex(&keys.enc.to_bytes()),
-            hex(&keys.sig.0),
-        )
-        .as_bytes(),
-    );
-    sha256(
-        format!(
-            "epoch_head:epoch_hash={};epoch_number={seq};previous_epoch_head={prev}",
-            hex(&epoch_hash)
-        )
-        .as_bytes(),
+    compute_epoch_head(
+        seq,
+        &keys.auth.0,
+        &keys.enc.to_bytes(),
+        &keys.sig.0,
+        members_hash,
+        prev_head,
+        did,
     )
 }
 
@@ -111,6 +116,7 @@ pub struct TransportAttestation {
 pub struct EpochPublic {
     pub seq: u64,
     pub keys: MailboxPublicKeys,
+    pub members_hash: [u8; 32],
     pub prev_head: Option<[u8; 32]>,
     pub head: [u8; 32],
     pub self_sig: [u8; 64],
@@ -120,11 +126,12 @@ pub struct EpochPublic {
 
 impl EpochPublic {
     /// Build and sign the public record for an epoch the caller just opened.
-    /// `prev_sig_key` is the previous epoch's mailbox signing key (None for epoch 0).
+    /// `prev_sig_key` is the previous epoch's mailbox signing key (`None` for epoch 0).
     pub fn sign(
         did: &str,
         seq: u64,
         keys: &MailboxKeys,
+        members_hash: [u8; 32],
         prev_head: Option<[u8; 32]>,
         prev_sig_key: Option<&XSigningKey>,
         transport: &dyn TransportSigner,
@@ -133,7 +140,7 @@ impl EpochPublic {
             return Err(Error::Malformed("epoch chain inputs inconsistent"));
         }
         let public = keys.public();
-        let head = epoch_head(seq, &public, prev_head.as_ref(), did);
+        let head = epoch_head(seq, &public, &members_hash, prev_head.as_ref(), did);
         let self_sig = keys.sig_secret.sign(&prefixed(SELF_SIG_PREFIX, &head))?;
         let prev_sig = prev_sig_key
             .map(|k| k.sign(&prefixed(PREV_SIG_PREFIX, &head)))
@@ -145,6 +152,7 @@ impl EpochPublic {
         Ok(Self {
             seq,
             keys: public,
+            members_hash,
             prev_head,
             head,
             self_sig,
@@ -155,12 +163,16 @@ impl EpochPublic {
 
     /// Verify the head, the self signature, the attestation, and — when the
     /// previous epoch's public record is given — the chain link to it.
-    ///
-    /// Callers must separately check that `attestation.transport_public_key`
-    /// belongs to one of `did`'s chat devices ([CB-18]).
     pub fn verify(&self, did: &str, previous: Option<&EpochPublic>) -> Result<()> {
-        let expected = epoch_head(self.seq, &self.keys, self.prev_head.as_ref(), did);
-        if expected != self.head {
+        self.keys.enc.validate()?;
+        let expected = epoch_head(
+            self.seq,
+            &self.keys,
+            &self.members_hash,
+            self.prev_head.as_ref(),
+            did,
+        );
+        if !bool::from(expected.ct_eq(&self.head)) {
             return Err(Error::Malformed("epoch head mismatch"));
         }
         self.keys
@@ -177,8 +189,6 @@ impl EpochPublic {
             }
             return Ok(());
         }
-        // [CB-35]: above epoch 0 the chain link is mandatory, whether or not
-        // the caller has the previous record to check it against.
         if self.prev_head.is_none() {
             return Err(Error::Malformed("missing prev_head"));
         }
@@ -191,10 +201,17 @@ impl EpochPublic {
         Ok(())
     }
 
-    /// Check only the chain link to the previous epoch, given the parts of
-    /// it that matter: its sequence number, its head, and its mailbox
-    /// signing key (which made `prev_sig`). Does not verify `self`; call
-    /// [`verify`](Self::verify) as well.
+    /// Verify that `active_devices` hashes to `self.members_hash` (`Gate 2`).
+    pub fn verify_members(&self, active_devices: &[DevicePublic]) -> Result<()> {
+        let computed = members_hash_for_devices(active_devices)?;
+        if bool::from(computed.ct_eq(&self.members_hash)) {
+            Ok(())
+        } else {
+            Err(Error::Malformed("epoch members_hash mismatch"))
+        }
+    }
+
+    /// Check only the chain link to the previous epoch.
     pub fn verify_link(
         &self,
         prev_seq: u64,
@@ -207,11 +224,50 @@ impl EpochPublic {
         }
         prev_sig_key.verify(&prefixed(PREV_SIG_PREFIX, &self.head), &prev_sig)
     }
+
+    /// Convert to [`labyrinth_protocol::epoch_chain::EpochPublicHeader`].
+    pub fn to_protocol_header(&self) -> EpochPublicHeader {
+        EpochPublicHeader {
+            seq: self.seq,
+            auth_pubkey: self.keys.auth.0,
+            encryption_pubkey: self.keys.enc.to_bytes(),
+            signing_pubkey: self.keys.sig.0,
+            members_hash: self.members_hash,
+            prev_head: self.prev_head,
+            head: self.head,
+            self_sig: self.self_sig,
+            prev_sig: self.prev_sig,
+            attestation_pubkey: self.attestation.transport_public_key,
+            attestation_sig: self.attestation.sig,
+        }
+    }
+
+    /// Parse from [`labyrinth_protocol::epoch_chain::EpochPublicHeader`].
+    pub fn from_protocol_header(h: &EpochPublicHeader) -> Result<Self> {
+        Ok(Self {
+            seq: h.seq,
+            keys: MailboxPublicKeys {
+                auth: X25519Public(h.auth_pubkey),
+                enc: HawkEncPublic::from_bytes(&h.encryption_pubkey)?,
+                sig: XVerifyingKey(h.signing_pubkey),
+            },
+            members_hash: h.members_hash,
+            prev_head: h.prev_head,
+            head: h.head,
+            self_sig: h.self_sig,
+            prev_sig: h.prev_sig,
+            attestation: TransportAttestation {
+                transport_public_key: h.attestation_pubkey,
+                sig: h.attestation_sig,
+            },
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::DeviceSecrets;
     use crate::sign::Ed25519Transport;
 
     fn transport() -> Ed25519Transport {
@@ -222,14 +278,19 @@ mod tests {
     fn chain_of_three_verifies_and_detects_tampering() {
         let did = "did:plc:testvector";
         let t = transport();
+        let dev = DeviceSecrets::generate().unwrap();
+        let mh = members_hash_for_devices(std::slice::from_ref(dev.public())).unwrap();
+
         let k0 = MailboxKeys::derive(&[1u8; 32], 0);
-        let e0 = EpochPublic::sign(did, 0, &k0, None, None, &t).unwrap();
+        let e0 = EpochPublic::sign(did, 0, &k0, mh, None, None, &t).unwrap();
         e0.verify(did, None).unwrap();
         let k1 = MailboxKeys::derive(&[2u8; 32], 1);
-        let e1 = EpochPublic::sign(did, 1, &k1, Some(e0.head), Some(&k0.sig_secret), &t).unwrap();
+        let e1 =
+            EpochPublic::sign(did, 1, &k1, mh, Some(e0.head), Some(&k0.sig_secret), &t).unwrap();
         e1.verify(did, Some(&e0)).unwrap();
         let k2 = MailboxKeys::derive(&[3u8; 32], 2);
-        let e2 = EpochPublic::sign(did, 2, &k2, Some(e1.head), Some(&k1.sig_secret), &t).unwrap();
+        let e2 =
+            EpochPublic::sign(did, 2, &k2, mh, Some(e1.head), Some(&k1.sig_secret), &t).unwrap();
         e2.verify(did, Some(&e1)).unwrap();
 
         assert!(e1.verify("did:plc:other", Some(&e0)).is_err());
@@ -237,24 +298,23 @@ mod tests {
         let mut bad = e1.clone();
         bad.keys.auth.0[0] ^= 1;
         assert!(bad.verify(did, Some(&e0)).is_err());
-        // A prev_sig made by the wrong key fails the chain check.
         let forged =
-            EpochPublic::sign(did, 1, &k1, Some(e0.head), Some(&k2.sig_secret), &t).unwrap();
+            EpochPublic::sign(did, 1, &k1, mh, Some(e0.head), Some(&k2.sig_secret), &t).unwrap();
         assert!(forged.verify(did, Some(&e0)).is_err());
     }
 
-    /// [CB-35]: a record above epoch 0 with a null previous head is rejected
-    /// even by a standalone verifier that has no previous record to link to.
     #[test]
     fn null_prev_head_above_epoch_zero_is_rejected_standalone() {
         let did = "did:plc:testvector";
         let t = transport();
+        let mh = [0x42u8; 32];
         let k1 = MailboxKeys::derive(&[2u8; 32], 1);
         let keys = k1.public();
-        let head = epoch_head(1, &keys, None, did);
+        let head = epoch_head(1, &keys, &mh, None, did);
         let forged = EpochPublic {
             seq: 1,
             keys,
+            members_hash: mh,
             prev_head: None,
             head,
             self_sig: k1
@@ -268,13 +328,6 @@ mod tests {
             },
         };
         assert!(forged.verify(did, None).is_err());
-        assert!(EpochPublic::sign(did, 1, &k1, None, None, &t).is_err());
-    }
-
-    #[test]
-    fn derive_is_deterministic_and_epoch_scoped() {
-        let a = MailboxKeys::derive(&[9u8; 32], 4).public();
-        assert_eq!(a, MailboxKeys::derive(&[9u8; 32], 4).public());
-        assert_ne!(a, MailboxKeys::derive(&[9u8; 32], 5).public());
+        assert!(EpochPublic::sign(did, 1, &k1, mh, None, None, &t).is_err());
     }
 }

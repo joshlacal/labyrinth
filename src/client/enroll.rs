@@ -8,7 +8,6 @@ use super::{Backends, Labyrinth};
 use crate::device::ChatBinding;
 use crate::epoch::{EpochKeys as _, EpochSecret, PendingEpoch, verify_public};
 use crate::mailbox::EpochPublic;
-use crate::orf::EvolveToken;
 use crate::otc::{Initiator, InitiatorMessage, OneTimeCode, Responder, ResponderMessage};
 use crate::records::mailbox::PasskeyWrap;
 use crate::records::{Device, EpochMember, VirtualDevice, datetime_from_ms};
@@ -20,43 +19,22 @@ use crate::virtual_device::{
 use crate::{Error, Result};
 
 /// A new recovery bundle. Show `code` to the user (or store it in the
-/// keychain), then drop it. The client has already registered the bundle's
-/// ORF state with [`Backends::orf`]
-/// (`vdeviceServerState = orf_server_evolve(token, parent state)`);
-/// `evolve_token` is returned only for callers that mirror ORF state.
+/// keychain), then drop it.
 pub struct RecoverySetup {
     pub code: RecoveryCode,
     pub vdevice_id: [u8; 16],
-    pub evolve_token: EvolveToken,
 }
 
-/// A device enrolled by restore or one-time code. The client has already
-/// registered `device_key`'s ORF state with [`Backends::orf`];
-/// `evolve_token` is returned only for callers that mirror ORF state.
+/// A device enrolled by restore or one-time code.
 pub struct Enrollment {
     pub device_key: XVerifyingKey,
-    pub evolve_token: EvolveToken,
-}
-
-/// The id under which a one-time-code transfer's temporary ORF server
-/// state is registered: both devices derive it from the CPace session
-/// key, so only they can name it. The responder registers the temporary
-/// state under it; the new device evolves its own state from it and then
-/// deletes it.
-fn otc_temp_orf_id(isk: &crate::otc::Isk) -> XVerifyingKey {
-    let mut input = b"catbird.labyrinth.otc_temp_orf:".to_vec();
-    input.extend_from_slice(isk.as_bytes());
-    XVerifyingKey(crate::encoding::sha256(&input))
 }
 
 /// What the enrolled device sends back in a one-time-code transfer.
 pub struct OtcResponse {
     pub message: ResponderMessage,
-    /// [`OtcPayload`] sealed under the CPace session key.
+    /// [`OtcPayload`] sealed under the hybrid PQ `OtcSessionKey`.
     pub sealed_payload: Vec<u8>,
-    /// Evolve token for the temporary ORF state handed to the new device,
-    /// already registered with [`Backends::orf`].
-    pub evolve_token: EvolveToken,
 }
 
 impl core::fmt::Debug for Enrollment {
@@ -203,7 +181,7 @@ impl Labyrinth {
         self.sync_epochs()?;
         let current = self.epoch_secret(self.latest)?;
         let code = RecoveryCode::generate()?;
-        let (rec, evolve_token, member) = virtual_device::create(
+        let (rec, member) = virtual_device::create(
             &self.did,
             &code,
             &self.device,
@@ -221,8 +199,6 @@ impl Labyrinth {
             .transpose()?;
         let now = self.now();
         let mb = self.b.mailbox.as_ref();
-        // Device record first: mls-ds admits only registered devices as
-        // members (createVirtualDevice may carry the membership).
         mb.create_device(&Device::from_public(&rec.public, now.clone()))?;
         mb.create_virtual_device(&VirtualDevice::from_bundle(
             &rec,
@@ -230,14 +206,9 @@ impl Labyrinth {
             now.clone(),
         ))?;
         mb.create_epoch_member(&EpochMember::from_record(&member, now))?;
-        self.b.orf.register(
-            &rec.public.device_key_pub,
-            Some((&self.device.public().device_key_pub, &evolve_token)),
-        )?;
         Ok(RecoverySetup {
             code,
             vdevice_id: rec.vdevice_id,
-            evolve_token,
         })
     }
 
@@ -281,8 +252,6 @@ impl Labyrinth {
         transport: Box<dyn TransportSigner + Send>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
-        // Validate before listing records so an unknown credential cannot
-        // turn a malformed PRF input into a credential-existence oracle.
         passkey::validate_prf_output(prf_output)?;
         let bundles = b.mailbox.list_virtual_devices()?;
         let candidates = select_passkey_bundles(did, prf_output, credential_id, &bundles)?;
@@ -297,12 +266,6 @@ impl Labyrinth {
             match Self::prepare_restore_from_bundle(did, bundle, &code, &b) {
                 Ok(_) if prepared.is_some() => return Err(Error::Conflict),
                 Ok(candidate) => prepared = Some(candidate),
-                // A bundle conclusively absent from the newest epoch or
-                // expired by its recovery TTL may be skipped in favor of a
-                // fresh active bundle. Any other preflight failure is
-                // uncertainty about a potentially active matching bundle; do
-                // not let another candidate hide a backend, attestation, or
-                // chain-integrity failure.
                 Err(Error::NotEpochMember) => {
                     prefer_passkey_error(&mut first_error, Error::NotEpochMember)
                 }
@@ -328,10 +291,6 @@ impl Labyrinth {
         Self::finish_prepared_restore(did, prepared, transport, b)
     }
 
-    /// Validate and open a bundle without touching it or creating device,
-    /// membership, or ORF state. Passkey recovery uses this to ignore a
-    /// retained revoked bundle while detecting multiple active matches
-    /// before any candidate can cause a write.
     fn prepare_restore_from_bundle(
         did: &str,
         bundle: &VirtualDevice,
@@ -358,8 +317,6 @@ impl Labyrinth {
         let (id, start_record) = epoch_record(b.mailbox.as_ref(), seq)?;
         let start = PendingEpoch::new(seq, *restored.epoch.root()).assign_id(id);
         verify_public(&start, &start_record.public)?;
-        // The forward walk verifies every later record against its
-        // predecessor; the starting one needs its own signatures checked.
         start_record.public.verify(did, None)?;
         let reached = chain_forward(
             b.mailbox.as_ref(),
@@ -399,25 +356,17 @@ impl Labyrinth {
             latest_public,
         } = prepared;
         let latest = reached.last().expect("non-empty");
-        let (device, public, evolve_token, member) =
-            virtual_device::enroll_from_virtual(&restored, latest)?;
+        let (device, public, member) = virtual_device::enroll_from_virtual(&restored, latest)?;
         let now = datetime_from_ms(b.clock.now_ms());
         let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());
         b.mailbox
             .create_device(&Device::bound(&public, &binding, now.clone()))?;
         b.mailbox
             .create_epoch_member(&EpochMember::from_record(&member, now))?;
-        // [CB-39] The bundle was used: keep it from expiring. Run after
-        // `create_device` + `create_epoch_member` so the recovering chat device
-        // is already bound (`touchVirtualDevice` requires a bound device).
         match b.mailbox.touch_virtual_device(&record.vdevice_id) {
             Ok(()) | Err(Error::NotSupported(_)) => {}
             Err(e) => return Err(e),
         }
-        b.orf.register(
-            &public.device_key_pub,
-            Some((&restored.device.public().device_key_pub, &evolve_token)),
-        )?;
         let mut me = Self::assemble(
             did,
             device,
@@ -431,7 +380,6 @@ impl Labyrinth {
             me,
             Enrollment {
                 device_key: public.device_key_pub,
-                evolve_token,
             },
         ))
     }
@@ -442,33 +390,26 @@ impl Labyrinth {
         Responder::generate(&self.did)
     }
 
-    /// Existing device: answer the new device's CPace message and send it
-    /// the sealed enrollment payload for the current epoch (SPEC §6.5).
+    /// Existing device: answer the new device's hybrid PQ CPace + ML-KEM-768 message
+    /// and send it the sealed enrollment payload for the current epoch (SPEC §6.5).
     pub fn otc_respond(
         &mut self,
         responder: &mut Responder,
         msg: &InitiatorMessage,
     ) -> Result<OtcResponse> {
         self.sync_epochs()?;
-        let (message, isk) = responder.respond(msg, b"")?;
+        let (message, session_key) = responder.respond(msg)?;
         let epoch = self.epoch_secret(self.latest)?;
-        let (payload, evolve_token) =
-            OtcPayload::create(&self.device, &epoch, &self.mailbox_root_salt)?;
-        self.b.orf.register(
-            &otc_temp_orf_id(&isk),
-            Some((&self.device.public().device_key_pub, &evolve_token)),
-        )?;
+        let payload = OtcPayload::create(&epoch, &self.mailbox_root_salt);
         Ok(OtcResponse {
             message,
-            sealed_payload: payload.seal(&isk)?,
-            evolve_token,
+            sealed_payload: payload.seal(&session_key)?,
         })
     }
 
-    /// New device: start a one-time-code session with the code the user
-    /// typed.
+    /// New device: start a hybrid PQ one-time-code session with the code the user typed.
     pub fn otc_start(did: &str, code_input: &str) -> Result<(Initiator, InitiatorMessage)> {
-        Initiator::start(&OneTimeCode::parse(code_input)?, did, b"")
+        Initiator::start(&OneTimeCode::parse(code_input)?, did)
     }
 
     /// New device: finish the session, open the payload and enroll into
@@ -481,8 +422,8 @@ impl Labyrinth {
         transport: Box<dyn TransportSigner + Send>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
-        let isk = initiator.finish(response)?;
-        let payload = OtcPayload::open(&isk, sealed_payload)?;
+        let session_key = initiator.finish(response)?;
+        let payload = OtcPayload::open(&session_key, sealed_payload)?;
         let epoch: &EpochSecret = &payload.epoch;
         let epoch_public = verified_own(b.mailbox.as_ref(), b.directory.as_ref(), did, epoch)?;
         check_candidate_integrity(
@@ -492,17 +433,13 @@ impl Labyrinth {
             epoch.seq,
             &epoch_public.head,
         )?;
-        let (device, public, evolve_token, member) = payload.enroll()?;
+        let (device, public, member) = payload.enroll()?;
         let now = datetime_from_ms(b.clock.now_ms());
         let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());
         b.mailbox
             .create_device(&Device::bound(&public, &binding, now.clone()))?;
         b.mailbox
             .create_epoch_member(&EpochMember::from_record(&member, now))?;
-        let temp = otc_temp_orf_id(&isk);
-        b.orf
-            .register(&public.device_key_pub, Some((&temp, &evolve_token)))?;
-        b.orf.delete(&temp)?;
         let mut me = Self::assemble(
             did,
             device,
@@ -516,7 +453,6 @@ impl Labyrinth {
             me,
             Enrollment {
                 device_key: public.device_key_pub,
-                evolve_token,
             },
         ))
     }

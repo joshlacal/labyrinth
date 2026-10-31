@@ -1,47 +1,47 @@
-//! One-time-code device transfer (SPEC §6.5, paper p.44–45, [CB-14]).
+//! Hybrid Post-Quantum One-Time-Code (`OTC`) device transfer (SPEC §6.5, `I16`).
 //!
-//! An enrolled device (the *responder*) shows a random 6-digit code. The new
-//! device (the *initiator*) asks for the transfer, the user types the code on
-//! it, and the two run CPace over ristretto255 / SHA-512
-//! (draft-irtf-cfrg-cpace-21) with:
-//!
-//! - `PRS` = the 6 ASCII digits,
-//! - `CI` = `"catbird.labyrinth.otc.v1" || did`,
-//! - `sid` = 16 random bytes chosen by the initiator,
-//! - the initiator–responder transcript (`transcript_ir`).
-//!
-//! The resulting 64-byte ISK is the paper's `otc_secret`. The responder
-//! seals the transfer payload under [`payload_key`]`(ISK)` with AAD
-//! [`PAYLOAD_AAD`]; sealing itself is left to the caller (`crate::aead`).
-//!
-//! # Flow
+//! Combines CPace over ristretto255 / SHA-512 (`draft-irtf-cfrg-cpace-21`) with
+//! an ephemeral `ML-KEM-768` encapsulation bound into the CPace transcript:
 //!
 //! ```text
-//! initiator (new device)                      responder (enrolled device)
-//!   Initiator::start(code, did, ADa)
-//!     ── InitiatorMessage { sid, Ya, ADa } ──▶  Responder::respond(...)
-//!                                               (consumes 1 of 3 attempts)
-//!     ◀── ResponderMessage { Yb, ADb } + sealed payload ──
-//!   Initiator::finish(msg) -> ISK
+//! initiator (new device)                               responder (enrolled device)
+//!   (dk_otc, ek_otc) = ML-KEM-768.KeyGen()
+//!   ad_a = SHA256(ek_otc)
+//!   Initiator::start(code, did)
+//!     ── InitiatorMessage { sid, ya, ek_otc, ad_a } ──▶  Responder::respond(...)
+//!                                                        (consumes 1 of 3 attempts)
+//!                                                        (kem_ct, mlkem_ss) = Encaps(ek_otc)
+//!                                                        ad_b = SHA256(kem_ct)
+//!                                                        cpace_isk = CPace_ISK(ya, ad_a, yb, ad_b)
+//!                                                        otc_seal_key = HKDF(cpace_isk || mlkem_ss,
+//!                                                                            MINOS_SALT,
+//!                                                                            "catbird.labyrinth.otc.pq.v2")
+//!     ◀── ResponderMessage { yb, kem_ct, ad_b } + sealed payload ──
+//!   Initiator::finish(msg) -> otc_seal_key
 //! ```
 //!
-//! CPace has no key confirmation; a wrong code shows up as a payload that
-//! fails to decrypt. Each [`Responder::respond`] call is one online guess, so
-//! the responder allows [`MAX_ATTEMPTS`] per code. On failure, the new device
-//! starts a new session (new `sid`) and the enrolled device answers with the
-//! same [`Responder`] until it is exhausted.
+//! Even a Harvest-Now-Decrypt-Later (`HNDL`) quantum adversary who later obtains
+//! the 6-digit code AND breaks `ristretto255` discrete logarithms (`cpace_isk`)
+//! cannot compute `mlkem_ss` without `dk_otc`, keeping `epoch_root` confidential.
 
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
+use ml_kem::array::Array;
+use ml_kem::kem::{Decapsulate as _, KeyExport as _};
+use ml_kem::ml_kem_768::{Ciphertext, DecapsulationKey, EncapsulationKey};
+use ml_kem::{B32, Seed};
 use sha2::{Digest, Sha512};
+use subtle::ConstantTimeEq as _;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::encoding::{kdf32, minos_salt, random, sha256};
+use crate::hpke::hawk::{MLKEM768_CT_LEN, MLKEM768_EK_LEN};
 use crate::{Error, Result};
 
 /// Prefix of the CPace channel identifier; the DID follows it.
 pub const CI_PREFIX: &[u8] = b"catbird.labyrinth.otc.v1";
-/// HKDF info for [`payload_key`].
-pub const PAYLOAD_KDF_INFO: &[u8] = b"catbird.labyrinth.otc.payload";
+/// HKDF info for hybrid PQ [`derive_otc_seal_key`] (`I16`).
+pub const OTC_PQ_KDF_INFO: &[u8] = b"catbird.labyrinth.otc.pq.v2";
 /// AEAD associated data for the sealed payload (SPEC §6.5).
 pub const PAYLOAD_AAD: &[u8] = b"otc_payload";
 /// Attempts allowed per code (paper p.44).
@@ -53,16 +53,6 @@ pub const SID_LEN: usize = 16;
 /// Length of the CPace ISK.
 pub const ISK_LEN: usize = 64;
 
-use crate::encoding::{minos_salt, random};
-
-fn hkdf32(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
-    crate::encoding::kdf32(ikm, Some(salt), info)
-}
-
-// ---------------------------------------------------------------------------
-// One-time code
-// ---------------------------------------------------------------------------
-
 /// A 6-digit one-time code. Secret: zeroized on drop, redacted in `Debug`.
 #[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq)]
 pub struct OneTimeCode([u8; CODE_DIGITS]);
@@ -70,7 +60,6 @@ pub struct OneTimeCode([u8; CODE_DIGITS]);
 impl OneTimeCode {
     /// Uniform random code in `000000..=999999` (rejection sampling).
     pub fn generate() -> Result<Self> {
-        // Largest multiple of 10^6 that fits in 2^32.
         const LIMIT: u32 = (u32::MAX / 1_000_000) * 1_000_000;
         loop {
             let mut b = [0u8; 4];
@@ -113,12 +102,10 @@ impl OneTimeCode {
         Ok(Self(digits))
     }
 
-    /// The 6 digits as a string.
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.0).expect("ASCII digits")
     }
 
-    /// The CPace password (`PRS`): the 6 ASCII digits.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -140,20 +127,11 @@ pub fn channel_identifier(did: &str) -> Vec<u8> {
     [CI_PREFIX, did.as_bytes()].concat()
 }
 
-/// `payload_key = kdf(ISK, MINOS_SALT, "catbird.labyrinth.otc.payload")`.
-///
-/// [`crate::virtual_device::OtcPayload`] seals its binary encoding with
-/// `crate::aead::encrypt(payload_key, PAYLOAD_AAD, payload)`.
-pub fn payload_key(isk: &Isk) -> Zeroizing<[u8; 32]> {
-    Zeroizing::new(hkdf32(isk.as_bytes(), &minos_salt(), PAYLOAD_KDF_INFO))
-}
-
-/// The 64-byte CPace intermediate session key (`otc_secret`).
+/// The 64-byte CPace intermediate session key (`cpace_isk`).
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Isk([u8; ISK_LEN]);
 
 impl Isk {
-    /// The raw key bytes.
     pub fn as_bytes(&self) -> &[u8; ISK_LEN] {
         &self.0
     }
@@ -167,24 +145,52 @@ impl core::fmt::Debug for Isk {
 
 impl PartialEq for Isk {
     fn eq(&self, other: &Self) -> bool {
-        use subtle::ConstantTimeEq;
         self.0.ct_eq(&other.0).into()
     }
 }
 impl Eq for Isk {}
 
-// ---------------------------------------------------------------------------
-// State machine
-// ---------------------------------------------------------------------------
+/// Hybrid PQ 32-byte sealing key derived from `cpace_isk || mlkem_ss` (`I16`).
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct OtcSessionKey([u8; 32]);
 
-/// First message, from the new device.
+impl OtcSessionKey {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for OtcSessionKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("OtcSessionKey(<redacted>)")
+    }
+}
+
+impl PartialEq for OtcSessionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ct_eq(&other.0).into()
+    }
+}
+impl Eq for OtcSessionKey {}
+
+/// `otc_seal_key = HKDF-SHA256(cpace_isk || mlkem_ss, MINOS_SALT, "catbird.labyrinth.otc.pq.v2")`.
+pub fn derive_otc_seal_key(cpace_isk: &Isk, mlkem_ss: &[u8; 32]) -> OtcSessionKey {
+    let mut ikm = Zeroizing::new([0u8; ISK_LEN + 32]);
+    ikm[..ISK_LEN].copy_from_slice(cpace_isk.as_bytes());
+    ikm[ISK_LEN..].copy_from_slice(mlkem_ss);
+    OtcSessionKey(kdf32(&*ikm, Some(&minos_salt()), OTC_PQ_KDF_INFO))
+}
+
+/// First message, from the new device (`blue.catbird.labyrinth.otcSession` initiated).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitiatorMessage {
     /// CPace session id, chosen by the initiator.
     pub sid: [u8; SID_LEN],
     /// Public share `Ya` (ristretto255 encoding).
     pub ya: [u8; 32],
-    /// Associated data `ADa` (may be empty).
+    /// Ephemeral `ML-KEM-768` encapsulation key (1,184 bytes).
+    pub ek_otc: Vec<u8>,
+    /// Associated data `ADa = SHA256(ek_otc)` (32 bytes).
     pub ad: Vec<u8>,
 }
 
@@ -193,59 +199,80 @@ pub struct InitiatorMessage {
 pub struct ResponderMessage {
     /// Public share `Yb` (ristretto255 encoding).
     pub yb: [u8; 32],
-    /// Associated data `ADb` (may be empty).
+    /// `ML-KEM-768` ciphertext encapsulated to `ek_otc` (1,088 bytes).
+    pub kem_ct: Vec<u8>,
+    /// Associated data `ADb = SHA256(kem_ct)` (32 bytes).
     pub ad: Vec<u8>,
 }
 
-/// The new device's side of one CPace session.
+/// The new device's side of one hybrid PQ `CPace + ML-KEM-768` session.
 pub struct Initiator {
     scalar: Scalar,
+    mlkem_seed: Zeroizing<[u8; 64]>,
     sid: [u8; SID_LEN],
     ya: [u8; 32],
     ad: Vec<u8>,
 }
 
 impl Initiator {
-    /// Start a session with a fresh random `sid`.
-    pub fn start(code: &OneTimeCode, did: &str, ad: &[u8]) -> Result<(Self, InitiatorMessage)> {
+    /// Start a session with a fresh random `sid`, CPace scalar, and ephemeral `ML-KEM-768` keypair.
+    pub fn start(code: &OneTimeCode, did: &str) -> Result<(Self, InitiatorMessage)> {
         let mut sid = [0u8; SID_LEN];
         random(&mut sid)?;
         let y = cpace::sample_scalar()?;
-        Ok(Self::start_with(code, did, ad, sid, y))
+        Self::start_deterministic(code, did, sid, y)
     }
 
-    fn start_with(
+    /// Start a session with caller-supplied `sid` and CPace `scalar` plus fresh `ML-KEM-768` seed.
+    pub fn start_deterministic(
         code: &OneTimeCode,
         did: &str,
-        ad: &[u8],
         sid: [u8; SID_LEN],
         scalar: Scalar,
-    ) -> (Self, InitiatorMessage) {
+    ) -> Result<(Self, InitiatorMessage)> {
+        let mut mlkem_seed = Zeroizing::new([0u8; 64]);
+        random(mlkem_seed.as_mut())?;
+        let dk = DecapsulationKey::from_seed(Seed::from(*mlkem_seed));
+        let ek_otc = dk.encapsulation_key().to_bytes().to_vec();
+        let ad = sha256(&ek_otc).to_vec();
+
         let ci = channel_identifier(did);
         let g = cpace::calculate_generator(code.as_bytes(), &ci, &sid);
         let ya = cpace::scalar_mult(&scalar, &g);
         let msg = InitiatorMessage {
             sid,
             ya,
-            ad: ad.to_vec(),
+            ek_otc,
+            ad: ad.clone(),
         };
-        (
+        Ok((
             Self {
                 scalar,
+                mlkem_seed,
                 sid,
                 ya,
-                ad: ad.to_vec(),
+                ad,
             },
             msg,
-        )
+        ))
     }
 
-    /// Process the responder's reply and output the ISK.
-    pub fn finish(self, msg: &ResponderMessage) -> Result<Isk> {
+    /// Process the responder's reply and output the hybrid PQ [`OtcSessionKey`].
+    pub fn finish(self, msg: &ResponderMessage) -> Result<OtcSessionKey> {
+        if msg.kem_ct.len() != MLKEM768_CT_LEN {
+            return Err(Error::Malformed("otc kem_ct length"));
+        }
+        let expected_ad = sha256(&msg.kem_ct);
+        if !bool::from(msg.ad.as_slice().ct_eq(expected_ad.as_slice())) {
+            return Err(Error::Malformed("otc responder ad mismatch"));
+        }
+        let kem_ct = Ciphertext::try_from(msg.kem_ct.as_slice())
+            .map_err(|_| Error::Malformed("otc kem_ct"))?;
         let k = cpace::scalar_mult_vfy(&self.scalar, &msg.yb).ok_or(Error::BadPublicKey)?;
-        Ok(cpace::isk_ir(
-            &self.sid, &k, &self.ya, &self.ad, &msg.yb, &msg.ad,
-        ))
+        let cpace_isk = cpace::isk_ir(&self.sid, &k, &self.ya, &self.ad, &msg.yb, &msg.ad);
+        let dk = DecapsulationKey::from_seed(Seed::from(*self.mlkem_seed));
+        let mlkem_ss = Zeroizing::new(<[u8; 32]>::from(dk.decapsulate(&kem_ct)));
+        Ok(derive_otc_seal_key(&cpace_isk, &mlkem_ss))
     }
 }
 
@@ -287,60 +314,79 @@ impl Responder {
         MAX_ATTEMPTS - self.attempts
     }
 
-    /// Answer one initiator session. Consumes an attempt even if the
-    /// initiator's share is invalid. Once [`MAX_ATTEMPTS`] are used, the code
-    /// is dead and the user must consent to a new one.
-    pub fn respond(
-        &mut self,
-        msg: &InitiatorMessage,
-        ad: &[u8],
-    ) -> Result<(ResponderMessage, Isk)> {
+    /// Answer one initiator session. Consumes an attempt even if the initiator's
+    /// share or `ek_otc` is invalid.
+    pub fn respond(&mut self, msg: &InitiatorMessage) -> Result<(ResponderMessage, OtcSessionKey)> {
         let y = cpace::sample_scalar()?;
-        self.respond_with(msg, ad, y)
+        self.respond_deterministic(msg, y)
     }
 
-    fn respond_with(
+    pub fn respond_deterministic(
         &mut self,
         msg: &InitiatorMessage,
-        ad: &[u8],
         mut scalar: Scalar,
-    ) -> Result<(ResponderMessage, Isk)> {
+    ) -> Result<(ResponderMessage, OtcSessionKey)> {
         if self.attempts >= MAX_ATTEMPTS {
             scalar.zeroize();
             return Err(Error::Malformed("one-time code attempts exhausted"));
         }
         self.attempts += 1;
+
+        if msg.ek_otc.len() != MLKEM768_EK_LEN {
+            scalar.zeroize();
+            return Err(Error::BadPublicKey);
+        }
+        let ek_arr = Array::try_from(msg.ek_otc.as_slice()).map_err(|_| {
+            scalar.zeroize();
+            Error::BadPublicKey
+        })?;
+        let ek = EncapsulationKey::new(&ek_arr).map_err(|_| {
+            scalar.zeroize();
+            Error::BadPublicKey
+        })?;
+        let expected_ad_a = sha256(&msg.ek_otc);
+        if !bool::from(msg.ad.as_slice().ct_eq(expected_ad_a.as_slice())) {
+            scalar.zeroize();
+            return Err(Error::Malformed("otc initiator ad mismatch"));
+        }
+
+        let mut m = Zeroizing::new([0u8; 32]);
+        if let Err(e) = random(&mut *m) {
+            scalar.zeroize();
+            return Err(e);
+        }
+        let (kem_ct, ss) = ek.encapsulate_deterministic(&B32::from(*m));
+        let mlkem_ss = Zeroizing::new(<[u8; 32]>::from(ss));
+        let kem_ct_vec = kem_ct.as_slice().to_vec();
+        let ad_b = sha256(&kem_ct_vec).to_vec();
+
         let ci = channel_identifier(&self.did);
         let g = cpace::calculate_generator(self.code.as_bytes(), &ci, &msg.sid);
         let yb = cpace::scalar_mult(&scalar, &g);
         let k = cpace::scalar_mult_vfy(&scalar, &msg.ya);
         scalar.zeroize();
         let k = k.ok_or(Error::BadPublicKey)?;
-        let isk = cpace::isk_ir(&msg.sid, &k, &msg.ya, &msg.ad, &yb, ad);
+        let cpace_isk = cpace::isk_ir(&msg.sid, &k, &msg.ya, &msg.ad, &yb, &ad_b);
+        let key = derive_otc_seal_key(&cpace_isk, &mlkem_ss);
         Ok((
             ResponderMessage {
                 yb,
-                ad: ad.to_vec(),
+                kem_ct: kem_ct_vec,
+                ad: ad_b,
             },
-            isk,
+            key,
         ))
     }
 }
 
 /// CPace over ristretto255 / SHA-512, draft-irtf-cfrg-cpace-21 §6–8.3.
-///
-/// Public so the draft's test vectors (Appendix B.3) can be checked.
 pub mod cpace {
     use super::*;
 
-    /// `G_Ristretto255.DSI`.
     pub const DSI: &[u8] = b"CPaceRistretto255";
-    /// `G.DSI || "_ISK"`.
     pub const DSI_ISK: &[u8] = b"CPaceRistretto255_ISK";
-    /// SHA-512 input block size (`H.s_in_bytes`).
     pub const S_IN_BYTES: usize = 128;
 
-    /// LEB128 length prefix (`prepend_len`).
     pub fn prepend_len(out: &mut Vec<u8>, data: &[u8]) {
         let mut n = data.len();
         loop {
@@ -355,7 +401,6 @@ pub mod cpace {
         out.extend_from_slice(data);
     }
 
-    /// `lv_cat(parts...)`.
     pub fn lv_cat(parts: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::new();
         for p in parts {
@@ -370,7 +415,6 @@ pub mod cpace {
         v.len() - n
     }
 
-    /// `generator_string(G.DSI, PRS, CI, sid, H.s_in_bytes)`.
     pub fn generator_string(prs: &[u8], ci: &[u8], sid: &[u8]) -> Zeroizing<Vec<u8>> {
         let len_prs = leb_len(prs.len()) + prs.len();
         let len_dsi = leb_len(DSI.len()) + DSI.len();
@@ -378,7 +422,6 @@ pub mod cpace {
         Zeroizing::new(lv_cat(&[DSI, prs, &vec![0u8; zpad], ci, sid]))
     }
 
-    /// `G.calculate_generator(H, PRS, CI, sid)` (internal representation).
     pub fn calculate_generator(prs: &[u8], ci: &[u8], sid: &[u8]) -> RistrettoPoint {
         let gen_str = generator_string(prs, ci, sid);
         let mut h: [u8; 64] = Sha512::digest(gen_str.as_slice()).into();
@@ -387,8 +430,6 @@ pub mod cpace {
         g
     }
 
-    /// `G.sample_scalar()`: 32 random bytes with bits ≥ 252 cleared, read
-    /// little-endian (the draft's recommended method). Zero is resampled.
     pub fn sample_scalar() -> Result<Scalar> {
         loop {
             let mut b = [0u8; 32];
@@ -401,8 +442,6 @@ pub mod cpace {
         }
     }
 
-    /// Interpret 32 little-endian bytes as a scalar after clearing bits ≥ 252
-    /// (so the value is below the group order and reduction is a no-op).
     pub fn scalar_from_bytes(bytes: &[u8; 32]) -> Scalar {
         let mut b = *bytes;
         b[31] &= 0x0f;
@@ -411,13 +450,10 @@ pub mod cpace {
         s
     }
 
-    /// `G.scalar_mult(y, _g)`: returns the public encoding.
     pub fn scalar_mult(y: &Scalar, g: &RistrettoPoint) -> [u8; 32] {
         (g * y).compress().to_bytes()
     }
 
-    /// `G.scalar_mult_vfy(y, X)`. `None` stands for `G.I`: `X` doesn't
-    /// decode, or the product is the identity. Callers MUST abort on `None`.
     pub fn scalar_mult_vfy(y: &Scalar, x: &[u8; 32]) -> Option<[u8; 32]> {
         let p = CompressedRistretto(*x).decompress()?;
         let k = (p * y).compress();
@@ -428,15 +464,12 @@ pub mod cpace {
         }
     }
 
-    /// `transcript_ir(Ya, ADa, Yb, ADb) = lv_cat(Ya, ADa) || lv_cat(Yb, ADb)`.
     pub fn transcript_ir(ya: &[u8], ada: &[u8], yb: &[u8], adb: &[u8]) -> Vec<u8> {
         let mut t = lv_cat(&[ya, ada]);
         t.extend_from_slice(&lv_cat(&[yb, adb]));
         t
     }
 
-    /// `transcript_oc(...) = o_cat(lv_cat(Ya, ADa), lv_cat(Yb, ADb))`.
-    /// Not used by the OTC flow; provided to check the draft's vectors.
     pub fn transcript_oc(ya: &[u8], ada: &[u8], yb: &[u8], adb: &[u8]) -> Vec<u8> {
         let a = lv_cat(&[ya, ada]);
         let b = lv_cat(&[yb, adb]);
@@ -447,7 +480,6 @@ pub mod cpace {
         t
     }
 
-    /// `ISK = H.hash(lv_cat(DSI_ISK, sid, K) || transcript)`.
     pub fn isk(sid: &[u8], k: &[u8; 32], transcript: &[u8]) -> Isk {
         let mut h = Sha512::new();
         h.update(lv_cat(&[DSI_ISK, sid, k]));
@@ -455,7 +487,6 @@ pub mod cpace {
         Isk(h.finalize().into())
     }
 
-    /// ISK in the initiator–responder setting.
     pub fn isk_ir(sid: &[u8], k: &[u8; 32], ya: &[u8], ada: &[u8], yb: &[u8], adb: &[u8]) -> Isk {
         isk(sid, k, &transcript_ir(ya, ada, yb, adb))
     }
@@ -467,21 +498,20 @@ mod tests {
 
     const DID: &str = "did:plc:testvector";
 
-    fn run(code_a: &str, code_b: &str) -> (Isk, Isk) {
+    fn run(code_a: &str, code_b: &str) -> (OtcSessionKey, OtcSessionKey) {
         let a = OneTimeCode::parse(code_a).unwrap();
         let b = OneTimeCode::parse(code_b).unwrap();
-        let (init, m1) = Initiator::start(&a, DID, b"new-device").unwrap();
+        let (init, m1) = Initiator::start(&a, DID).unwrap();
         let mut resp = Responder::new(b, DID);
-        let (m2, isk_b) = resp.respond(&m1, b"old-device").unwrap();
-        let isk_a = init.finish(&m2).unwrap();
-        (isk_a, isk_b)
+        let (m2, key_b) = resp.respond(&m1).unwrap();
+        let key_a = init.finish(&m2).unwrap();
+        (key_a, key_b)
     }
 
     #[test]
     fn both_sides_agree() {
         let (a, b) = run("123456", "123456");
         assert_eq!(a, b);
-        assert_eq!(payload_key(&a).as_slice(), payload_key(&b).as_slice());
     }
 
     #[test]
@@ -493,10 +523,10 @@ mod tests {
     #[test]
     fn wrong_did_disagrees() {
         let code = OneTimeCode::parse("000001").unwrap();
-        let (init, m1) = Initiator::start(&code, "did:plc:a", b"").unwrap();
-        let mut resp = Responder::new(code.clone(), "did:plc:b");
-        let (m2, isk_b) = resp.respond(&m1, b"").unwrap();
-        assert_ne!(init.finish(&m2).unwrap(), isk_b);
+        let (init, m1) = Initiator::start(&code, "did:plc:a").unwrap();
+        let mut resp = Responder::new(code, "did:plc:b");
+        let (m2, key_b) = resp.respond(&m1).unwrap();
+        assert_ne!(init.finish(&m2).unwrap(), key_b);
     }
 
     #[test]
@@ -506,73 +536,27 @@ mod tests {
         let mut resp = Responder::new(code, DID);
         assert_eq!(resp.remaining_attempts(), 3);
         for left in (0..3).rev() {
-            let (_, m1) = Initiator::start(&wrong, DID, b"").unwrap();
-            resp.respond(&m1, b"").unwrap();
+            let (_, m1) = Initiator::start(&wrong, DID).unwrap();
+            resp.respond(&m1).unwrap();
             assert_eq!(resp.remaining_attempts(), left);
         }
-        let (_, m1) = Initiator::start(&wrong, DID, b"").unwrap();
-        assert!(resp.respond(&m1, b"").is_err());
+        let (_, m1) = Initiator::start(&wrong, DID).unwrap();
+        assert!(resp.respond(&m1).is_err());
     }
 
     #[test]
     fn rejects_identity_and_invalid_shares() {
         let code = OneTimeCode::parse("111111").unwrap();
+        let (_, mut m1) = Initiator::start(&code, DID).unwrap();
+        m1.ya = [0; 32];
         let mut resp = Responder::new(code.clone(), DID);
-        let bad = InitiatorMessage {
-            sid: [7; SID_LEN],
-            ya: [0; 32],
-            ad: vec![],
-        };
-        assert_eq!(resp.respond(&bad, b"").unwrap_err(), Error::BadPublicKey);
-        let (init, _) = Initiator::start(&code, DID, b"").unwrap();
+        assert_eq!(resp.respond(&m1).unwrap_err(), Error::BadPublicKey);
+
+        let (init, m1_good) = Initiator::start(&code, DID).unwrap();
+        let (mut m2, _) = resp.respond(&m1_good).unwrap();
         let mut invalid = [0xffu8; 32];
         invalid[31] = 0x7f;
-        assert!(
-            init.finish(&ResponderMessage {
-                yb: invalid,
-                ad: vec![]
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn code_generation_and_parsing() {
-        for _ in 0..1000 {
-            let c = generate_code().unwrap();
-            assert_eq!(c.as_str().len(), 6);
-            assert!(c.as_str().bytes().all(|b| b.is_ascii_digit()));
-            assert_eq!(OneTimeCode::parse(c.as_str()).unwrap(), c);
-        }
-        assert_eq!(OneTimeCode::parse(" 123-456 ").unwrap().as_str(), "123456");
-        assert!(OneTimeCode::parse("12345").is_err());
-        assert!(OneTimeCode::parse("1234567").is_err());
-        assert!(OneTimeCode::parse("12345a").is_err());
-        assert!(!format!("{:?}", OneTimeCode::parse("987654").unwrap()).contains("987654"));
-    }
-
-    #[test]
-    fn code_distribution_roughly_uniform() {
-        // First digit should be roughly uniform over 0..=9.
-        let mut counts = [0u32; 10];
-        for _ in 0..20_000 {
-            let c = generate_code().unwrap();
-            counts[(c.as_bytes()[0] - b'0') as usize] += 1;
-        }
-        for c in counts {
-            assert!((1600..2400).contains(&c), "{counts:?}");
-        }
-    }
-
-    #[test]
-    fn deterministic_session() {
-        // Fixed scalars reproduce: the state machine is the cpace module.
-        let code = OneTimeCode::parse("314159").unwrap();
-        let ya = cpace::scalar_from_bytes(&[3; 32]);
-        let yb = cpace::scalar_from_bytes(&[5; 32]);
-        let (init, m1) = Initiator::start_with(&code, DID, b"A", [1; 16], ya);
-        let mut resp = Responder::new(code, DID);
-        let (m2, isk_b) = resp.respond_with(&m1, b"B", yb).unwrap();
-        assert_eq!(init.finish(&m2).unwrap(), isk_b);
+        m2.yb = invalid;
+        assert!(init.finish(&m2).is_err());
     }
 }

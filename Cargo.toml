@@ -12,6 +12,7 @@ description = "Labyrinth 1.1 encrypted message-history storage (Catbird profile)
 repository = "https://github.com/joshlacal/labyrinth"
 
 [dependencies]
+labyrinth-protocol = { path = "labyrinth-protocol" }
 aes = "0.9"
 aes-gcm = "0.11"
 chacha20 = { version = "0.10", features = ["xchacha"] }

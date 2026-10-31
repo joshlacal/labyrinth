@@ -27,16 +27,13 @@ use crate::records::{Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, 
 use crate::sign::XVerifyingKey;
 use crate::{Error, Result};
 
-mod attachments;
 mod directory;
 mod heads;
 mod lifecycle;
-mod orf;
 mod threads;
 
 pub use directory::MemoryDirectory;
 pub use heads::{MemoryDsDirectory, MemoryDsPublisher, MemoryPdsPublisher};
-pub use orf::MemoryOrf;
 pub use threads::MemoryThreads;
 
 #[derive(Default)]
@@ -89,10 +86,6 @@ struct State {
     server_now: u64,
     /// mls-ds `labyrinth.epoch_heads`, by DID and epoch number.
     ds_heads: HashMap<String, BTreeMap<u64, crate::mailbox::EpochPublic>>,
-    /// ORF server states by (owner DID, device key).
-    orf: HashMap<(String, [u8; 32]), crate::orf::OrfServerState>,
-    /// Attachment references and chat blobs ([CB-33]).
-    attach: attachments::AttachState,
     /// The DS that sequences every thread here: its DID and, when it
     /// signs its own redactions, its Ed25519 seed ([CB-38]).
     sequencer: Option<(String, Option<[u8; 32]>)>,
@@ -200,11 +193,6 @@ impl MemoryBackend {
     /// mailbox does in [`MailboxStore::publish_mailbox_keys`]).
     pub fn pds_publisher(&self, did: &str) -> MemoryPdsPublisher {
         MemoryPdsPublisher::new(did, self.clone())
-    }
-
-    /// The ORF server, as `did` sees it.
-    pub fn orf(&self, did: &str) -> MemoryOrf {
-        MemoryOrf::new(did, self.clone())
     }
 
     /// From now on, stamp every MEK, batch and owner batch with a

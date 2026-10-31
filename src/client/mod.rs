@@ -26,7 +26,6 @@
 //! [`MailboxDirectory`] reports them.
 
 pub mod archive;
-pub mod attach;
 pub mod composite;
 pub mod delete;
 pub mod enroll;
@@ -60,7 +59,7 @@ use crate::message::{OwnerMessage, SealedMessage};
 use crate::records::datetime_from_ms;
 use crate::sign::TransportSigner;
 use crate::store::{
-    KeyPublisher, MailboxDirectory, MailboxStore, OrfServer, ThreadStore, VouchAt, keys_valid_for,
+    KeyPublisher, MailboxDirectory, MailboxStore, ThreadStore, VouchAt, keys_valid_for,
 };
 use crate::{Error, Result};
 
@@ -89,9 +88,6 @@ pub struct Backends {
     /// Discovery of other accounts and of MLS chat devices; a
     /// [`CompositeDirectory`] over the PDS and mls-ds in production.
     pub directory: Box<dyn MailboxDirectory + Send>,
-    /// The ORF server (mls-ds, [CB-17]). The client registers each new
-    /// device's evolved state and deletes a revoked device's state.
-    pub orf: Box<dyn OrfServer + Send>,
     /// Where every new epoch is published besides
     /// [`MailboxStore::publish_mailbox_keys`]: the mls-ds directory for a
     /// Space mailbox, the PDS `mailboxKeys` record for an mls-ds mailbox,
@@ -307,24 +303,6 @@ impl Labyrinth {
     fn accept_for_addressing(&mut self, did: &str, epoch: &EpochPublic) -> Result<()> {
         self.check_attested(did, epoch, VouchAt::Current)?;
         self.pin_peer(did, epoch)
-    }
-
-    /// The full ORF evaluation for this device (SPEC §3.6, §8):
-    /// `orf_client_map` under this device's client state and
-    /// `client_domain`, then the ORF server's map under this device's
-    /// server state and `server_domain`. Evolving to a restored or newly
-    /// enrolled device preserves the output, so indexes derived from it
-    /// survive device changes.
-    pub fn orf_evaluate(
-        &self,
-        client_domain: &[u8],
-        server_domain: &[u8],
-        input: &[u8],
-    ) -> Result<[u8; 32]> {
-        let id = crate::orf::orf_client_map(&self.device.orf, client_domain, input);
-        self.b
-            .orf
-            .map(&self.device.public().device_key_pub, server_domain, &id)
     }
 
     /// My epoch `seq` (backward-chained if needed) and its mailbox keys.

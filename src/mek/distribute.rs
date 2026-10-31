@@ -8,10 +8,10 @@ use zeroize::Zeroizing;
 
 use super::{Mek, MekProvenance, mek_id, roster_hash};
 use crate::encoding::hex;
+use crate::hpke::X25519Public;
 use crate::hpke::hawk::{
     HawkAuthPublic, HawkAuthSecret, hawk_auth_keygen, hawk_decrypt, hawk_encrypt,
 };
-use crate::hpke::labyrinth::X25519Public;
 use crate::mailbox::{EpochPublic, MailboxKeys};
 use crate::sign::{TransportSigner, verify_transport};
 use crate::{Error, Result};

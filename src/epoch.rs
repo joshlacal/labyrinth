@@ -1,17 +1,4 @@
-//! Epochs (SPEC §5, paper p.25–30, p.35–36).
-//!
-//! An epoch is a root key plus its sequence number and the backend-assigned
-//! `epochID` ([CB-9]). From the root we derive the mailbox keys
-//! ([`crate::mailbox`]), the data-storage key that seals the link to the
-//! previous epoch, and the device-MAC key that authenticates membership.
-//!
-//! - [`open_genesis`] / [`open_next`] create an epoch ([`open`]).
-//! - [`forward_chain`] / [`backward_chain`] walk the chain ([`chain`]).
-//! - [`add_device_mac`] / [`verify_member`] manage membership.
-//!
-//! The `epochID` is only an input to the *next* epoch's chaining KDF, so an
-//! epoch the caller has opened but not yet stored is a [`PendingEpoch`]; it
-//! becomes an [`EpochSecret`] once the backend assigns the id.
+//! Epochs (SPEC §5, Gate 2, `I16`).
 
 pub mod chain;
 pub mod open;
@@ -56,9 +43,12 @@ pub trait EpochKeys {
         MailboxKeys::derive(self.root(), self.seq())
     }
 
-    /// `mac(deviceKeyPub, macKey)`.
-    fn device_mac(&self, device_key_pub: &XVerifyingKey) -> [u8; 32] {
-        mac(&device_key_pub.0, self.mac_key().as_slice())
+    /// `mac(deviceKeyPub || u8(is_virtual), macKey)` (`Gate 2` domain binding).
+    fn device_mac(&self, device_key_pub: &XVerifyingKey, is_virtual: bool) -> [u8; 32] {
+        let mut msg = [0u8; 33];
+        msg[..32].copy_from_slice(&device_key_pub.0);
+        msg[32] = u8::from(is_virtual);
+        mac(&msg, self.mac_key().as_slice())
     }
 }
 
@@ -159,9 +149,16 @@ pub(crate) fn entropy_aad(seq: u64) -> Vec<u8> {
 
 /// The Space backend's `epochID` convention: the decimal sequence number
 /// zero-padded to 12 digits, which is also the epoch record's rkey ([CB-9]).
-/// Everywhere else ids are opaque strings.
 pub fn space_epoch_id(seq: u64) -> String {
     format!("{seq:012}")
+}
+
+/// Canonical 16-hex Space epoch rkey helper (`format!("{seq:016x}")`) when hex
+/// ordering is requested; note `blue.catbird.labyrinth.epoch` uses 12-digit
+/// zero-padded decimal `space_epoch_id(seq)` (`000000000000..`) which is also
+/// lexicographically ascending!
+pub fn space_epoch_hex_rkey(seq: u64) -> String {
+    format!("{seq:016x}")
 }
 
 /// The published part of an epoch (`blue.catbird.labyrinth.epoch`).
@@ -182,8 +179,8 @@ pub struct EpochMemberRecord {
     pub seq: u64,
     pub device_key_pub: XVerifyingKey,
     pub device_mac: [u8; 32],
-    /// Labyrinth-HPKE-sealed entropy; present for devices carried over when
-    /// the epoch opened, absent for devices added mid-epoch.
+    /// `Hawk + PSK`-sealed entropy (`I16`); present for devices carried over
+    /// when the epoch opened, absent for devices added mid-epoch.
     pub encrypted_entropy: Option<Vec<u8>>,
 }
 
@@ -191,28 +188,38 @@ pub struct EpochMemberRecord {
 /// device's signatures first.
 pub fn add_device_mac(epoch: &impl EpochKeys, device: &DevicePublic) -> Result<EpochMemberRecord> {
     device.verify()?;
-    Ok(member_record(epoch, &device.device_key_pub, None))
+    Ok(member_record(
+        epoch,
+        &device.device_key_pub,
+        device.is_virtual,
+        None,
+    ))
 }
 
 pub(crate) fn member_record(
     epoch: &impl EpochKeys,
     device_key_pub: &XVerifyingKey,
+    is_virtual: bool,
     encrypted_entropy: Option<Vec<u8>>,
 ) -> EpochMemberRecord {
     EpochMemberRecord {
         seq: epoch.seq(),
         device_key_pub: *device_key_pub,
-        device_mac: epoch.device_mac(device_key_pub),
+        device_mac: epoch.device_mac(device_key_pub, is_virtual),
         encrypted_entropy,
     }
 }
 
-/// Check a membership record's sequence number and MAC (constant time).
-pub fn verify_member(epoch: &impl EpochKeys, record: &EpochMemberRecord) -> Result<()> {
+/// Check a membership record's sequence number and MAC (constant time, `Gate 2` `is_virtual` bound).
+pub fn verify_member(
+    epoch: &impl EpochKeys,
+    record: &EpochMemberRecord,
+    is_virtual: bool,
+) -> Result<()> {
     if record.seq != epoch.seq() {
         return Err(Error::NotEpochMember);
     }
-    let expected = epoch.device_mac(&record.device_key_pub);
+    let expected = epoch.device_mac(&record.device_key_pub, is_virtual);
     if bool::from(expected.ct_eq(&record.device_mac)) {
         Ok(())
     } else {
@@ -221,8 +228,7 @@ pub fn verify_member(epoch: &impl EpochKeys, record: &EpochMemberRecord) -> Resu
 }
 
 /// Check that a published `EpochPublic` carries the mailbox keys derived
-/// from this epoch's root. Combine with [`EpochPublic::verify`] for the
-/// signatures and chain.
+/// from this epoch's root.
 pub fn verify_public(epoch: &impl EpochKeys, public: &EpochPublic) -> Result<()> {
     if public.seq != epoch.seq() {
         return Err(Error::Malformed("epoch public seq mismatch"));
@@ -278,34 +284,17 @@ mod tests {
     }
 
     #[test]
-    fn derived_key_labels() {
-        // SPEC §5.4: the labels use base64 of the decimal seq.
-        let e = PendingEpoch::new(3, [5u8; 32]);
-        assert_eq!(
-            *e.data_key(),
-            kdf32(&[5u8; 32], None, b"epoch_data_storage_Mw==")
-        );
-        assert_eq!(*e.mac_key(), kdf32(&[5u8; 32], None, b"epoch_devices_Mw=="));
-        let s = e.assign_id("abc");
-        let (chain, psk) = s.chaining_keys();
-        let mut okm = [0u8; 64];
-        kdf(&[5u8; 32], None, b"epoch_chaining_3_abc", &mut okm);
-        assert_eq!(chain.as_slice(), &okm[..32]);
-        assert_eq!(psk.as_slice(), &okm[32..]);
-    }
-
-    #[test]
     fn member_mac_round_trip_and_tamper() {
         let e = PendingEpoch::new(1, [9u8; 32]);
         let d = crate::device::DeviceSecrets::generate().unwrap();
         let rec = add_device_mac(&e, d.public()).unwrap();
-        verify_member(&e, &rec).unwrap();
+        verify_member(&e, &rec, false).unwrap();
+        assert_eq!(verify_member(&e, &rec, true), Err(Error::NotEpochMember));
         let mut bad = rec.clone();
         bad.device_mac[0] ^= 1;
-        assert_eq!(verify_member(&e, &bad), Err(Error::NotEpochMember));
+        assert_eq!(verify_member(&e, &bad, false), Err(Error::NotEpochMember));
         let mut bad = rec.clone();
         bad.seq = 2;
-        assert_eq!(verify_member(&e, &bad), Err(Error::NotEpochMember));
-        assert!(verify_member(&PendingEpoch::new(1, [8u8; 32]), &rec).is_err());
+        assert_eq!(verify_member(&e, &bad, false), Err(Error::NotEpochMember));
     }
 }

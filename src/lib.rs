@@ -17,7 +17,6 @@ pub mod hpke;
 pub mod mailbox;
 pub mod mek;
 pub mod message;
-pub mod orf;
 pub mod otc;
 pub mod padding;
 pub mod records;
@@ -27,3 +26,4 @@ pub mod store;
 pub mod virtual_device;
 
 pub use error::{Error, Result};
+pub use labyrinth_protocol as protocol;
