@@ -1,0 +1,26 @@
+[package]
+name = "labyrinth-protocol"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Zero-secrets Labyrinth protocol verification primitives (I13 sequencer receipts, archive commitments, EpochPublic chain + membersHash)"
+
+[dependencies]
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+hex = "0.4"
+hmac = "0.12"
+p256 = { version = "0.13", features = ["ecdsa"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = "0.6"
