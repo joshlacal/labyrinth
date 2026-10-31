@@ -18,6 +18,25 @@ fn named(status: u16, name: &str, msg: &str) -> XrpcError {
     XrpcError::named(status, name, msg)
 }
 
+fn require_active_leaf(
+    s: &MemoryXrpcServer,
+    c: &Caller,
+    thread_id: &str,
+) -> core::result::Result<(), XrpcError> {
+    if let Some((chat_seq, leaves)) = s.net.thread_leaves(thread_id, &c.did)
+        && !leaves
+            .iter()
+            .any(|l| l.key == c.device && l.active_at(chat_seq))
+    {
+        return Err(named(
+            403,
+            "NotParticipant",
+            "caller device has no active leaf in conversation",
+        ));
+    }
+    Ok(())
+}
+
 /// Per-MEK read authorization: the caller wrote the MEK or is addressed.
 fn can_read(m: &Stored<MekDistribution>, did: &str) -> bool {
     m.author == did || m.value.recipients.iter().any(|r| r.did == did)
@@ -58,6 +77,7 @@ pub(super) fn handle(
         "createMek" => (|| {
             let m: RecordBody<MekDistribution> = body(input)?;
             let m = m.record;
+            require_active_leaf(s, c, &m.thread_id)?;
             match &m.sender {
                 MekSenderDef::Labyrinth(l) => {
                     if l.did != c.did {
@@ -113,6 +133,7 @@ pub(super) fn handle(
         "appendBatch" => (|| {
             let b: RecordBody<Batch> = body(input)?;
             let b = b.record;
+            require_active_leaf(s, c, &b.thread_id)?;
             let first = b.items.first().ok_or_else(|| bad("empty batch"))?;
             if b.items.iter().any(|i| i.mek_id != first.mek_id) {
                 return Err(named(400, "MixedMekBatch", "one MEK per batch"));

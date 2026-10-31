@@ -128,11 +128,13 @@ impl State {
     }
 
     pub(super) fn touch_vdevice(&mut self, did: &str, id: &[u8; 16]) -> Result<()> {
-        let now = datetime_from_ms(self.server_now);
+        let now_ms = self.server_now;
+        let now = datetime_from_ms(now_ms);
         let vd = self
             .mailboxes
             .get_mut(did)
             .and_then(|m| m.vdevices.get_mut(&hex::encode(id)))
+            .filter(|vd| !super::vdevice_expired_at(vd, now_ms))
             .ok_or(Error::NotFound("virtual device"))?;
         vd.last_used_at = Some(now);
         Ok(())

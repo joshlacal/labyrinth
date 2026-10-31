@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use super::binding::{require_bound, require_registered, verify_chat_binding};
 use super::{Caller, Input, MemoryXrpcServer, Reply, bad, body, err, hex_param, json, num, req};
-use crate::Error;
 use crate::orf::EvolveToken;
 use crate::records::{Device, Epoch, EpochMember, OwnerBatch, VirtualDevice};
 use crate::sign::XVerifyingKey;
@@ -142,9 +141,9 @@ pub(super) fn handle(
         })(),
         "createVirtualDevice" => (|| {
             let i: CreateVirtualDeviceIn = body(input)?;
+            require_bound(s, c, None)?;
             mb.create_virtual_device(&i.record).map_err(err)?;
             if let Some(m) = &i.member {
-                require_bound(s, c, None)?;
                 require_registered(s, c, &[&m.device_key_pubkey.0])?;
                 mb.create_epoch_member(m).map_err(err)?;
             }
@@ -158,12 +157,6 @@ pub(super) fn handle(
         })(),
         "getVirtualDevice" => (|| {
             let id = hex_param::<16>(input, "vdeviceId")?;
-            // Reading a bundle also records it as used (lexicon:
-            // getVirtualDevice touches it, returning the server lastUsedAt).
-            match mb.touch_virtual_device(&id) {
-                Ok(()) | Err(Error::NotFound(_)) => {}
-                Err(e) => return Err(err(e)),
-            }
             let v = mb.get_virtual_device(&id).map_err(err)?;
             json(&RecordBody {
                 record: v.ok_or_else(|| not_found("VirtualDeviceNotFound"))?,
@@ -206,6 +199,9 @@ pub(super) fn handle(
         })(),
         "registerOrfState" => (|| {
             let i: RegisterOrfIn = body(input)?;
+            if super::binding::hosts_mailbox(s, &c.did)? {
+                require_bound(s, c, None)?;
+            }
             let parent = match &i.parent {
                 None => None,
                 Some(p) => Some((
@@ -222,6 +218,9 @@ pub(super) fn handle(
         })(),
         "deleteOrfState" => (|| {
             let i: DeviceKeyIn = body(input)?;
+            if super::binding::hosts_mailbox(s, &c.did)? {
+                require_bound(s, c, None)?;
+            }
             orf.delete(&key(&i.device_key_pubkey)?).map_err(err)?;
             json(&Empty {})
         })(),

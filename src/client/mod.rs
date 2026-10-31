@@ -133,6 +133,10 @@ pub struct Labyrinth {
     /// MEKs minted or opened here, per thread, newest last.
     meks: HashMap<String, Vec<Mek>>,
     outbox: BTreeMap<String, Vec<SealedMessage>>,
+    /// Canonical `(DID, epoch head)` roster under which each sender buffer's
+    /// MEK was distributed. Flush revalidates it so a queued ciphertext
+    /// cannot cross a later device/account rotation.
+    outbox_rosters: BTreeMap<String, Vec<(String, [u8; 32])>>,
     owner_outbox: BTreeMap<String, Vec<OwnerMessage>>,
 }
 
@@ -175,6 +179,7 @@ impl Labyrinth {
             pins: BTreeMap::new(),
             meks: HashMap::new(),
             outbox: BTreeMap::new(),
+            outbox_rosters: BTreeMap::new(),
             owner_outbox: BTreeMap::new(),
         })
     }
@@ -247,6 +252,11 @@ impl Labyrinth {
     /// [`latest_public`](Self::latest_public) after finishing a deferred
     /// attester check: the copy that goes into a roster.
     fn own_latest_checked(&mut self) -> Result<EpochPublic> {
+        // A failed revocation deliberately remains in the persisted local
+        // revoked set. Before this account contributes a recipient epoch to
+        // any new archive, prove that the active epoch excludes every such
+        // device; otherwise it may still know the encryption root.
+        self.sync_epochs()?;
         self.adopt_latest()?;
         self.latest_public()
     }
@@ -280,9 +290,13 @@ impl Labyrinth {
         at: VouchAt,
     ) -> Result<Vec<[u8; 32]>> {
         let keys = self.b.directory.device_transport_keys(did)?;
-        let leaves = match (thread, at) {
-            (Some(t), VouchAt::Server(_)) => self.b.directory.member_device_keys(t, did)?,
-            _ => None,
+        let (leaves, at) = match (thread, at) {
+            (Some(t), at) => (self.b.directory.member_device_keys(t, did)?, at),
+            (None, VouchAt::Server(mut o)) => {
+                o.chat_seq = None;
+                (None, VouchAt::Server(o))
+            }
+            (None, at) => (None, at),
         };
         Ok(keys_valid_for(&keys, leaves.as_deref(), at))
     }

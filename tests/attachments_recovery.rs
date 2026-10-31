@@ -254,3 +254,185 @@ fn safety_numbers_match_on_both_sides_and_change_on_rotation() {
         .unwrap();
     assert_ne!(alice.own_fingerprint().unwrap(), before);
 }
+
+#[test]
+fn expired_un_gcd_recovery_bundles_fail_with_expired() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut phone = init(&net, &clock, A, 1);
+    let keychain = phone.create_recovery_code(Mechanism::Keychain).unwrap();
+    let prf = [0x42u8; 32];
+    let cred = b"cred-exp-1";
+    phone.create_passkey_recovery(&prf, cred).unwrap();
+
+    // Advance client clock past 180-day TTL while leaving `net` server clock
+    // un-advanced so the server still serves the un-GC'd bundles.
+    clock.advance(AUTO_RECOVERY_TTL_MS + 1);
+    net.register_chat_device(A, tpub(8));
+    let err = Labyrinth::restore_with_recovery_code(
+        A,
+        keychain.code.as_str(),
+        Box::new(signer(8)),
+        backends(&net, &clock, A),
+    )
+    .unwrap_err();
+    assert_eq!(err, Error::Expired);
+
+    let err = Labyrinth::restore_with_passkey(
+        A,
+        &prf,
+        cred,
+        Box::new(signer(8)),
+        backends(&net, &clock, A),
+    )
+    .unwrap_err();
+    assert_eq!(err, Error::Expired);
+}
+
+#[test]
+fn restore_with_passkey_skips_expired_bundle_in_favor_of_fresh_one() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut phone = init(&net, &clock, A, 1);
+    let prf = [0x55u8; 32];
+    let cred = b"cred-rotate-1";
+    let old = phone.create_passkey_recovery(&prf, cred).unwrap();
+
+    // Advance client clock past 180 days; `create_bundle` stamps
+    // `b.clock.now_ms()`, so keeping `net` server time at 0 leaves the old
+    // bundle un-GC'd on the server while its `created_at` is >180 days old.
+    clock.advance(AUTO_RECOVERY_TTL_MS + 1_000);
+    let fresh = phone.create_passkey_recovery(&prf, cred).unwrap();
+    assert_ne!(old.vdevice_id, fresh.vdevice_id);
+    assert_eq!(net.mailbox(A).list_virtual_devices().unwrap().len(), 2);
+
+    net.register_chat_device(A, tpub(9));
+    let (restored, _) = Labyrinth::restore_with_passkey(
+        A,
+        &prf,
+        cred,
+        Box::new(signer(9)),
+        backends(&net, &clock, A),
+    )
+    .unwrap();
+    assert_eq!(restored.latest_epoch(), phone.latest_epoch());
+}
+
+#[cfg(feature = "xrpc")]
+#[test]
+fn xrpc_get_virtual_device_does_not_refresh_last_used_at_and_memory_backend_filters_expired() {
+    use labyrinth::store::xrpc::XrpcMailboxStore;
+    use labyrinth::store::xrpc::server::MemoryXrpcServer;
+
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut phone = init(&net, &clock, A, 1);
+    let kc = phone.create_recovery_code(Mechanism::Keychain).unwrap();
+
+    let server = MemoryXrpcServer::new(net.clone());
+    let transport = server.transport(A, tpub(1));
+    let xmb = XrpcMailboxStore::new(A, transport);
+
+    net.set_server_time(1_791_000_000_000 + 50 * 86_400_000);
+    let fetched = xmb
+        .get_virtual_device(&kc.vdevice_id)
+        .unwrap()
+        .expect("present before expiry");
+    assert_eq!(
+        fetched.last_used_at, None,
+        "GET getVirtualDevice must not mutate last_used_at"
+    );
+
+    // Explicit touchVirtualDevice DOES update last_used_at.
+    xmb.touch_virtual_device(&kc.vdevice_id).unwrap();
+    let touched = xmb.get_virtual_device(&kc.vdevice_id).unwrap().unwrap();
+    assert!(touched.last_used_at.is_some());
+
+    // Once server_now passes `last_used_at + AUTO_RECOVERY_TTL_MS`, MemoryBackend
+    // filters the expired virtual device from get, list, and touch.
+    net.set_server_time(1_791_000_000_000 + 50 * 86_400_000 + AUTO_RECOVERY_TTL_MS);
+    assert!(
+        net.mailbox(A)
+            .get_virtual_device(&kc.vdevice_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(net.mailbox(A).list_virtual_devices().unwrap().is_empty());
+    assert_eq!(
+        net.mailbox(A)
+            .touch_virtual_device(&kc.vdevice_id)
+            .unwrap_err(),
+        Error::NotFound("virtual device")
+    );
+}
+
+#[test]
+fn remove_recovery_method_refuses_confused_deputy_revocation_of_physical_or_self_device() {
+    use labyrinth::records::Bytes;
+
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut phone = init(&net, &clock, A, 1);
+    let laptop = sibling(&net, &clock, &mut phone, 2);
+
+    let prf = [0x77u8; 32];
+    let passkey_setup = phone.create_passkey_recovery(&prf, b"cred-cd").unwrap();
+    let code_setup = phone.create_recovery_code(Mechanism::Code).unwrap();
+    let mb = net.mailbox(A);
+
+    // 1. VirtualDevice::to_bundle must verify sig_0x30 on the embedded DevicePublic.
+    let mut bad_sig_vd = mb
+        .get_virtual_device(&passkey_setup.vdevice_id)
+        .unwrap()
+        .unwrap();
+    bad_sig_vd.epoch_storage_key_sig = Bytes(vec![0u8; 64]);
+    assert_eq!(bad_sig_vd.to_bundle().unwrap_err(), Error::BadSignature);
+
+    // 2. Malicious store points a passkey VirtualDevice record at active physical sibling `laptop`.
+    let laptop_pub = laptop.device_public();
+    let mut spoof_sibling = mb
+        .get_virtual_device(&passkey_setup.vdevice_id)
+        .unwrap()
+        .unwrap();
+    spoof_sibling.device_key_pubkey = Bytes::from_slice(&laptop_pub.device_key_pub.0);
+    spoof_sibling.epoch_storage_key_pubkey = Bytes::from_slice(&laptop_pub.epoch_storage_key_pub.0);
+    spoof_sibling.epoch_storage_key_sig = Bytes::from_slice(&laptop_pub.sig_0x30);
+    mb.delete_virtual_device(&passkey_setup.vdevice_id).unwrap();
+    mb.create_virtual_device(&spoof_sibling).unwrap();
+
+    let epoch_before = phone.latest_epoch();
+    assert_eq!(
+        phone
+            .remove_recovery_method(&passkey_setup.vdevice_id)
+            .unwrap_err(),
+        Error::DeviceTampered
+    );
+    assert_eq!(phone.latest_epoch(), epoch_before);
+    assert!(
+        mb.get_device(&laptop_pub.device_key_pub)
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_none()
+    );
+
+    // 3. Malicious store points a recovery-code VirtualDevice record at `phone` itself.
+    let self_pub = phone.device_public();
+    let mut spoof_self = mb
+        .get_virtual_device(&code_setup.vdevice_id)
+        .unwrap()
+        .unwrap();
+    spoof_self.device_key_pubkey = Bytes::from_slice(&self_pub.device_key_pub.0);
+    spoof_self.epoch_storage_key_pubkey = Bytes::from_slice(&self_pub.epoch_storage_key_pub.0);
+    spoof_self.epoch_storage_key_sig = Bytes::from_slice(&self_pub.sig_0x30);
+    mb.delete_virtual_device(&code_setup.vdevice_id).unwrap();
+    mb.create_virtual_device(&spoof_self).unwrap();
+
+    assert_eq!(
+        phone
+            .remove_recovery_method(&code_setup.vdevice_id)
+            .unwrap_err(),
+        Error::DeviceTampered
+    );
+    assert_eq!(phone.latest_epoch(), epoch_before);
+}

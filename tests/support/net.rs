@@ -111,6 +111,8 @@ pub fn sibling(
 pub struct Faulty {
     pub inner: Arc<MemoryMailbox>,
     pub tamper: Arc<std::sync::Mutex<Option<XVerifyingKey>>>,
+    pub omit: Arc<std::sync::Mutex<Option<XVerifyingKey>>>,
+    pub omit_skip: Arc<AtomicU64>,
     pub fail_epochs: Arc<AtomicBool>,
 }
 
@@ -119,6 +121,8 @@ impl Faulty {
         Self {
             inner: Arc::new(m),
             tamper: Arc::default(),
+            omit: Arc::default(),
+            omit_skip: Arc::default(),
             fail_epochs: Arc::default(),
         }
     }
@@ -157,6 +161,15 @@ impl MailboxStore for Faulty {
     }
     fn list_epoch_members(&self, s: u64) -> labyrinth::Result<Vec<EpochMember>> {
         let mut v = self.inner.list_epoch_members(s)?;
+        if let Some(k) = *self.omit.lock().unwrap() {
+            if self
+                .omit_skip
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_err()
+            {
+                v.retain(|m| m.device_key_pubkey.0 != k.0);
+            }
+        }
         if let Some(k) = *self.tamper.lock().unwrap() {
             for m in v.iter_mut().filter(|m| m.device_key_pubkey.0 == k.0) {
                 let mut mac = m.device_mac.0.clone();

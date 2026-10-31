@@ -113,7 +113,7 @@ impl Labyrinth {
         };
         let batches = self.readable(&mut h, self.b.threads.list_batches(thread_id, None, range))?;
         let keep = |_: &str, ts: u64| range.contains(ts);
-        self.open_batches(thread_id, batches, &keep, &mut h);
+        self.open_batches(thread_id, batches, &keep, &mut h)?;
         let owner = self.b.mailbox.list_owner_batches(thread_id, range)?;
         let tombstones = self.open_owner_batches(thread_id, owner, &keep, &mut h)?;
         finish(&mut h, &tombstones);
@@ -145,7 +145,7 @@ impl Labyrinth {
         batches: Vec<Stored<Batch>>,
         keep: Keep<'_>,
         h: &mut ThreadHistory,
-    ) {
+    ) -> Result<()> {
         for b in batches {
             let author = Some(b.author.clone());
             let items = if b.value.thread_id == thread_id {
@@ -177,15 +177,27 @@ impl Labyrinth {
                         redaction,
                     } => {
                         let (by_author, account_deleted) = match &redaction {
-                            StoredRedaction::Author(r) => (
-                                self.redaction_by_author(thread_id, &b.author, &message_id, r),
-                                false,
-                            ),
-                            StoredRedaction::Server(r) => (
-                                false,
-                                self.redaction_by_sequencer(thread_id, &b.author, &message_id, r),
-                            ),
-                            StoredRedaction::Unsigned { .. } => (false, false),
+                            StoredRedaction::Author(r)
+                                if self.redaction_by_author(
+                                    thread_id,
+                                    &b.author,
+                                    &message_id,
+                                    r,
+                                ) =>
+                            {
+                                (true, false)
+                            }
+                            StoredRedaction::Server(r)
+                                if self.redaction_by_sequencer(
+                                    thread_id,
+                                    &b.author,
+                                    &message_id,
+                                    r,
+                                ) =>
+                            {
+                                (false, true)
+                            }
+                            _ => return Err(Error::BadSignature),
                         };
                         h.redacted.push(RedactedMessage {
                             message_id,
@@ -193,7 +205,7 @@ impl Labyrinth {
                             sender: b.author.clone(),
                             by_author,
                             account_deleted,
-                            removed_by_server: !by_author && !account_deleted,
+                            removed_by_server: false,
                         });
                         continue;
                     }
@@ -218,6 +230,7 @@ impl Labyrinth {
                 }
             }
         }
+        Ok(())
     }
 
     /// [CB-38]: the redaction is signed by a chat device of `author` that

@@ -50,23 +50,34 @@ pub struct ResolvedRoster {
     pub excluded: Vec<RosterExclusion>,
 }
 
-/// True for failures that say nothing about the member (the backend did
-/// not answer, no randomness): the whole roster must be retried rather
-/// than the member dropped.
-fn is_transient(e: &Error) -> bool {
-    matches!(e, Error::Backend(_) | Error::Rng)
+/// Only cryptographic/trust failures attributable to a peer's published
+/// epoch may exclude that peer. Operational, authorization, missing-history
+/// and version-skew errors abort the whole roster so backend failure cannot
+/// silently turn an MLS member into a history omission.
+fn is_roster_exclusion(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::BadSignature
+            | Error::BadPublicKey
+            | Error::Unsupported(_)
+            | Error::EpochRollback { .. }
+            | Error::DirectoryFork { .. }
+            | Error::Unattested
+    )
 }
 
 impl Labyrinth {
     /// Like [`resolve_roster`](Self::resolve_roster), but a member whose
     /// epoch fails a trust check ([CB-18], [CB-28], [CB-29], or a record
     /// that does not verify) is excluded and reported instead of failing
-    /// the whole roster. Transient failures ([`Error::Backend`],
-    /// [`Error::Rng`]) still fail it, so a network blip never drops a
-    /// member. This account's own epoch is always included.
+    /// the whole roster. Every other failure—including unavailable,
+    /// unauthorized, incomplete, or missing directory evidence—fails the
+    /// whole roster, so an operational fault never drops an MLS member.
+    /// This account's own epoch is always included.
     pub fn resolve_roster_report(&mut self, member_dids: &[&str]) -> Result<ResolvedRoster> {
         let mut out = ResolvedRoster::default();
         let me = self.did.clone();
+        let own = self.own_latest_checked()?;
         for did in member_dids.iter().filter(|d| **d != me) {
             let checked = self.b.directory.latest(did).and_then(|e| match e {
                 Some(epoch) => self
@@ -77,15 +88,14 @@ impl Labyrinth {
             match checked {
                 Ok(Some(epoch)) => out.roster.push(((*did).to_owned(), epoch)),
                 Ok(None) => {}
-                Err(e) if is_transient(&e) => return Err(e),
-                Err(error) => out.excluded.push(RosterExclusion {
+                Err(error) if is_roster_exclusion(&error) => out.excluded.push(RosterExclusion {
                     did: (*did).to_owned(),
                     error,
                 }),
+                Err(error) => return Err(error),
             }
         }
-        out.roster
-            .push((self.did.clone(), self.own_latest_checked()?));
+        out.roster.push((self.did.clone(), own));
         Ok(out)
     }
 
@@ -102,13 +112,14 @@ impl Labyrinth {
     pub fn resolve_roster(&mut self, member_dids: &[&str]) -> Result<Vec<(String, EpochPublic)>> {
         let mut roster = Vec::with_capacity(member_dids.len() + 1);
         let me = self.did.clone();
+        let own = self.own_latest_checked()?;
         for did in member_dids.iter().filter(|d| **d != me) {
             if let Some(epoch) = self.b.directory.latest(did)? {
                 self.accept_for_addressing(did, &epoch)?;
                 roster.push(((*did).to_owned(), epoch));
             }
         }
-        roster.push((self.did.clone(), self.own_latest_checked()?));
+        roster.push((self.did.clone(), own));
         Ok(roster)
     }
 
@@ -117,9 +128,10 @@ impl Labyrinth {
     /// `roster` lists the other enrolled members and their latest epochs
     /// (see [`resolve_roster`](Self::resolve_roster)); any entry for this
     /// account is replaced by its own latest epoch. Every other entry is
-    /// verified and must be attested by a current chat device of its DID
-    /// ([CB-18]) or the call fails with [`crate::Error::Unattested`], and
-    /// must pass the DID's [CB-29] pin ([`crate::Error::EpochRollback`]).
+    /// verified, must equal the directory's current independently anchored
+    /// head, must be attested by a current chat device of its DID ([CB-18]),
+    /// and must pass the DID's [CB-29] pin. Rechecking here prevents a caller
+    /// from bypassing strict roster resolution with a substituted epoch.
     ///
     /// A cached MEK is reused only under the reuse rules (p.38–39,
     /// [CB-23], [CB-42]); otherwise a fresh MEK is distributed to the roster and its
@@ -140,11 +152,30 @@ impl Labyrinth {
         let mut full = Vec::with_capacity(roster.len() + 1);
         let me = self.did.clone();
         for (did, epoch) in roster.iter().filter(|(d, _)| *d != me) {
+            let current = self
+                .b
+                .directory
+                .latest(did)?
+                .ok_or(Error::NotFound("recipient mailbox keys"))?;
+            // Do not assume every MailboxDirectory implementation verifies
+            // what it returns. A malicious raw adapter can preserve the
+            // committed head while substituting malformed key material;
+            // authenticate the live record before using it as the equality
+            // anchor for a caller-supplied roster.
+            self.accept_for_addressing(did, &current)?;
+            if current.seq != epoch.seq || current.head != epoch.head {
+                return Err(Error::Malformed("roster epoch is not the directory head"));
+            }
             self.accept_for_addressing(did, epoch)?;
             full.push((did.clone(), epoch.clone()));
         }
         full.push((self.did.clone(), me_public.clone()));
         let heads: Vec<[u8; 32]> = full.iter().map(|(_, e)| e.head).collect();
+        let mut pending_roster: Vec<(String, [u8; 32])> = full
+            .iter()
+            .map(|(did, epoch)| (did.clone(), epoch.head))
+            .collect();
+        pending_roster.sort_unstable();
 
         let mut out = ArchiveOutcome::default();
         let cached = self.meks.get(thread_id).and_then(|v| {
@@ -153,6 +184,21 @@ impl Labyrinth {
                 .find(|m| m.reusable_for(&me, &heads))
                 .cloned()
         });
+        // Flush any buffered sender items tied to an older roster or MEK
+        // before minting/publishing a new MEK, so a failed flush never
+        // orphans a freshly created MEK on the thread store.
+        if self.outbox.get(thread_id).is_some_and(|v| !v.is_empty()) {
+            let roster_changed = self.outbox_rosters.get(thread_id) != Some(&pending_roster);
+            let mek_changed = cached.as_ref().is_none_or(|c| {
+                self.outbox
+                    .get(thread_id)
+                    .and_then(|v| v.last())
+                    .is_some_and(|m| m.mek_id != *c.id())
+            });
+            if roster_changed || mek_changed {
+                out.flushed = self.flush_sender(thread_id)?;
+            }
+        }
         let mek = match cached {
             Some(m) => m,
             None => {
@@ -198,6 +244,12 @@ impl Labyrinth {
         if pending > 0 && pending + SealedMessageDef::approx_json_len(&sealed) > BATCH_BYTE_BUDGET {
             out.flushed = self.flush_sender(thread_id)?;
         }
+        if self.outbox.get(thread_id).is_none_or(Vec::is_empty) {
+            self.outbox_rosters
+                .insert(thread_id.to_owned(), pending_roster);
+        } else if self.outbox_rosters.get(thread_id) != Some(&pending_roster) {
+            return Err(Error::RosterMismatch);
+        }
         let queue = self.outbox.entry(thread_id.to_owned()).or_default();
         queue.push(sealed);
         if queue.len() >= MAX_BATCH_ITEMS {
@@ -232,8 +284,9 @@ impl Labyrinth {
     /// that failed part-way through a thread and will retry it from its
     /// own queue). Returns how many were dropped.
     pub fn discard_pending(&mut self, thread_id: &str) -> usize {
-        self.outbox.remove(thread_id).map_or(0, |v| v.len())
-            + self.owner_outbox.remove(thread_id).map_or(0, |v| v.len())
+        let sender = self.outbox.remove(thread_id).map_or(0, |v| v.len());
+        self.outbox_rosters.remove(thread_id);
+        sender + self.owner_outbox.remove(thread_id).map_or(0, |v| v.len())
     }
 
     /// Messages buffered for `thread_id` but not yet written.
@@ -244,12 +297,59 @@ impl Labyrinth {
 
     /// Writes the sender buffer of one thread; on error the buffer is kept.
     pub(super) fn flush_sender(&mut self, thread_id: &str) -> Result<Option<FlushedBatch>> {
-        let Some(items) = self.outbox.get(thread_id).filter(|v| !v.is_empty()) else {
+        let Some(mek_id) = self
+            .outbox
+            .get(thread_id)
+            .and_then(|items| items.first())
+            .map(|item| item.mek_id)
+        else {
             return Ok(None);
         };
+        let roster = self
+            .outbox_rosters
+            .get(thread_id)
+            .cloned()
+            .ok_or(Error::Malformed("pending sender roster missing"))?;
+        let own = self.own_latest_checked()?;
+        let me = self.did.clone();
+        let mut heads = Vec::with_capacity(roster.len());
+        for (did, expected) in &roster {
+            let current = if *did == me {
+                own.clone()
+            } else {
+                let current = self
+                    .b
+                    .directory
+                    .latest(did)?
+                    .ok_or(Error::NotFound("recipient mailbox keys"))?;
+                self.accept_for_addressing(did, &current)?;
+                current
+            };
+            if current.head != *expected {
+                return Err(Error::RosterMismatch);
+            }
+            heads.push(current.head);
+        }
+        let valid_mek = self
+            .meks
+            .get(thread_id)
+            .and_then(|meks| meks.iter().find(|mek| *mek.id() == mek_id))
+            .is_some_and(|mek| mek.reusable_for(&self.did, &heads));
+        if !valid_mek {
+            return Err(Error::RosterMismatch);
+        }
+        let items = self
+            .outbox
+            .get(thread_id)
+            .filter(|items| !items.is_empty())
+            .expect("sender buffer checked above");
+        if items.iter().any(|item| item.mek_id != mek_id) {
+            return Err(Error::Malformed("pending sender batch mixes MEKs"));
+        }
         let batch = Batch::from_messages(thread_id, items, self.now())?;
         let rkey = self.b.threads.append_batch(&batch)?;
         let count = self.outbox.remove(thread_id).map_or(0, |v| v.len());
+        self.outbox_rosters.remove(thread_id);
         Ok(Some(FlushedBatch {
             thread_id: thread_id.to_owned(),
             rkey,
@@ -260,9 +360,18 @@ impl Labyrinth {
 
     /// Writes the owner buffer of one thread; on error the buffer is kept.
     pub(super) fn flush_owner(&mut self, thread_id: &str) -> Result<Option<FlushedBatch>> {
-        let Some(items) = self.owner_outbox.get(thread_id).filter(|v| !v.is_empty()) else {
+        if self.owner_outbox.get(thread_id).is_none_or(Vec::is_empty) {
             return Ok(None);
-        };
+        }
+        self.sync_epochs()?;
+        let items = self
+            .owner_outbox
+            .get(thread_id)
+            .filter(|items| !items.is_empty())
+            .expect("owner buffer checked above");
+        if items.iter().any(|item| item.epoch_seq != self.latest) {
+            return Err(Error::WrongEpoch);
+        }
         let batch = OwnerBatch::from_messages(items, self.now())?;
         let rkey = self.b.mailbox.append_owner_batch(&batch)?;
         let count = self.owner_outbox.remove(thread_id).map_or(0, |v| v.len());

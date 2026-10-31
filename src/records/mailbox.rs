@@ -276,6 +276,7 @@ impl VirtualDevice {
             sig_0x31: None,
             is_virtual: true,
         };
+        public.verify()?;
         let passkey = match (&self.passkey_wrapped_code, &self.passkey_credential_id) {
             (Some(w), Some(c)) => Some(PasskeyWrap {
                 wrapped_code: w.0.clone(),

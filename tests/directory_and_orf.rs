@@ -202,25 +202,116 @@ fn composite_directory_detects_truncation_by_the_mailbox_host() {
     let dir = CompositeDirectory::new(Box::new(truncating(&net)), Box::new(net.ds_directory()));
     assert_eq!(
         restore(Box::new(dir), 6).unwrap_err(),
-        Error::EpochTruncated {
-            published: 1,
-            reached: 0
+        Error::DirectoryIncomplete {
+            pds_present: false,
+            ds_present: true,
         }
     );
 }
 
 /// Serves fixed epochs as the PDS view.
-struct FixedPds(Vec<EpochPublic>);
+struct FixedPds {
+    latest: Option<EpochPublic>,
+    epochs: Vec<EpochPublic>,
+}
+impl FixedPds {
+    fn all(epochs: Vec<EpochPublic>) -> Self {
+        Self {
+            latest: epochs.last().cloned(),
+            epochs,
+        }
+    }
+}
+
+/// Serves a fixed view only for one DID and delegates every other account.
+/// This keeps adversarial peer-directory fixtures from corrupting the
+/// reviewing client's own epoch-integrity check.
+struct FixedForDid {
+    did: &'static str,
+    fixed: FixedPds,
+    fallback: MemoryDirectory,
+}
+
+impl MailboxDirectory for FixedForDid {
+    fn latest(&self, did: &str) -> labyrinth::Result<Option<EpochPublic>> {
+        if did == self.did {
+            self.fixed.latest(did)
+        } else {
+            self.fallback.latest(did)
+        }
+    }
+
+    fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
+        if did == self.did {
+            self.fixed.epoch(did, seq)
+        } else {
+            self.fallback.epoch(did, seq)
+        }
+    }
+
+    fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
+        self.fallback.device_transport_keys(did)
+    }
+}
 impl MailboxDirectory for FixedPds {
     fn latest(&self, _: &str) -> labyrinth::Result<Option<EpochPublic>> {
-        Ok(self.0.last().cloned())
+        Ok(self.latest.clone())
     }
     fn epoch(&self, _: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
-        Ok(self.0.iter().find(|e| e.seq == seq).cloned())
+        Ok(self.epochs.iter().find(|e| e.seq == seq).cloned())
     }
     fn device_transport_keys(&self, _: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
         Ok(vec![])
     }
+}
+
+#[test]
+fn composite_directory_rejects_one_sided_latest_and_epoch() {
+    let net = MemoryBackend::new();
+    let alice = init(&net, A, 1);
+    let e0 = alice.latest_public().unwrap();
+
+    let pds_only = CompositeDirectory::new(
+        Box::new(FixedPds::all(vec![e0.clone()])),
+        Box::new(FixedPds::all(vec![])),
+    );
+    let missing_ds = Error::DirectoryIncomplete {
+        pds_present: true,
+        ds_present: false,
+    };
+    assert_eq!(pds_only.latest(A), Err(missing_ds.clone()));
+    assert_eq!(pds_only.epoch(A, 0), Err(missing_ds));
+
+    let ds_only = CompositeDirectory::new(
+        Box::new(FixedPds::all(vec![])),
+        Box::new(FixedPds::all(vec![e0.clone()])),
+    );
+    let missing_pds = Error::DirectoryIncomplete {
+        pds_present: false,
+        ds_present: true,
+    };
+    assert_eq!(ds_only.latest(A), Err(missing_pds.clone()));
+    assert_eq!(ds_only.epoch(A, 0), Err(missing_pds));
+
+    let neither = CompositeDirectory::new(
+        Box::new(FixedPds::all(vec![])),
+        Box::new(FixedPds::all(vec![])),
+    );
+    assert_eq!(neither.latest(A), Ok(None));
+    assert_eq!(neither.epoch(A, 0), Ok(None));
+
+    let pds_tofu = CompositeDirectory::new_allowing_single_source(
+        Box::new(FixedPds::all(vec![e0.clone()])),
+        Box::new(FixedPds::all(vec![])),
+    );
+    assert_eq!(pds_tofu.latest(A), Ok(Some(e0.clone())));
+    assert_eq!(pds_tofu.epoch(A, 0), Ok(Some(e0.clone())));
+    let ds_tofu = CompositeDirectory::new_allowing_single_source(
+        Box::new(FixedPds::all(vec![])),
+        Box::new(FixedPds::all(vec![e0.clone()])),
+    );
+    assert_eq!(ds_tofu.latest(A), Ok(Some(e0.clone())));
+    assert_eq!(ds_tofu.epoch(A, 0), Ok(Some(e0)));
 }
 
 #[test]
@@ -238,18 +329,73 @@ fn composite_directory_accepts_only_a_verified_chain() {
     let e1 = net.ds_directory().epoch(A, 1).unwrap().unwrap();
     let e2 = laptop.latest_public().unwrap();
     let dir = |pds: Vec<EpochPublic>| {
-        CompositeDirectory::new(Box::new(FixedPds(pds)), Box::new(net.ds_directory()))
+        CompositeDirectory::new(Box::new(FixedPds::all(pds)), Box::new(net.ds_directory()))
     };
 
-    // Equal, or older on one side with a verified chain: the newest wins.
+    // Equal heads pass.
     assert_eq!(
         dir(vec![e0.clone(), e1.clone(), e2.clone()])
             .latest(A)
             .unwrap(),
         Some(e2.clone())
     );
-    assert_eq!(dir(vec![e0.clone()]).latest(A).unwrap(), Some(e2.clone()));
-    assert_eq!(dir(vec![]).latest(A).unwrap(), Some(e2.clone()));
+
+    // A lagging source may not omit the newer endpoint: otherwise the
+    // other source alone chooses the first-contact recipient epoch.
+    let missing_endpoint = CompositeDirectory::new(
+        Box::new(FixedPds {
+            latest: Some(e0.clone()),
+            epochs: vec![e0.clone(), e1.clone()],
+        }),
+        Box::new(net.ds_directory()),
+    );
+    assert_eq!(
+        missing_endpoint.latest(A),
+        Err(Error::DirectoryIncomplete {
+            pds_present: false,
+            ds_present: true,
+        })
+    );
+
+    // An older `latest` does pass when every immutable epoch, including
+    // the newer endpoint, is independently present in both sources. A PDS
+    // writes that copy before updating its mutable `self` record.
+    let lagging = CompositeDirectory::new(
+        Box::new(FixedPds {
+            latest: Some(e0.clone()),
+            epochs: vec![e0.clone(), e1.clone(), e2.clone()],
+        }),
+        Box::new(net.ds_directory()),
+    );
+    assert_eq!(lagging.latest(A).unwrap(), Some(e2.clone()));
+
+    // A mutable newer head with its required immutable endpoint missing
+    // from both sources is incomplete evidence, not a per-recipient trust
+    // failure that callers may silently exclude.
+    let missing_everywhere = CompositeDirectory::new(
+        Box::new(FixedPds {
+            latest: Some(e0.clone()),
+            epochs: vec![e0.clone()],
+        }),
+        Box::new(FixedPds {
+            latest: Some(e2.clone()),
+            epochs: vec![e0.clone()],
+        }),
+    );
+    assert_eq!(
+        missing_everywhere.latest(A),
+        Err(Error::DirectoryIncomplete {
+            pds_present: false,
+            ds_present: false,
+        })
+    );
+
+    // The former one-source availability fallback is explicit degraded TOFU.
+    let degraded = CompositeDirectory::new_allowing_single_source(
+        Box::new(FixedPds::all(vec![])),
+        Box::new(net.ds_directory()),
+    );
+    assert_eq!(degraded.latest(A).unwrap(), Some(e2.clone()));
 
     // A different, validly attested epoch 0 (the PDS lies): a fork, both
     // at the head and along the chain to mls-ds's newer head.
@@ -263,12 +409,21 @@ fn composite_directory_accepts_only_a_verified_chain() {
     )
     .unwrap();
     forged.verify(A, None).unwrap();
+    let forked = |head: EpochPublic| {
+        CompositeDirectory::new(
+            Box::new(FixedPds {
+                latest: Some(head.clone()),
+                epochs: vec![head, e1.clone(), e2.clone()],
+            }),
+            Box::new(net.ds_directory()),
+        )
+    };
     assert_eq!(
-        dir(vec![forged.clone()]).latest(A).unwrap_err(),
+        forked(forged.clone()).latest(A).unwrap_err(),
         Error::DirectoryFork { pds: 0, ds: 2 }
     );
     assert_eq!(
-        dir(vec![forged]).epoch(A, 0).unwrap_err(),
+        forked(forged).epoch(A, 0).unwrap_err(),
         Error::DirectoryFork { pds: 0, ds: 0 }
     );
 
@@ -283,12 +438,49 @@ fn composite_directory_accepts_only_a_verified_chain() {
     )
     .unwrap();
     net.register_chat_device(B, tpub(4));
-    let b = backends(&net, B, Box::new(net.mailbox(B)), Box::new(dir(vec![fork])));
+    let pds = FixedForDid {
+        did: A,
+        fixed: FixedPds {
+            latest: Some(fork.clone()),
+            epochs: vec![fork, e1, e2],
+        },
+        fallback: net.directory(),
+    };
+    let peer_fork = CompositeDirectory::new(Box::new(pds), Box::new(net.ds_directory()));
+    let b = backends(&net, B, Box::new(net.mailbox(B)), Box::new(peer_fork));
     let mut bob = Labyrinth::initialize(B, Box::new(signer(4)), b).unwrap();
     assert_eq!(
         bob.resolve_roster(&[A, B]).unwrap_err(),
         Error::DirectoryFork { pds: 0, ds: 2 }
     );
+}
+
+#[test]
+fn archive_outgoing_rejects_a_roster_not_anchored_in_the_directory() {
+    let net = MemoryBackend::new();
+    let mut alice = init(&net, A, 1);
+    let bob = init(&net, B, 2);
+
+    // This is self-consistent and attested by Bob's current chat key, but
+    // it is not Bob's independently published mailbox epoch.
+    let substituted = EpochPublic::sign(
+        B,
+        0,
+        &MailboxKeys::derive(&[9; 32], 0),
+        None,
+        None,
+        &signer(2),
+    )
+    .unwrap();
+    substituted.verify(B, None).unwrap();
+    assert_ne!(substituted.head, bob.latest_public().unwrap().head);
+
+    assert!(
+        alice
+            .archive_outgoing("t", &[(B.to_owned(), substituted)], "m", 1, b"secret")
+            .is_err()
+    );
+    assert_eq!(alice.pending("t"), 0);
 }
 
 #[test]

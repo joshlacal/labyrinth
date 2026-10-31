@@ -123,6 +123,65 @@ impl ThreadStore for MemoryThreads {
         })
     }
 
+    fn list_batches_before(
+        &self,
+        thread_id: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Stored<Batch>>> {
+        let target = limit.max(1).saturating_add(1);
+        let range = TimeRange {
+            from_ms: None,
+            until_ms: before_ms,
+        };
+        self.space(thread_id, |t| {
+            let mut candidates: Vec<Stored<Batch>> = t
+                .repos
+                .iter()
+                .flat_map(|(did, r)| {
+                    r.batches
+                        .iter()
+                        .rev()
+                        .filter(|(_, (b, _))| b.items.iter().any(|i| range.contains(i.timestamp)))
+                        .map(|(k, (b, order))| Stored {
+                            author: did.clone(),
+                            rkey: k.clone(),
+                            value: b.clone(),
+                            order: *order,
+                        })
+                })
+                .collect();
+            candidates.sort_by_key(|b| core::cmp::Reverse(b.order.map(|o| o.labyrinth_seq)));
+            let mut eligible = std::collections::BTreeSet::new();
+            for b in &candidates {
+                for i in &b.value.items {
+                    if before_ms.is_none_or(|u| i.timestamp < u.saturating_sub(1)) {
+                        eligible.insert((i.timestamp, i.message_id.clone()));
+                    }
+                }
+                if eligible.len() >= target {
+                    break;
+                }
+            }
+            if let Some((floor, _)) = (eligible.len() >= target)
+                .then(|| eligible.iter().rev().nth(target - 1))
+                .flatten()
+            {
+                let floor = *floor;
+                candidates.retain(|b| {
+                    b.value
+                        .items
+                        .iter()
+                        .any(|i| i.timestamp >= floor && before_ms.is_none_or(|u| i.timestamp < u))
+                });
+            }
+            candidates.sort_by_key(|b| {
+                core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max())
+            });
+            Ok(candidates)
+        })
+    }
+
     fn list_threads(&self) -> Result<Vec<String>> {
         Ok(self.backend.lock().threads_of(&self.did))
     }

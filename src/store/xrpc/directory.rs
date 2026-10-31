@@ -26,6 +26,7 @@ use crate::{Error, Result};
 /// the mailbox lives in a Space.
 pub struct XrpcDirectory {
     x: Xrpc,
+    sequencer_key: Option<crate::store::SequencerKey>,
 }
 
 /// One participant's `labyrinthHead` in `blue.catbird.chat.getConversationState`
@@ -69,7 +70,15 @@ impl XrpcDirectory {
     pub fn new(transport: Arc<dyn XrpcTransport>) -> Self {
         Self {
             x: Xrpc::new(transport),
+            sequencer_key: None,
         }
+    }
+
+    /// Configures the sequencer DS signing key (`[CB-38]`) reported for
+    /// server `ACCOUNT_DELETED` redactions.
+    pub fn with_sequencer_key(mut self, key: crate::store::SequencerKey) -> Self {
+        self.sequencer_key = Some(key);
+        self
     }
 
     fn head(&self, did: &str, seq: Option<u64>) -> Result<Option<EpochPublic>> {
@@ -153,6 +162,10 @@ impl MailboxDirectory for XrpcDirectory {
             })
             .collect::<Result<_>>()
             .map(Some)
+    }
+
+    fn sequencer_key(&self, _thread_id: &str) -> Result<Option<crate::store::SequencerKey>> {
+        Ok(self.sequencer_key.clone())
     }
 }
 

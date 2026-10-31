@@ -120,6 +120,16 @@ impl State {
             return Err(Error::Conflict);
         }
         history.insert(seq, record.clone());
+        if let Some(existing) = self.public_keys.get(did)
+            && let Ok(existing_pub) = existing.to_public()
+            && existing_pub.verify(did, None).is_ok()
+            && existing_pub.seq > seq
+        {
+            return Err(Error::EpochRollback {
+                pinned: existing_pub.seq,
+                offered: seq,
+            });
+        }
         self.public_keys.insert(did.to_owned(), record.clone());
         Ok(())
     }
@@ -135,7 +145,7 @@ impl State {
         t.next_seq += 1;
         Some(ServerOrder {
             labyrinth_seq: t.next_seq,
-            chat_seq: Some(t.chat_seq),
+            chat_seq: t.leaves.as_ref().map(|_| t.chat_seq),
             received_at_ms: now,
         })
     }
@@ -208,6 +218,15 @@ impl MemoryBackend {
     /// [`remove_chat_device`](Self::remove_chat_device) times are read on.
     pub fn set_server_time(&self, ms: u64) {
         self.lock().server_now = ms;
+    }
+
+    /// Fault-injection helper for tests modelling a compromised or unvalidated
+    /// store that holds an epoch with a broken `prev_sig`.
+    #[doc(hidden)]
+    pub fn insert_epoch_unchecked(&self, did: &str, epoch: &Epoch) {
+        let mut s = self.lock();
+        let m = s.mailboxes.entry(did.to_owned()).or_default();
+        m.epochs.insert(space_epoch_id(epoch.seq()), epoch.clone());
     }
 
     /// Records one MLS chat entry in `thread_id`; returns its seq.
@@ -324,6 +343,18 @@ impl MemoryBackend {
         Some(leaves.get(did).cloned().unwrap_or_default())
     }
 
+    #[cfg(feature = "xrpc")]
+    pub(crate) fn thread_leaves(
+        &self,
+        thread_id: &str,
+        did: &str,
+    ) -> Option<(u64, Vec<MemberDeviceKey>)> {
+        let s = self.lock();
+        let t = s.threads.get(thread_id)?;
+        let leaves = t.leaves.as_ref()?;
+        Some((t.chat_seq, leaves.get(did).cloned().unwrap_or_default()))
+    }
+
     fn chat_keys(&self, did: &str) -> Vec<ChatDeviceKey> {
         let s = self.lock();
         s.chat_devices
@@ -395,14 +426,26 @@ impl MailboxStore for MemoryMailbox {
     }
 
     fn create_epoch(&self, epoch: &Epoch, members: &[EpochMember]) -> Result<String> {
-        let id = space_epoch_id(epoch.seq());
+        let seq = epoch.seq();
+        let id = space_epoch_id(seq);
+        let cur_pub = epoch.public.to_public()?;
         self.with(|m| {
             if m.epochs.contains_key(&id)
                 || members
                     .iter()
-                    .any(|x| x.epoch_number != epoch.seq() || m.members.contains_key(&x.rkey()))
+                    .any(|x| x.epoch_number != seq || m.members.contains_key(&x.rkey()))
             {
                 return Err(Error::Conflict);
+            }
+            if seq > 0 {
+                let prev = m
+                    .epochs
+                    .get(&space_epoch_id(seq - 1))
+                    .ok_or(Error::Malformed("InvalidEpochChain"))?;
+                let prev_pub = prev.public.to_public()?;
+                cur_pub
+                    .verify_link(prev_pub.seq, &prev_pub.head, &prev_pub.keys.sig)
+                    .map_err(|_| Error::Malformed("InvalidEpochChain"))?;
             }
             m.epochs.insert(id.clone(), epoch.clone());
             for x in members {
@@ -463,11 +506,28 @@ impl MailboxStore for MemoryMailbox {
     }
 
     fn get_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<Option<VirtualDevice>> {
-        self.with(|m| Ok(m.vdevices.get(&hex::encode(vdevice_id)).cloned()))
+        let s = self.backend.lock();
+        let now = s.server_now;
+        Ok(s.mailboxes
+            .get(&self.did)
+            .and_then(|m| m.vdevices.get(&hex::encode(vdevice_id)))
+            .filter(|vd| !vdevice_expired_at(vd, now))
+            .cloned())
     }
 
     fn list_virtual_devices(&self) -> Result<Vec<VirtualDevice>> {
-        self.with(|m| Ok(m.vdevices.values().cloned().collect()))
+        let s = self.backend.lock();
+        let now = s.server_now;
+        Ok(s.mailboxes
+            .get(&self.did)
+            .map(|m| {
+                m.vdevices
+                    .values()
+                    .filter(|vd| !vdevice_expired_at(vd, now))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     fn append_owner_batch(&self, batch: &OwnerBatch) -> Result<String> {
@@ -508,6 +568,63 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
+    fn list_owner_batches_before(
+        &self,
+        thread_id: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Stored<OwnerBatch>>> {
+        let target = limit.max(1).saturating_add(1);
+        let range = TimeRange {
+            from_ms: None,
+            until_ms: before_ms,
+        };
+        self.with(|m| {
+            let mut candidates: Vec<Stored<OwnerBatch>> = m
+                .owner_batches
+                .iter()
+                .rev()
+                .filter(|(_, (b, _))| {
+                    b.thread_id == thread_id && b.items.iter().any(|i| range.contains(i.timestamp))
+                })
+                .map(|(k, (b, order))| Stored {
+                    author: self.did.clone(),
+                    rkey: k.clone(),
+                    value: b.clone(),
+                    order: *order,
+                })
+                .collect();
+            candidates.sort_by_key(|b| core::cmp::Reverse(b.order.map(|o| o.labyrinth_seq)));
+            let mut eligible = std::collections::BTreeSet::new();
+            for b in &candidates {
+                for i in &b.value.items {
+                    if before_ms.is_none_or(|u| i.timestamp < u.saturating_sub(1)) {
+                        eligible.insert((i.timestamp, i.message_id.clone()));
+                    }
+                }
+                if eligible.len() >= target {
+                    break;
+                }
+            }
+            if let Some((floor, _)) = (eligible.len() >= target)
+                .then(|| eligible.iter().rev().nth(target - 1))
+                .flatten()
+            {
+                let floor = *floor;
+                candidates.retain(|b| {
+                    b.value
+                        .items
+                        .iter()
+                        .any(|i| i.timestamp >= floor && before_ms.is_none_or(|u| i.timestamp < u))
+                });
+            }
+            candidates.sort_by_key(|b| {
+                core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max())
+            });
+            Ok(candidates)
+        })
+    }
+
     fn publish_mailbox_keys(&self, record: &MailboxKeysRecord) -> Result<()> {
         self.backend.lock().publish_pds(&self.did, record)
     }
@@ -528,6 +645,25 @@ impl MailboxStore for MemoryMailbox {
         self.backend.lock().purge(&self.did);
         Ok(())
     }
+}
+
+pub(super) fn vdevice_expired_at(vd: &VirtualDevice, now_ms: u64) -> bool {
+    let Ok((rec, _)) = vd.to_bundle() else {
+        return false;
+    };
+    let Ok(created_ms) = crate::records::ms_from_datetime(&vd.created_at) else {
+        return false;
+    };
+    let Ok(last_used_ms) = vd
+        .last_used_at
+        .as_deref()
+        .map(crate::records::ms_from_datetime)
+        .transpose()
+    else {
+        return false;
+    };
+    crate::client::recovery::recovery_expiry(rec.mechanism, created_ms, last_used_ms)
+        .is_some_and(|exp| now_ms >= exp)
 }
 
 #[cfg(test)]

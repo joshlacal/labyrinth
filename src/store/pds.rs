@@ -125,6 +125,16 @@ impl KeyPublisher for PdsPublisher {
                     .map_err(backend)?;
             }
         }
+        if let Some(existing) = get(self.records.as_ref(), &self.did, SELF_RKEY)?
+            && let Ok(existing_pub) = existing.to_public()
+            && existing_pub.verify(&self.did, None).is_ok()
+            && existing_pub.seq > record.current.epoch_number
+        {
+            return Err(Error::EpochRollback {
+                pinned: existing_pub.seq,
+                offered: record.current.epoch_number,
+            });
+        }
         let bytes = serde_json::to_vec(record).map_err(|e| backend(e.to_string()))?;
         self.records
             .put_mailbox_keys(SELF_RKEY, &bytes)

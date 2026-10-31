@@ -458,7 +458,7 @@ fn space_store_semantics() {
 
     // read_self only: Bob's session sees no repo in Alice's Space and
     // cannot write there.
-    let as_bob = SpaceMailboxStore::in_space(
+    let as_bob = SpaceMailboxStore::in_space_unchecked_for_test(
         space.clone(),
         w.transport(BOB),
         Box::new(w.net.pds_publisher(BOB)),

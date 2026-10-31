@@ -67,6 +67,7 @@ impl Labyrinth {
         author: Option<&str>,
         blob_ids: &[&str],
     ) -> Result<()> {
+        self.sync_epochs()?;
         let e = self.epoch_secret(self.latest)?;
         let t = seal_owner_tombstone(e.root(), e.seq, thread_id, message_id, timestamp, author)?;
         self.queue_owner(thread_id, t)?;
@@ -86,6 +87,9 @@ impl Labyrinth {
             let before = q.len();
             q.retain(|m| m.message_id != message_id);
             dropped = before - q.len();
+            if q.is_empty() {
+                self.outbox_rosters.remove(thread_id);
+            }
         }
         let r = Redaction::sign(&self.did, thread_id, message_id, self.transport.as_ref());
         match self.b.threads.redact_item(thread_id, message_id, &r) {
@@ -113,6 +117,7 @@ impl Labyrinth {
     /// caller to retry ([`delete_account_remote`]).
     pub fn purge_account(&mut self) -> Result<PurgeReport> {
         self.outbox.clear();
+        self.outbox_rosters.clear();
         self.owner_outbox.clear();
         let out = self.purge_remote();
         self.meks.clear();

@@ -6,7 +6,7 @@ mod net;
 
 use labyrinth::Error;
 use labyrinth::client::Labyrinth;
-use labyrinth::store::memory::MemoryBackend;
+use labyrinth::store::memory::{MemoryBackend, MemoryDirectory};
 use net::{A, B, TestClock, backends, init, sibling, signer, tpub};
 
 /// Bob purges his account and starts a new mailbox with chat key `seed`.
@@ -108,6 +108,88 @@ impl labyrinth::store::MailboxDirectory for Down {
     }
 }
 
+/// A directory whose independent sources have not both published a peer.
+struct Incomplete(MemoryDirectory);
+
+impl labyrinth::store::MailboxDirectory for Incomplete {
+    fn latest(&self, did: &str) -> labyrinth::Result<Option<labyrinth::mailbox::EpochPublic>> {
+        if did == B {
+            Err(Error::DirectoryIncomplete {
+                pds_present: true,
+                ds_present: false,
+            })
+        } else {
+            self.0.latest(did)
+        }
+    }
+
+    fn epoch(
+        &self,
+        did: &str,
+        seq: u64,
+    ) -> labyrinth::Result<Option<labyrinth::mailbox::EpochPublic>> {
+        if did == B {
+            Err(Error::DirectoryIncomplete {
+                pds_present: true,
+                ds_present: false,
+            })
+        } else {
+            self.0.epoch(did, seq)
+        }
+    }
+
+    fn device_transport_keys(
+        &self,
+        did: &str,
+    ) -> labyrinth::Result<Vec<labyrinth::store::ChatDeviceKey>> {
+        if did == B {
+            Err(Error::DirectoryIncomplete {
+                pds_present: true,
+                ds_present: false,
+            })
+        } else {
+            self.0.device_transport_keys(did)
+        }
+    }
+}
+
+/// A peer lookup that fails for an operational reason rather than because
+/// the peer supplied a cryptographically invalid epoch.
+struct PeerFailure(MemoryDirectory, Error);
+
+impl labyrinth::store::MailboxDirectory for PeerFailure {
+    fn latest(&self, did: &str) -> labyrinth::Result<Option<labyrinth::mailbox::EpochPublic>> {
+        if did == B {
+            Err(self.1.clone())
+        } else {
+            self.0.latest(did)
+        }
+    }
+
+    fn epoch(
+        &self,
+        did: &str,
+        seq: u64,
+    ) -> labyrinth::Result<Option<labyrinth::mailbox::EpochPublic>> {
+        if did == B {
+            Err(self.1.clone())
+        } else {
+            self.0.epoch(did, seq)
+        }
+    }
+
+    fn device_transport_keys(
+        &self,
+        did: &str,
+    ) -> labyrinth::Result<Vec<labyrinth::store::ChatDeviceKey>> {
+        if did == B {
+            Err(self.1.clone())
+        } else {
+            self.0.device_transport_keys(did)
+        }
+    }
+}
+
 #[test]
 fn transient_directory_failure_fails_the_roster_instead_of_dropping_members() {
     let (net, clock) = (MemoryBackend::new(), TestClock::default());
@@ -120,6 +202,41 @@ fn transient_directory_failure_fails_the_roster_instead_of_dropping_members() {
         alice.resolve_roster_report(&[A, B]),
         Err(Error::Backend(_))
     ));
+}
+
+#[test]
+fn incomplete_directory_fails_the_roster_instead_of_dropping_members() {
+    let (net, clock) = (MemoryBackend::new(), TestClock::default());
+    let alice = init(&net, &clock, A, 1);
+    let state = alice.export_state().unwrap();
+    let mut b = backends(&net, &clock, A);
+    b.directory = Box::new(Incomplete(net.directory()));
+    let mut alice = Labyrinth::from_state(&state, A, Box::new(signer(1)), b).unwrap();
+    assert_eq!(
+        alice.resolve_roster_report(&[A, B]).unwrap_err(),
+        Error::DirectoryIncomplete {
+            pds_present: true,
+            ds_present: false,
+        }
+    );
+}
+
+#[test]
+fn operational_peer_lookup_failures_never_become_roster_exclusions() {
+    for expected in [
+        Error::NotFound("required peer epoch"),
+        Error::Forbidden,
+        Error::NotSupported("peer directory lookup"),
+        Error::Malformed("directory epoch under the wrong number"),
+    ] {
+        let (net, clock) = (MemoryBackend::new(), TestClock::default());
+        let alice = init(&net, &clock, A, 1);
+        let state = alice.export_state().unwrap();
+        let mut b = backends(&net, &clock, A);
+        b.directory = Box::new(PeerFailure(net.directory(), expected.clone()));
+        let mut alice = Labyrinth::from_state(&state, A, Box::new(signer(1)), b).unwrap();
+        assert_eq!(alice.resolve_roster_report(&[A, B]).unwrap_err(), expected);
+    }
 }
 
 #[test]
@@ -138,4 +255,44 @@ fn discard_pending_drops_one_threads_buffer_only() {
     assert_eq!(alice.flush_thread("t2").unwrap().len(), 1);
     assert_eq!(alice.pending("t2"), 0);
     assert!(alice.flush().unwrap().is_empty());
+}
+
+#[test]
+fn propose_repin_and_repin_peer_sync_own_epochs_first() {
+    let (net, clock) = (MemoryBackend::new(), TestClock::default());
+    let mut alice = init(&net, &clock, A, 1);
+    let mut alice2 = sibling(&net, &clock, &mut alice, 3);
+    let alice3 = sibling(&net, &clock, &mut alice, 4);
+    let mut bob = init(&net, &clock, B, 2);
+    alice.resolve_roster(&[A, B]).unwrap();
+
+    // Sibling rotates Alice's account to epoch 1 while `alice` is still at 0.
+    alice2
+        .revoke_device(&alice3.device_public().device_key_pub)
+        .unwrap();
+    assert_eq!(alice.latest_epoch(), 0);
+    let mut bob = reset(&net, &clock, &mut bob, 2);
+    bob.resolve_roster(&[A, B]).unwrap();
+
+    // `propose_repin` syncs `alice` to epoch 1 first, so the safety number it
+    // shows matches Bob's view of Alice's latest head.
+    let p = alice.propose_repin(B).unwrap();
+    assert_eq!(alice.latest_epoch(), 1);
+    assert_eq!(p.new_safety_number, bob.safety_number_with(A).unwrap());
+    alice.repin_peer(B, &p.offered_head).unwrap();
+
+    // Now `alice2` revokes `alice` itself; neither `propose_repin` nor
+    // `repin_peer` may succeed or mutate `alice`'s pins after revocation.
+    let bob = reset(&net, &clock, &mut bob, 2);
+    let old_pin = alice.peer_pin(B).unwrap().clone();
+    alice2
+        .revoke_device(&alice.device_public().device_key_pub)
+        .unwrap();
+    assert_eq!(alice.propose_repin(B).unwrap_err(), Error::NotEpochMember);
+    let new_bob_head = bob.latest_public().unwrap().head;
+    assert_eq!(
+        alice.repin_peer(B, &new_bob_head).unwrap_err(),
+        Error::NotEpochMember
+    );
+    assert_eq!(alice.peer_pin(B), Some(&old_pin));
 }

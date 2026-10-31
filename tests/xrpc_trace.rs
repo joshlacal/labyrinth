@@ -160,10 +160,18 @@ impl World {
 
     fn backends(&self, did: &str, seed: u8) -> Backends {
         let t = self.transport(did, seed);
+        let ds_vk = ed25519_dalek::SigningKey::from_bytes(&[0x5e; 32])
+            .verifying_key()
+            .to_bytes();
         Backends {
             mailbox: Box::new(XrpcMailboxStore::new(did, t.clone())),
             threads: Box::new(XrpcThreadStore::new(did, t.clone())),
-            directory: Box::new(XrpcDirectory::new(t.clone())),
+            directory: Box::new(XrpcDirectory::new(t.clone()).with_sequencer_key(
+                labyrinth::store::SequencerKey {
+                    did: "did:web:ds.example".into(),
+                    key: ds_vk,
+                },
+            )),
             orf: Box::new(XrpcOrf::new(t)),
             publishers: vec![],
             clock: Box::new(TestClock::default()),
@@ -303,15 +311,18 @@ fn record_crate_xrpc_trace() {
     // Removing a recovery method rotates its device out and deletes it.
     alice.remove_recovery_method(&keychain.vdevice_id).unwrap();
 
-    // Carol deletes her account server-side. The reference server here
-    // has no sequencer signing key and XrpcDirectory reports none, so Bob
-    // sees "removed by server", never an unsend.
+    // Carol deletes her account server-side with the sequencer DS signing
+    // `ACCOUNT_DELETED` redactions, so Bob verifies `account_deleted` and
+    // never sees an unverified removal or unsend.
+    w.server
+        .backend()
+        .set_sequencer("did:web:ds.example", Some([0x5e; 32]));
     assert!(carol.purge_account().unwrap().server_side);
     let h = bob.load_thread(THREAD, TimeRange::ALL).unwrap();
     assert!(
         h.redacted
             .iter()
-            .any(|r| r.removed_by_server && !r.by_author && !r.account_deleted)
+            .any(|r| r.account_deleted && !r.by_author && !r.removed_by_server)
     );
     XrpcMailboxStore::new(BOB, w.transport(BOB, 3))
         .purge_mailbox()

@@ -50,6 +50,7 @@ fn vdevice(s: &MemoryXrpcServer, c: &Caller, name: &str, input: &Input<'_>) -> R
         .vdevice_id
         .array::<16>("vdeviceId")
         .map_err(|_| super::bad("vdeviceId is not 16 bytes"))?;
+    super::binding::require_bound(s, c, None)?;
     let mb = s.net.mailbox(&c.did);
     let r = if name == "touchVirtualDevice" {
         mb.touch_virtual_device(&id)

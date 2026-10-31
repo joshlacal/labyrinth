@@ -414,7 +414,7 @@ fn lifecycle_on_a_live_space_pds() {
     assert_eq!(frames, want);
 
     // read_self only: Bob's session cannot read Alice's mailbox.
-    let as_bob = SpaceMailboxStore::in_space(
+    let as_bob = SpaceMailboxStore::in_space_unchecked_for_test(
         SpaceRef::mailbox(&alice_a.did),
         w.transport(&bob_a),
         Box::new(PdsPublisher::new(&bob_a.did, w.public(&bob_a))),

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use super::members::ExcludedMember;
+use super::members::{Audit, ExcludedMember, ExclusionReason};
 use super::{Backends, Labyrinth};
 use crate::device::{ChatBinding, DevicePublic, DeviceSecrets};
 use crate::encoding::random;
@@ -52,12 +52,63 @@ pub struct RotationReport {
 /// How many times a rotation retries after losing the create race.
 const ROTATE_ATTEMPTS: usize = 3;
 
+/// Keys with a cryptographically valid membership in `audit`. Physical
+/// devices whose member MAC is valid but whose chat binding is absent or no
+/// longer current still know this epoch's entropy, so revocation safety must
+/// count them even though rotation excludes them for [CB-36]. Malformed rows,
+/// missing/invalid device records and invalid MACs remain non-blocking.
+fn confirmed_epoch_member_keys(audit: &Audit) -> impl Iterator<Item = XVerifyingKey> + '_ {
+    audit
+        .valid
+        .iter()
+        .map(|v| v.record.device_key_pub)
+        .chain(audit.excluded.iter().filter_map(|x| {
+            matches!(
+                x.reason,
+                ExclusionReason::Unbound | ExclusionReason::ChatDeviceNotCurrent
+            )
+            .then_some(x.device_key)
+            .flatten()
+        }))
+}
+
 pub(super) fn epoch_record(mb: &dyn MailboxStore, seq: u64) -> Result<(String, EpochRecord)> {
     let s = mb.get_epoch(seq)?.ok_or(Error::NotFound("epoch"))?;
     if s.value.seq() != seq {
         return Err(Error::Malformed("epoch record under the wrong key"));
     }
     Ok((s.rkey, s.value.to_record()?))
+}
+
+/// Create an immutable epoch, reconciling an ambiguous response by reading
+/// back the exact signed record and every initial member. This keeps the
+/// pending epoch secrets alive when a backend committed the write but its
+/// acknowledgement was lost. A process crash still requires a durable
+/// operation journal outside this in-memory call.
+fn create_epoch_reconciled(
+    mb: &dyn MailboxStore,
+    epoch: &Epoch,
+    members: &[EpochMember],
+) -> Result<String> {
+    let failure = match mb.create_epoch(epoch, members) {
+        Ok(id) => return Ok(id),
+        Err(error) => error,
+    };
+    if !matches!(&failure, Error::Backend(_) | Error::Conflict) {
+        return Err(failure);
+    }
+    let seq = epoch.public.epoch_number;
+    let Some(stored) = mb.get_epoch(seq)? else {
+        return Err(failure);
+    };
+    if stored.author != mb.owner() || stored.value != *epoch {
+        return Err(failure);
+    }
+    let actual = mb.list_epoch_members(seq)?;
+    if !members.iter().all(|expected| actual.contains(expected)) {
+        return Err(failure);
+    }
+    Ok(stored.rkey)
 }
 
 /// Reads my own epoch `secret.seq` from the mailbox and authenticates the
@@ -181,15 +232,15 @@ pub(super) fn chain_forward(
         if revoked.contains(&record.opened_by.0) {
             return Err(squat("it was opened by a device this client revoked"));
         }
-        let opener_prev = member(mb, prev.seq, &opener.device_key_pub)
-            .ok()
-            .flatten()
-            .filter(|m| verify_member(prev, m).is_ok())
+        let opener_prev = member(mb, prev.seq, &opener.device_key_pub)?
             .ok_or(squat("its opener was not a member of the previous epoch"))?;
-        let mine = member(mb, seq, &me.device_key_pub)
-            .ok()
-            .flatten()
-            .ok_or(Error::NotEpochMember)?;
+        verify_member(prev, &opener_prev)
+            .map_err(|_| squat("its opener was not a member of the previous epoch"))?;
+        // Only an absent membership record proves that this device was
+        // revoked. Backend/decoding failures are uncertainty and must
+        // propagate; otherwise passkey recovery could skip a potentially
+        // active bundle and enroll from a second matching candidate.
+        let mine = member(mb, seq, &me.device_key_pub)?.ok_or(Error::NotEpochMember)?;
         let opened = OpenedEpoch {
             epoch_id: &next.rkey,
             record: &record,
@@ -197,10 +248,11 @@ pub(super) fn chain_forward(
             opener: &opener,
             opener_prev_member: &opener_prev,
         };
-        let e = forward_chain(did, prev, &prev_public, &opened, storage).map_err(|e| match e {
-            Error::NotEpochMember => Error::NotEpochMember,
-            _ => squat("the entropy addressed to this device does not open"),
-        })?;
+        // Once a membership row exists, missing entropy or a bad
+        // sequence/MAC is not evidence of revocation. It is an immutable
+        // invalid child occupying the next sequence and must fail closed.
+        let e = forward_chain(did, prev, &prev_public, &opened, storage)
+            .map_err(|_| squat("the entropy addressed to this device does not open"))?;
         out.push(e);
     }
 }
@@ -208,23 +260,79 @@ pub(super) fn chain_forward(
 /// SPEC §10 epoch-integrity check ([CB-28]): the account's published latest epoch
 /// (from the directory, i.e. the public `mailboxKeys` / mls-ds roster view)
 /// must not be ahead of what this device reached, nor fork from it.
-pub(super) fn check_integrity(
+fn checked_published(
     dir: &dyn MailboxDirectory,
     did: &str,
     reached: u64,
     reached_head: &[u8; 32],
-) -> Result<()> {
+) -> Result<Option<EpochPublic>> {
     let Some(published) = dir.latest(did)? else {
-        return Ok(());
+        return Ok(None);
     };
     published.verify(did, None)?;
     if published.seq > reached {
+        // A self-consistent ahead row can carry attacker-generated epoch
+        // and transport keys. It has no authenticated chain path yet, so a
+        // historically associated but removed key must not be allowed to
+        // invent it and block sync/recovery. Only a current account device
+        // may supply this fail-closed truncation anchor.
+        let attester = published.attestation.transport_public_key;
+        if !dir
+            .device_transport_keys(did)?
+            .iter()
+            .any(|key| key.is_current() && key.key == attester)
+        {
+            return Err(Error::Unattested);
+        }
         return Err(Error::EpochTruncated {
             published: published.seq,
             reached,
         });
     }
+    // Equal or historical heads are accepted from a removed device because
+    // they may genuinely predate its removal; their ancestry is checked by
+    // the caller below.
+    check_own_attester(dir, did, &published)?;
     if published.seq == reached && published.head != *reached_head {
+        return Err(Error::Malformed("published epoch head forks from mailbox"));
+    }
+    Ok(Some(published))
+}
+
+/// Checks the published epoch and proves that a lagging published head is
+/// an ancestor of the candidate reached through the mailbox. Every link is
+/// authenticated with the previous epoch's mailbox signing key; removed
+/// historical attesters remain valid while the candidate's own attester is
+/// checked separately by [`verified_own`].
+pub(super) fn check_candidate_integrity(
+    mb: &dyn MailboxStore,
+    dir: &dyn MailboxDirectory,
+    did: &str,
+    reached: u64,
+    reached_head: &[u8; 32],
+) -> Result<()> {
+    let Some(published) = checked_published(dir, did, reached, reached_head)? else {
+        return Ok(());
+    };
+    if published.seq == reached {
+        return Ok(());
+    }
+
+    let mut seq = reached;
+    let mut child = epoch_record(mb, seq)?.1.public;
+    if child.head != *reached_head {
+        return Err(Error::Malformed("published epoch head forks from mailbox"));
+    }
+    while seq > published.seq {
+        let prev_seq = seq
+            .checked_sub(1)
+            .ok_or(Error::Malformed("epoch chain broken"))?;
+        let prev = epoch_record(mb, prev_seq)?.1.public;
+        child.verify(did, Some(&prev))?;
+        child = prev;
+        seq = prev_seq;
+    }
+    if child.head != published.head {
         return Err(Error::Malformed("published epoch head forks from mailbox"));
     }
     Ok(())
@@ -278,9 +386,8 @@ impl Labyrinth {
         let binding = ChatBinding::sign(did, &key, transport.as_ref());
         b.mailbox
             .create_device(&Device::bound(device.public(), &binding, now.clone()))?;
-        let id = b
-            .mailbox
-            .create_epoch(&Epoch::from_record(&new.record, now), &members)?;
+        let epoch = Epoch::from_record(&new.record, now);
+        let id = create_epoch_reconciled(b.mailbox.as_ref(), &epoch, &members)?;
         let mut me = Self::assemble(did, device, transport, b, salt, [pending.assign_id(id)])?;
         // Made here, so it needs no checking.
         me.adopted(new.record.public.clone());
@@ -301,14 +408,24 @@ impl Labyrinth {
     /// are replayed, a PDS's `mailboxKeys/self` briefly names an older
     /// epoch; the last write restores the newest.
     pub fn finish_initialize(&self) -> Result<()> {
+        self.ensure_latest_revocation_safe()?;
         let key = self.device.public().device_key_pub;
         let orf = match self.b.orf.register(&key, None) {
             Ok(()) | Err(Error::Conflict) => Ok(()),
             Err(e) => Err(e),
         };
         // Publish even when the ORF is down: the directories don't need it.
-        let published = (0..=self.latest)
-            .try_for_each(|seq| self.publish_keys(&self.epoch_record(seq)?.1.public));
+        let published = (0..=self.latest).try_for_each(|seq| {
+            match self.publish_keys(&self.epoch_record(seq)?.1.public) {
+                Ok(()) => Ok(()),
+                Err(Error::EpochRollback { pinned, .. })
+                    if seq < self.latest && pinned <= self.latest =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        });
         orf.and(published)
     }
 
@@ -335,7 +452,41 @@ impl Labyrinth {
     /// whose publish failed. The [CB-28] check depends on the other
     /// directory staying current.
     pub fn publish_latest_keys(&self) -> Result<()> {
+        self.ensure_latest_revocation_safe()?;
         self.publish_keys(&self.latest_public()?)
+    }
+
+    /// Publishing an inclusive head after a locally decided revocation
+    /// would advertise unsafe keys even though new encryption is blocked.
+    /// Re-audit the cached latest epoch and include invalid/omitted rows for
+    /// keys this client already knows were members.
+    fn ensure_latest_revocation_safe(&self) -> Result<()> {
+        if self.revoked.is_empty() {
+            return Ok(());
+        }
+        let epoch = self
+            .epochs
+            .get(&self.latest)
+            .ok_or(Error::NotFound("epoch"))?;
+        let audit = self.audit_epoch(epoch)?;
+        let served_revoked = confirmed_epoch_member_keys(&audit)
+            .map(|member| member.0)
+            .chain(
+                audit
+                    .excluded
+                    .iter()
+                    .filter_map(|member| member.device_key.map(|key| key.0)),
+            )
+            .any(|key| self.revoked.contains(&key));
+        let omitted_verified_revoked = self.verified.0 == epoch.seq
+            && self.verified.1.iter().any(|key| self.revoked.contains(key));
+        if served_revoked || omitted_verified_revoked {
+            return Err(Error::EpochSquatted {
+                seq: epoch.seq,
+                reason: "it re-admits a device this client revoked",
+            });
+        }
+        Ok(())
     }
 
     /// Forward-chain into every epoch opened since this device last synced
@@ -344,38 +495,107 @@ impl Labyrinth {
     ///
     /// [`Error::NotEpochMember`] means this device has been revoked.
     pub fn sync_epochs(&mut self) -> Result<SyncReport> {
+        self.sync_epochs_allowing(&BTreeSet::new())
+    }
+
+    /// Sync while permitting `pending_revocations` to remain members of the
+    /// reached chain. This is used only between the local decision to revoke
+    /// a target and the rotation that removes it; no ordinary operation gets
+    /// access to an epoch containing a previously revoked device.
+    fn sync_epochs_allowing(
+        &mut self,
+        pending_revocations: &BTreeSet<[u8; 32]>,
+    ) -> Result<SyncReport> {
         let from = self.latest;
         let start = self.epoch_secret(from)?;
+        // A target may legitimately have opened an unseen epoch before this
+        // device decided to revoke it. During the private preparatory catch-up
+        // only, let that target's existing opener signature through so this
+        // client can reach the head and immediately rotate it out. Ordinary
+        // sync still rejects every locally revoked opener, and addressing is
+        // blocked until the safe rotation succeeds.
+        let enforced_revoked: BTreeSet<[u8; 32]> = self
+            .revoked
+            .difference(pending_revocations)
+            .copied()
+            .collect();
         let reached = chain_forward(
             self.b.mailbox.as_ref(),
             &self.did,
             start,
             self.device.public(),
             &self.device.storage,
-            &self.revoked,
+            &enforced_revoked,
         )?;
+        let latest = reached.last().expect("chain contains its start");
+        let latest_public = if latest.seq == self.latest {
+            let public = self.latest_public()?;
+            if !self.own_attester_checked {
+                check_own_attester(self.b.directory.as_ref(), &self.did, &public)?;
+            }
+            public
+        } else {
+            verified_own(
+                self.b.mailbox.as_ref(),
+                self.b.directory.as_ref(),
+                &self.did,
+                latest,
+            )?
+        };
+        check_candidate_integrity(
+            self.b.mailbox.as_ref(),
+            self.b.directory.as_ref(),
+            &self.did,
+            latest.seq,
+            &latest_public.head,
+        )?;
+        let mut latest_audit = None;
+        for epoch in &reached {
+            let audit = self.audit_epoch(epoch)?;
+            let is_enforced_revoked =
+                |key: &[u8; 32]| self.revoked.contains(key) && !pending_revocations.contains(key);
+            // Once this client has decided a key is revoked, a store cannot
+            // make its possession of the epoch root disappear by corrupting
+            // or omitting the served member row. Named invalid rows count,
+            // and the persisted verified set covers same-epoch omissions.
+            // An unseen epoch's complete roster still needs a committed
+            // membership root at the protocol layer; this closes the local
+            // evidence the client already possesses.
+            let served_revoked = confirmed_epoch_member_keys(&audit)
+                .map(|member| member.0)
+                .chain(
+                    audit
+                        .excluded
+                        .iter()
+                        .filter_map(|member| member.device_key.map(|key| key.0)),
+                )
+                .any(|key| is_enforced_revoked(&key));
+            let omitted_verified_revoked =
+                self.verified.0 == epoch.seq && self.verified.1.iter().any(is_enforced_revoked);
+            if served_revoked || omitted_verified_revoked {
+                return Err(Error::EpochSquatted {
+                    seq: epoch.seq,
+                    reason: "it re-admits a device this client revoked",
+                });
+            }
+            self.check_not_tampered(epoch.seq, &audit)?;
+            latest_audit = Some(audit);
+        }
+        let audit = latest_audit.expect("chain contains its start");
+        let readmitted = confirmed_epoch_member_keys(&audit)
+            .filter(|k| self.revoked.contains(&k.0))
+            .collect::<Vec<_>>();
+
+        let to = latest.seq;
         for e in reached {
-            self.latest = self.latest.max(e.seq);
             self.epochs.insert(e.seq, e);
         }
-        self.adopt_latest()?;
-        self.check_epoch_integrity()?;
-        let latest = self.epoch_secret(self.latest)?;
-        let audit = self.audit_epoch(&latest)?;
-        let readmitted = audit
-            .valid
-            .iter()
-            .map(|v| v.record.device_key_pub)
-            .chain(audit.excluded.iter().filter_map(|x| x.device_key))
-            .filter(|k| self.revoked.contains(&k.0))
-            .collect();
-        self.remember_verified(
-            latest.seq,
-            audit.valid.iter().map(|v| v.record.device_key_pub.0),
-        );
+        self.latest = to;
+        self.adopted(latest_public);
+        self.remember_verified(to, audit.valid.iter().map(|v| v.record.device_key_pub.0));
         Ok(SyncReport {
             from,
-            to: self.latest,
+            to,
             readmitted,
             invalid_members: audit.excluded,
         })
@@ -386,7 +606,13 @@ impl Labyrinth {
     /// for this account is ahead of the newest epoch this device reached.
     pub fn check_epoch_integrity(&self) -> Result<()> {
         let head = self.latest_public()?.head;
-        check_integrity(self.b.directory.as_ref(), &self.did, self.latest, &head)
+        check_candidate_integrity(
+            self.b.mailbox.as_ref(),
+            self.b.directory.as_ref(),
+            &self.did,
+            self.latest,
+            &head,
+        )
     }
 
     /// The secret of my epoch `seq`, backward-chaining lazily from the
@@ -435,8 +661,18 @@ impl Labyrinth {
         if *target == self.device.public().device_key_pub {
             return Err(Error::Malformed("a device cannot revoke itself"));
         }
+        // A queued sender/owner ciphertext was sealed under the pre-decision
+        // epoch or recipient roster. Crossing the revocation boundary would
+        // let a removed device receive old-key ciphertext after the cutoff.
+        // The caller must deliberately flush it first or discard and
+        // re-archive under the post-rotation keys.
+        if self.outbox.values().any(|items| !items.is_empty())
+            || self.owner_outbox.values().any(|items| !items.is_empty())
+        {
+            return Err(Error::PendingWrites);
+        }
         self.revoked.insert(target.0);
-        self.sync_epochs()?;
+        self.sync_epochs_allowing(&BTreeSet::from([target.0]))?;
         self.b.mailbox.set_device_revoked(target, &self.now())?;
         self.b.orf.delete(target)?;
         for _ in 0..ROTATE_ATTEMPTS {
@@ -484,7 +720,7 @@ impl Labyrinth {
             return Err(Error::Unattested);
         }
         let audit = self.audit_epoch(&prev)?;
-        self.check_not_tampered(prev.seq, &audit.excluded)?;
+        self.check_not_tampered(prev.seq, &audit)?;
         let mb = self.b.mailbox.as_ref();
         let (_, prev_record) = epoch_record(mb, prev.seq)?;
         let me = self.device.public().device_key_pub;
@@ -521,7 +757,8 @@ impl Labyrinth {
             .iter()
             .map(|m| EpochMember::from_record(m, now.clone()))
             .collect();
-        let id = mb.create_epoch(&Epoch::from_record(&new.record, now), &members)?;
+        let epoch = Epoch::from_record(&new.record, now);
+        let id = create_epoch_reconciled(mb, &epoch, &members)?;
         let e = pending.assign_id(id);
         self.latest = e.seq;
         self.epochs.insert(e.seq, e);

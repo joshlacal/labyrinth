@@ -77,6 +77,15 @@ pub const MAX_WRITES: usize = 200;
 /// up to 1000; owner batches can be near 1 MB each, so pages stay small).
 pub const LIST_LIMIT: usize = 50;
 
+/// Cross-page bounds for direct `com.atproto.space.*` reads. These calls do
+/// not pass through the generic Labyrinth XRPC pager, so they enforce their
+/// own budgets.
+pub(super) const MAX_SPACE_PAGES: usize = 1_024;
+pub(super) const MAX_SPACE_LIST_ITEMS: usize = 10_000;
+pub(super) const MAX_SPACE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_SPACE_LIST_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const MAX_SPACE_CURSOR_BYTES: usize = 1_024;
+
 /// The Space NSIDs the store calls.
 pub mod endpoint {
     pub const APPLY_WRITES: &str = "com.atproto.space.applyWrites";
@@ -146,17 +155,18 @@ impl core::fmt::Display for SpaceRef {
 
 /// Maps a `com.atproto.space.*` error to the store error.
 pub fn map_space_error(e: XrpcError) -> Error {
+    let is_not_found_status = e.status == 404 || e.status == 400;
     match e.error.as_deref() {
         Some("MethodNotImplemented") if e.status == 501 => {
             Error::NotSupported("personal Space mailbox")
         }
         Some("RecordAlreadyExists") => Error::Conflict,
-        Some("RecordNotFound") => Error::NotFound("record"),
-        Some("SpaceNotFound") => Error::NotFound("space"),
+        Some("RecordNotFound") if is_not_found_status => Error::NotFound("record"),
+        Some("SpaceNotFound") if is_not_found_status => Error::NotFound("space"),
         // Deletion is terminal for this generation. It must never become
         // an absent mailbox that initialization silently recreates.
         Some("SpaceDeleted") => Error::Forbidden,
-        Some("RepoNotFound") => Error::NotFound("repo"),
+        Some("RepoNotFound") if is_not_found_status => Error::NotFound("repo"),
         _ if e.status == 403 => Error::Forbidden,
         name => Error::Backend(format!(
             "space {}: {}: {}",
@@ -283,12 +293,41 @@ impl SpaceMailboxStore {
         transport: Arc<dyn XrpcTransport>,
         mailbox_keys: Box<dyn KeyPublisher + Send>,
     ) -> Self {
-        Self::in_space(SpaceRef::mailbox(did), transport, mailbox_keys)
+        Self::from_space(SpaceRef::mailbox(did), transport, mailbox_keys)
     }
 
     /// A mailbox in another Space owned by the same account (the Space's
-    /// authority is the mailbox owner).
+    /// authority is the mailbox owner). The signed-in account is explicit
+    /// so a caller cannot accidentally bind mailbox operations to a foreign
+    /// authority or to a conversation Space.
     pub fn in_space(
+        owner_did: &str,
+        space: SpaceRef,
+        transport: Arc<dyn XrpcTransport>,
+        mailbox_keys: Box<dyn KeyPublisher + Send>,
+    ) -> Result<Self> {
+        if space.space_type != MAILBOX_SPACE_TYPE {
+            return Err(Error::Malformed("mailbox Space type"));
+        }
+        if space.space_did != owner_did || !owner_did.starts_with("did:") || owner_did.contains('/')
+        {
+            return Err(Error::Malformed("mailbox Space owner"));
+        }
+        Ok(Self::from_space(space, transport, mailbox_keys))
+    }
+
+    /// Test-only escape hatch for exercising a PDS with credentials that do
+    /// not own `space`. Production callers must use [`Self::in_space`].
+    #[doc(hidden)]
+    pub fn in_space_unchecked_for_test(
+        space: SpaceRef,
+        transport: Arc<dyn XrpcTransport>,
+        mailbox_keys: Box<dyn KeyPublisher + Send>,
+    ) -> Self {
+        Self::from_space(space, transport, mailbox_keys)
+    }
+
+    fn from_space(
         space: SpaceRef,
         transport: Arc<dyn XrpcTransport>,
         mailbox_keys: Box<dyn KeyPublisher + Send>,
@@ -366,10 +405,11 @@ impl SpaceMailboxStore {
     /// Every `(rkey, value)` of `collection`, ascending by rkey. With
     /// `values = false` the values are `Null` (`excludeValues`).
     fn list_raw(&self, collection: &str, values: bool) -> Result<Vec<(String, Value)>> {
-        const MAX_PAGES: usize = 100_000;
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        for _ in 0..MAX_PAGES {
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        let mut response_bytes = 0usize;
+        for _ in 0..MAX_SPACE_PAGES {
             let mut p = vec![
                 ("space", self.space.to_string()),
                 ("repo", self.did.clone()),
@@ -383,24 +423,58 @@ impl SpaceMailboxStore {
             if let Some(c) = &cursor {
                 p.push(("cursor", c.clone()));
             }
-            let page: ListRecordsOut = match self
+            let body = match self
                 .t
                 .query(endpoint::LIST_RECORDS, &p)
                 .map_err(map_space_error)
             {
-                Ok(body) => decode_body(&body)?,
+                Ok(body) => body,
                 // No repo in the Space yet: nothing written.
                 Err(Error::NotFound("repo")) => return Ok(out),
                 Err(e) => return Err(e),
             };
+            if body.len() > MAX_SPACE_RESPONSE_BYTES {
+                return Err(Error::Backend(format!(
+                    "space response exceeds {MAX_SPACE_RESPONSE_BYTES} bytes"
+                )));
+            }
+            response_bytes = response_bytes.checked_add(body.len()).ok_or_else(|| {
+                Error::Backend("space listing response byte count overflow".into())
+            })?;
+            if response_bytes > MAX_SPACE_LIST_RESPONSE_BYTES {
+                return Err(Error::Backend(format!(
+                    "space listing responses exceed {MAX_SPACE_LIST_RESPONSE_BYTES} bytes"
+                )));
+            }
+            let page: ListRecordsOut = decode_body(&body)?;
+            if page.records.len() > self.page {
+                return Err(Error::Backend(format!(
+                    "space page exceeds {} records",
+                    self.page
+                )));
+            }
+            let total = out
+                .len()
+                .checked_add(page.records.len())
+                .ok_or_else(|| Error::Backend("space listing item count overflow".into()))?;
+            if total > MAX_SPACE_LIST_ITEMS {
+                return Err(Error::Backend(format!(
+                    "space listing exceeds {MAX_SPACE_LIST_ITEMS} records"
+                )));
+            }
             out.extend(
                 page.records
                     .into_iter()
                     .map(|r| (r.rkey, r.value.unwrap_or(Value::Null))),
             );
             match page.cursor {
-                Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
-                Some(_) => return Err(Error::Backend("space cursor did not advance".into())),
+                Some(c) if c.len() > MAX_SPACE_CURSOR_BYTES => {
+                    return Err(Error::Backend(format!(
+                        "space cursor exceeds {MAX_SPACE_CURSOR_BYTES} bytes"
+                    )));
+                }
+                Some(c) if seen_cursors.insert(c.clone()) => cursor = Some(c),
+                Some(_) => return Err(Error::Backend("space cursor cycle".into())),
                 None => return Ok(out),
             }
         }
@@ -662,5 +736,188 @@ impl MailboxStore for SpaceMailboxStore {
             }
         }
         self.keys.retract()
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct NoopPublisher;
+    impl KeyPublisher for NoopPublisher {
+        fn publish(&self, _: &MailboxKeysRecord) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Scripted {
+        replies: Mutex<VecDeque<Vec<u8>>>,
+    }
+
+    impl Scripted {
+        fn new(replies: impl IntoIterator<Item = Value>) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(
+                    replies
+                        .into_iter()
+                        .map(|value| serde_json::to_vec(&value).unwrap())
+                        .collect(),
+                ),
+            })
+        }
+
+        fn raw(replies: impl IntoIterator<Item = Vec<u8>>) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(replies.into_iter().collect()),
+            })
+        }
+    }
+
+    impl XrpcTransport for Scripted {
+        fn query_with_headers(
+            &self,
+            _: &str,
+            _: &[(&str, String)],
+            _: &[(String, String)],
+        ) -> core::result::Result<Vec<u8>, XrpcError> {
+            self.replies.lock().unwrap().pop_front().ok_or(XrpcError {
+                status: 599,
+                error: Some("ScriptExhausted".into()),
+                message: None,
+            })
+        }
+
+        fn procedure(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: [u8; 16],
+        ) -> core::result::Result<Vec<u8>, XrpcError> {
+            unreachable!("listing tests never write")
+        }
+    }
+
+    fn store(transport: Arc<dyn XrpcTransport>) -> SpaceMailboxStore {
+        SpaceMailboxStore::new("did:plc:alice", transport, Box::new(NoopPublisher))
+            .with_page_size(100)
+    }
+
+    #[test]
+    fn personal_listing_rejects_a_non_adjacent_cursor_cycle() {
+        let transport = Scripted::new([
+            json!({"records": [], "cursor": "a"}),
+            json!({"records": [], "cursor": "b"}),
+            json!({"records": [], "cursor": "a"}),
+        ]);
+        assert_eq!(
+            store(transport).list_raw(nsid::DEVICE, false).unwrap_err(),
+            Error::Backend("space cursor cycle".into())
+        );
+    }
+
+    #[test]
+    fn personal_listing_rejects_more_than_ten_thousand_records() {
+        let replies = (0..101).map(|page| {
+            let records = (0..100)
+                .map(|item| json!({"rkey": format!("r{page:03}-{item:03}")}))
+                .collect::<Vec<_>>();
+            json!({
+                "records": records,
+                "cursor": (page < 100).then(|| format!("c{page}")),
+            })
+        });
+        assert_eq!(
+            store(Scripted::new(replies))
+                .list_raw(nsid::DEVICE, false)
+                .unwrap_err(),
+            Error::Backend("space listing exceeds 10000 records".into())
+        );
+    }
+
+    #[test]
+    fn personal_listing_rejects_an_oversized_response_before_decoding() {
+        assert_eq!(
+            store(Scripted::raw([vec![b' '; 16 * 1024 * 1024 + 1]]))
+                .list_raw(nsid::DEVICE, false)
+                .unwrap_err(),
+            Error::Backend("space response exceeds 16777216 bytes".into())
+        );
+    }
+
+    #[test]
+    fn personal_listing_rejects_more_than_sixty_four_mebibytes_across_pages() {
+        let replies = (0..5).map(|page| {
+            json!({
+                "records": [],
+                "cursor": (page < 4).then(|| format!("c{page}")),
+                "padding": "x".repeat(if page < 4 { 15 * 1024 * 1024 } else { 5 * 1024 * 1024 }),
+            })
+        });
+        assert_eq!(
+            store(Scripted::new(replies))
+                .list_raw(nsid::DEVICE, false)
+                .unwrap_err(),
+            Error::Backend("space listing responses exceed 67108864 bytes".into())
+        );
+    }
+
+    #[test]
+    fn personal_listing_rejects_page_and_cursor_width_overflow() {
+        let records = (0..101)
+            .map(|item| json!({"rkey": format!("r{item}")}))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            store(Scripted::new([json!({"records": records})]))
+                .list_raw(nsid::DEVICE, false)
+                .unwrap_err(),
+            Error::Backend("space page exceeds 100 records".into())
+        );
+
+        assert_eq!(
+            store(Scripted::new([json!({
+                "records": [],
+                "cursor": "x".repeat(1025),
+            })]))
+            .list_raw(nsid::DEVICE, false)
+            .unwrap_err(),
+            Error::Backend("space cursor exceeds 1024 bytes".into())
+        );
+    }
+
+    #[test]
+    fn checked_mailbox_space_constructor_binds_type_and_owner() {
+        let transport: Arc<dyn XrpcTransport> = Scripted::raw(std::iter::empty());
+        let wrong_type = SpaceRef {
+            space_did: "did:plc:alice".into(),
+            space_type: "blue.catbird.labyrinth.conversation".into(),
+            skey: "self".into(),
+        };
+        assert_eq!(
+            SpaceMailboxStore::in_space(
+                "did:plc:alice",
+                wrong_type,
+                transport.clone(),
+                Box::new(NoopPublisher),
+            )
+            .err(),
+            Some(Error::Malformed("mailbox Space type"))
+        );
+
+        assert_eq!(
+            SpaceMailboxStore::in_space(
+                "did:plc:bob",
+                SpaceRef::mailbox("did:plc:alice"),
+                transport,
+                Box::new(NoopPublisher),
+            )
+            .err(),
+            Some(Error::Malformed("mailbox Space owner"))
+        );
     }
 }

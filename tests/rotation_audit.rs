@@ -112,7 +112,8 @@ fn a_squatted_next_epoch_is_reported_not_retried() {
     fake.public.prev_sig = Some(e0.public.self_sig.clone());
     fake.encrypted_previous_epoch_number = Some(Bytes(vec![2; 40]));
     fake.encrypted_previous_epoch_root_key = Some(Bytes(vec![2; 60]));
-    mb.create_epoch(&fake, &[]).unwrap();
+    assert!(mb.create_epoch(&fake, &[]).is_err());
+    net.insert_epoch_unchecked(A, &fake);
 
     let err = phone
         .revoke_device(&tablet.device_public().device_key_pub)
@@ -234,4 +235,39 @@ fn revoking_a_chat_device_revokes_the_labyrinth_device_it_bound() {
     assert!(phone.devices_bound_to(&tpub(2)).unwrap().is_empty());
     // Never itself.
     assert!(phone.revoke_chat_device(&tpub(1)).unwrap().is_empty());
+}
+
+#[test]
+fn a_store_omitting_a_verified_sibling_in_same_epoch_fails_sync_and_rotate() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let faulty = Faulty::new(net.mailbox(A));
+    net.register_chat_device(A, tpub(1));
+    let mut phone = labyrinth::client::Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends_with(&net, &clock, A, Box::new(faulty.clone()), vec![]),
+    )
+    .unwrap();
+    let laptop = sibling(&net, &clock, &mut phone, 2);
+    let tablet = sibling(&net, &clock, &mut phone, 3);
+    // Device A (phone) verifies Device B (laptop) and Device C (tablet) in Epoch 0.
+    phone.sync_epochs().unwrap();
+
+    // Malicious server omits laptop's EpochMember row while still at Epoch 0.
+    *faulty.omit.lock().unwrap() = Some(laptop.device_public().device_key_pub);
+    assert_eq!(
+        phone.sync_epochs().unwrap_err(),
+        Error::MemberTampered { seq: 0 }
+    );
+
+    // Also verify `rotate` itself fails closed if the omission starts right
+    // after `revoke_device`'s `sync_epochs_allowing` pre-check (skip 1 read).
+    faulty
+        .omit_skip
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let err = phone
+        .revoke_device(&tablet.device_public().device_key_pub)
+        .unwrap_err();
+    assert_eq!(err, Error::MemberTampered { seq: 0 });
 }

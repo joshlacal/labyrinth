@@ -719,3 +719,147 @@ fn lookups_over_xrpc() {
         ],
     );
 }
+
+#[test]
+fn load_thread_page_over_large_thread_uses_bounded_page_calls() {
+    struct CountingTransport {
+        inner: Arc<dyn XrpcTransport>,
+        list_batches_calls: Arc<AtomicU64>,
+        list_owner_batches_calls: Arc<AtomicU64>,
+    }
+
+    impl XrpcTransport for CountingTransport {
+        fn query_with_headers(
+            &self,
+            nsid: &str,
+            params: &[(&str, String)],
+            headers: &[(String, String)],
+        ) -> Result<Vec<u8>, XrpcError> {
+            match nsid {
+                "blue.catbird.labyrinth.listBatches" => {
+                    self.list_batches_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                "blue.catbird.labyrinth.listOwnerBatches" => {
+                    self.list_owner_batches_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            self.inner.query_with_headers(nsid, params, headers)
+        }
+
+        fn procedure(
+            &self,
+            nsid: &str,
+            payload: &[u8],
+            op: [u8; 16],
+        ) -> Result<Vec<u8>, XrpcError> {
+            self.inner.procedure(nsid, payload, op)
+        }
+    }
+
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("lexicons/blue/catbird/labyrinth");
+    let w = World {
+        server: MemoryXrpcServer::new(MemoryBackend::new()).require_signed_reads(),
+        lex: Arc::new(Lexicons::load(&dir)),
+        seen: Arc::default(),
+        sent: Vec::new(),
+        ts: 1_000,
+    };
+    let mut alice = w.init(ALICE, 1);
+    let bob_signer = w.chat_device(BOB, 3);
+    let list_batches_calls = Arc::new(AtomicU64::new(0));
+    let list_owner_batches_calls = Arc::new(AtomicU64::new(0));
+    let bob_t: Arc<dyn XrpcTransport> = Arc::new(CountingTransport {
+        inner: w.transport(BOB, 3),
+        list_batches_calls: list_batches_calls.clone(),
+        list_owner_batches_calls: list_owner_batches_calls.clone(),
+    });
+    let bob_backends = Backends {
+        mailbox: Box::new(XrpcMailboxStore::new(BOB, bob_t.clone())),
+        threads: Box::new(XrpcThreadStore::new(BOB, bob_t.clone())),
+        directory: Box::new(CompositeDirectory::new(
+            Box::new(w.net().directory()),
+            Box::new(XrpcDirectory::new(bob_t.clone())),
+        )),
+        orf: Box::new(XrpcOrf::new(bob_t)),
+        publishers: vec![Box::new(w.net().pds_publisher(BOB))],
+        clock: Box::new(TestClock::default()),
+    };
+    let mut bob = Labyrinth::initialize(BOB, bob_signer, bob_backends).unwrap();
+    let roster = alice.resolve_roster(&[ALICE, BOB]).unwrap();
+
+    // Seed an early-seq batch whose sender timestamp is newer than all 350
+    // subsequent batches so bounded newest-first paging must also sweep `[floor_ts, ..)`.
+    w.net().set_server_time(1_001);
+    alice
+        .archive_outgoing(
+            THREAD,
+            &roster,
+            "m-early-future",
+            50_000,
+            b"early-seq-newest-ts",
+        )
+        .unwrap();
+    alice.flush().unwrap();
+
+    for i in 0..350u64 {
+        let ts = 2_000 + i * 10;
+        w.net().set_server_time(ts);
+        let id = format!("m-{i:03}");
+        alice
+            .archive_outgoing(THREAD, &roster, &id, ts, id.as_bytes())
+            .unwrap();
+        alice.flush().unwrap();
+    }
+
+    for i in 0..350u64 {
+        let ts = 1_500 + i;
+        w.net().set_server_time(ts);
+        let id = format!("o-{i:03}");
+        bob.archive_owner("owner-paged", &id, ts, id.as_bytes())
+            .unwrap();
+        bob.flush().unwrap();
+    }
+
+    list_batches_calls.store(0, Ordering::Relaxed);
+    let page = bob.load_thread_page(THREAD, None, 10).unwrap();
+    let batch_calls = list_batches_calls.load(Ordering::Relaxed);
+    assert!(
+        batch_calls <= 3,
+        "expected <= 3 listBatches page calls for 351 batches, got {batch_calls}"
+    );
+    assert!(page.next.is_some());
+    let got_ids: Vec<&str> = page
+        .history
+        .messages
+        .iter()
+        .map(|m| m.message_id.as_str())
+        .collect();
+    assert_eq!(
+        got_ids,
+        [
+            "m-early-future",
+            "m-349",
+            "m-348",
+            "m-347",
+            "m-346",
+            "m-345",
+            "m-344",
+            "m-343",
+            "m-342",
+            "m-341",
+        ]
+    );
+
+    list_owner_batches_calls.store(0, Ordering::Relaxed);
+    let owner_page = bob.load_thread_page("owner-paged", None, 10).unwrap();
+    let owner_calls = list_owner_batches_calls.load(Ordering::Relaxed);
+    assert!(
+        owner_calls <= 3,
+        "expected <= 3 listOwnerBatches page calls for 350 owner batches, got {owner_calls}"
+    );
+    assert!(owner_page.next.is_some());
+    assert_eq!(owner_page.history.messages.len(), 10);
+    assert_eq!(owner_page.history.messages[0].message_id, "o-349");
+}

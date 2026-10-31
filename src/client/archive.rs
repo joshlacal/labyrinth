@@ -5,16 +5,29 @@ use std::collections::HashSet;
 
 use super::Labyrinth;
 use super::read::{MessageSource, ThreadHistory};
-use crate::Result;
 use crate::epoch::EpochKeys as _;
 use crate::message::seal_owner;
 use crate::records::{BATCH_BYTE_BUDGET, MAX_BATCH_ITEMS};
 use crate::store::TimeRange;
+use crate::{Error, Result};
 
 impl Labyrinth {
     /// Archive a message into my own mailbox in owner mode (cipher version
     /// 5, [CB-37]) under my latest epoch. Buffered like sender batches.
     pub fn archive_owner(
+        &mut self,
+        thread_id: &str,
+        message_id: &str,
+        timestamp: u64,
+        frame: &[u8],
+    ) -> Result<Option<super::FlushedBatch>> {
+        self.sync_epochs()?;
+        self.archive_owner_synced(thread_id, message_id, timestamp, frame)
+    }
+
+    /// Owner-mode archive after the caller has completed the epoch/revocation
+    /// safety check. Kept private so public callers cannot skip it.
+    fn archive_owner_synced(
         &mut self,
         thread_id: &str,
         message_id: &str,
@@ -32,6 +45,15 @@ impl Labyrinth {
         thread_id: &str,
         m: crate::message::OwnerMessage,
     ) -> Result<Option<super::FlushedBatch>> {
+        if m.epoch_seq != self.latest
+            || self
+                .owner_outbox
+                .values()
+                .flatten()
+                .any(|item| item.epoch_seq != self.latest)
+        {
+            return Err(Error::WrongEpoch);
+        }
         let size = |m: &crate::message::OwnerMessage| m.encrypted.len().div_ceil(3) * 4 + 200;
         let mut flushed = None;
         let pending: usize = self
@@ -56,6 +78,19 @@ impl Labyrinth {
     /// Owner records carry no sender DID; a client that needs it must keep
     /// it inside the frame.
     pub fn rearchive_thread_before_leave(&mut self, thread_id: &str) -> Result<usize> {
+        // One safety check covers the whole local batch. No external call in
+        // the loop can advance this client's epoch; re-running a full member
+        // audit for every historical message would make this path quadratic
+        // in remote work.
+        self.sync_epochs()?;
+        if self
+            .owner_outbox
+            .values()
+            .flatten()
+            .any(|item| item.epoch_seq != self.latest)
+        {
+            return Err(Error::WrongEpoch);
+        }
         let history = self.load_thread(thread_id, TimeRange::ALL)?;
         // What the owner archive already holds, by (messageId, frame): a
         // copy counts as archived only if its plaintext is byte-equal, so
@@ -80,7 +115,7 @@ impl Labyrinth {
             if archived.contains(&key) {
                 continue;
             }
-            self.archive_owner(thread_id, &key.0, m.timestamp, &key.1)?;
+            self.archive_owner_synced(thread_id, &key.0, m.timestamp, &key.1)?;
             archived.insert(key);
             n += 1;
         }

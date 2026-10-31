@@ -132,6 +132,7 @@ pub struct SequencedSpaceThreadStore {
     legacy: XrpcThreadStore,
     space: Option<Arc<dyn XrpcTransport>>,
     pins: Arc<dyn ThreadPlacementPins>,
+    ds_redaction_pubkey: Option<crate::store::SequencerKey>,
 }
 
 impl SequencedSpaceThreadStore {
@@ -150,7 +151,9 @@ impl SequencedSpaceThreadStore {
         let mut cursor: Option<String> = None;
         let mut seen = std::collections::BTreeSet::new();
         let mut spaces = std::collections::BTreeSet::new();
-        for _ in 0..100_000 {
+        let mut response_bytes = 0usize;
+        let mut item_count = 0usize;
+        for _ in 0..super::MAX_SPACE_PAGES {
             let mut params = vec![
                 ("spaceType", "blue.catbird.labyrinth.conversation".into()),
                 ("limit", "100".into()),
@@ -161,8 +164,37 @@ impl SequencedSpaceThreadStore {
             let body = transport
                 .query(endpoint::LIST_SPACES, &params)
                 .map_err(map_space_error)?;
+            if body.len() > super::MAX_SPACE_RESPONSE_BYTES {
+                return Err(Error::Backend(format!(
+                    "space response exceeds {} bytes",
+                    super::MAX_SPACE_RESPONSE_BYTES
+                )));
+            }
+            response_bytes = response_bytes
+                .checked_add(body.len())
+                .ok_or_else(|| Error::Backend("space inventory response size overflow".into()))?;
+            if response_bytes > super::MAX_SPACE_LIST_RESPONSE_BYTES {
+                return Err(Error::Backend(format!(
+                    "conversation Space inventory responses exceed {} bytes",
+                    super::MAX_SPACE_LIST_RESPONSE_BYTES
+                )));
+            }
             let page: Page = serde_json::from_slice(&body)
                 .map_err(|_| Error::Malformed("owned conversation Space inventory"))?;
+            if page.spaces.len() > 100 {
+                return Err(Error::Backend(
+                    "conversation Space inventory page exceeds 100 items".into(),
+                ));
+            }
+            item_count = item_count
+                .checked_add(page.spaces.len())
+                .ok_or_else(|| Error::Backend("space inventory item count overflow".into()))?;
+            if item_count > super::MAX_SPACE_LIST_ITEMS {
+                return Err(Error::Backend(format!(
+                    "conversation Space inventory exceeds {} items",
+                    super::MAX_SPACE_LIST_ITEMS
+                )));
+            }
             for view in page.spaces {
                 let space = SpaceRef::parse(&view.uri)?;
                 ThreadPlacement {
@@ -176,6 +208,12 @@ impl SequencedSpaceThreadStore {
             let Some(next) = page.cursor else {
                 return Ok(spaces.into_iter().collect());
             };
+            if next.len() > super::MAX_SPACE_CURSOR_BYTES {
+                return Err(Error::Backend(format!(
+                    "conversation Space inventory cursor exceeds {} bytes",
+                    super::MAX_SPACE_CURSOR_BYTES
+                )));
+            }
             if !seen.insert(next.clone()) {
                 return Err(Error::Malformed("Space inventory cursor repeated"));
             }
@@ -198,7 +236,15 @@ impl SequencedSpaceThreadStore {
             legacy: XrpcThreadStore::new(did, sequencer),
             space,
             pins,
+            ds_redaction_pubkey: None,
         }
+    }
+
+    /// Configures the sequencer DS signing key (`[CB-38]`) trusted for
+    /// `ACCOUNT_DELETED` server redactions on Space conversation batches.
+    pub fn with_sequencer_key(mut self, key: crate::store::SequencerKey) -> Self {
+        self.ds_redaction_pubkey = Some(key);
+        self
     }
 
     fn placement(&self, thread: &str) -> Result<ThreadPlacement> {
@@ -236,6 +282,32 @@ impl SequencedSpaceThreadStore {
         Ok(record)
     }
 
+    fn verify_tombstone(
+        &self,
+        thread: &str,
+        author: &str,
+        tombstone: &SpaceBatchRedaction,
+    ) -> Result<()> {
+        match tombstone.redaction.to_stored()? {
+            crate::deletion::StoredRedaction::Author(r) => {
+                r.verify(author, thread, &tombstone.message_id)
+            }
+            crate::deletion::StoredRedaction::Server(r) => {
+                if r.reason != crate::deletion::ACCOUNT_DELETED {
+                    return Err(Error::BadSignature);
+                }
+                let Some(k) = &self.ds_redaction_pubkey else {
+                    return Err(Error::BadSignature);
+                };
+                if r.by != k.did {
+                    return Err(Error::BadSignature);
+                }
+                r.verify_account_deletion(author, thread, &tombstone.message_id, &k.key)
+            }
+            crate::deletion::StoredRedaction::Unsigned { .. } => Err(Error::BadSignature),
+        }
+    }
+
     fn resolve(
         &self,
         thread: &str,
@@ -266,64 +338,76 @@ impl SequencedSpaceThreadStore {
             }
             tombstone.redaction.to_stored()?;
         }
-        // After account deletion the owner PDS is physically purged. A
-        // complete DS tombstone set remains displayable without the source
-        // record. This envelope can only remove content: no ciphertext or
-        // sender key is invented, and no source CID is claimed verified.
-        if view.redactions.len() == view.item_count {
-            let items = view
-                .redactions
-                .into_iter()
-                .map(|r| SealedMessageDef {
-                    message_id: r.message_id,
-                    timestamp: r.timestamp,
-                    mek_id: Bytes(vec![]),
-                    sender_transport_pubkey: Bytes(vec![]),
-                    signed_enc_message: Bytes(vec![]),
-                    redaction: Some(r.redaction),
+        match self.read_record(&view.space, &view.author, &view.rkey) {
+            Ok(mut record) => {
+                if record.cid != view.cid
+                    || record.value.thread_id != thread
+                    || record.value.items.len() != view.item_count
+                {
+                    return Err(Error::Malformed("sequenced conversation record identity"));
+                }
+                // Apply DS-authenticated tombstones after authenticating the
+                // immutable original record and verifying each redaction signature.
+                for tombstone in view.redactions {
+                    self.verify_tombstone(thread, &view.author, &tombstone)?;
+                    let item = record
+                        .value
+                        .items
+                        .iter_mut()
+                        .find(|i| {
+                            i.message_id == tombstone.message_id
+                                && i.timestamp == tombstone.timestamp
+                        })
+                        .ok_or(Error::Malformed(
+                            "conversation tombstone does not match batch",
+                        ))?;
+                    item.signed_enc_message.0.clear();
+                    item.redaction = Some(tombstone.redaction);
+                }
+                Ok(Stored {
+                    author: view.author,
+                    rkey: view.rkey,
+                    value: record.value,
+                    order: Some(view.order.to_order()?),
                 })
-                .collect();
-            return Ok(Stored {
-                author: view.author,
-                rkey: view.rkey,
-                value: Batch {
-                    type_: nsid::BATCH.into(),
-                    thread_id: thread.into(),
-                    items,
-                    created_at: view.order.received_at.clone(),
-                },
-                order: Some(view.order.to_order()?),
-            });
-        }
-        let mut record = self.read_record(&view.space, &view.author, &view.rkey)?;
-        if record.cid != view.cid
-            || record.value.thread_id != thread
-            || record.value.items.len() != view.item_count
-        {
-            return Err(Error::Malformed("sequenced conversation record identity"));
-        }
-        // Apply DS-authenticated tombstones after authenticating the immutable
-        // original record. A retained PDS copy cannot resurrect an unsent item.
-        for tombstone in view.redactions {
-            let item = record
-                .value
-                .items
-                .iter_mut()
-                .find(|i| {
-                    i.message_id == tombstone.message_id && i.timestamp == tombstone.timestamp
+            }
+            Err(Error::NotFound("record")) => {
+                // Only synthesize sourceless redacted items when the Space
+                // record is genuinely 404 AND every item in the batch is
+                // covered by a cryptographically verified author or DS
+                // ACCOUNT_DELETED tombstone.
+                if view.redactions.is_empty() || view.redactions.len() != view.item_count {
+                    return Err(Error::NotFound("record"));
+                }
+                for tombstone in &view.redactions {
+                    self.verify_tombstone(thread, &view.author, tombstone)?;
+                }
+                let items = view
+                    .redactions
+                    .into_iter()
+                    .map(|r| SealedMessageDef {
+                        message_id: r.message_id,
+                        timestamp: r.timestamp,
+                        mek_id: Bytes(vec![]),
+                        sender_transport_pubkey: Bytes(vec![]),
+                        signed_enc_message: Bytes(vec![]),
+                        redaction: Some(r.redaction),
+                    })
+                    .collect();
+                Ok(Stored {
+                    author: view.author,
+                    rkey: view.rkey,
+                    value: Batch {
+                        type_: nsid::BATCH.into(),
+                        thread_id: thread.into(),
+                        items,
+                        created_at: view.order.received_at.clone(),
+                    },
+                    order: Some(view.order.to_order()?),
                 })
-                .ok_or(Error::Malformed(
-                    "conversation tombstone does not match batch",
-                ))?;
-            item.signed_enc_message.0.clear();
-            item.redaction = Some(tombstone.redaction);
+            }
+            Err(err) => Err(err),
         }
-        Ok(Stored {
-            author: view.author,
-            rkey: view.rkey,
-            value: record.value,
-            order: Some(view.order.to_order()?),
-        })
     }
 
     /// Remove every batch this account owns in a previously pinned Space.
@@ -338,24 +422,77 @@ impl SequencedSpaceThreadStore {
         }
         .validate()?;
         // Re-read the first page after each removal, avoiding pagination
-        // cursors whose source record has just been deleted.
-        for _ in 0..100_000 {
+        // cursors whose source record has just been deleted, while still
+        // advancing if a page returns empty records alongside a cursor.
+        let mut response_bytes = 0usize;
+        let mut record_count = 0usize;
+        let mut seen_rkeys = std::collections::BTreeSet::new();
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..super::MAX_SPACE_PAGES {
+            let mut params = vec![
+                ("space", uri.into()),
+                ("repo", did.into()),
+                ("collection", nsid::BATCH.into()),
+                ("limit", "100".into()),
+                ("excludeValues", "true".into()),
+            ];
+            if let Some(c) = &cursor {
+                params.push(("cursor", c.clone()));
+            }
             let raw = transport
-                .query(
-                    endpoint::LIST_RECORDS,
-                    &[
-                        ("space", uri.into()),
-                        ("repo", did.into()),
-                        ("collection", nsid::BATCH.into()),
-                        ("limit", "100".into()),
-                        ("excludeValues", "true".into()),
-                    ],
-                )
+                .query(endpoint::LIST_RECORDS, &params)
                 .map_err(map_space_error)?;
+            if raw.len() > super::MAX_SPACE_RESPONSE_BYTES {
+                return Err(Error::Backend(format!(
+                    "space response exceeds {} bytes",
+                    super::MAX_SPACE_RESPONSE_BYTES
+                )));
+            }
+            response_bytes = response_bytes.checked_add(raw.len()).ok_or_else(|| {
+                Error::Backend("conversation deletion response size overflow".into())
+            })?;
+            if response_bytes > super::MAX_SPACE_LIST_RESPONSE_BYTES {
+                return Err(Error::Backend(format!(
+                    "conversation deletion responses exceed {} bytes",
+                    super::MAX_SPACE_LIST_RESPONSE_BYTES
+                )));
+            }
             let page: super::ListRecordsOut = serde_json::from_slice(&raw)
                 .map_err(|_| Error::Malformed("conversation deletion listing"))?;
             if page.records.is_empty() {
-                return Ok(());
+                let Some(next) = page.cursor else {
+                    return Ok(());
+                };
+                if next.len() > super::MAX_SPACE_CURSOR_BYTES {
+                    return Err(Error::Backend(format!(
+                        "space cursor exceeds {} bytes",
+                        super::MAX_SPACE_CURSOR_BYTES
+                    )));
+                }
+                if !seen_cursors.insert(next.clone()) {
+                    return Err(Error::Backend("space cursor cycle".into()));
+                }
+                cursor = Some(next);
+                continue;
+            }
+            cursor = None;
+            seen_cursors.clear();
+            if page.records.len() > 100 {
+                return Err(Error::Backend(
+                    "conversation deletion page exceeds 100 records".into(),
+                ));
+            }
+            record_count = record_count
+                .checked_add(page.records.len())
+                .ok_or_else(|| {
+                    Error::Backend("conversation deletion record count overflow".into())
+                })?;
+            if record_count > super::MAX_SPACE_LIST_ITEMS {
+                return Err(Error::Backend(format!(
+                    "conversation deletion exceeds {} records",
+                    super::MAX_SPACE_LIST_ITEMS
+                )));
             }
             for record in page.records {
                 if record.rkey.is_empty()
@@ -367,12 +504,34 @@ impl SequencedSpaceThreadStore {
                 {
                     return Err(Error::Malformed("conversation deletion record key"));
                 }
+                if !seen_rkeys.insert(record.rkey.clone()) {
+                    return Err(Error::Backend(
+                        "conversation deletion made no progress".into(),
+                    ));
+                }
                 let body = serde_json::to_vec(&serde_json::json!({"space": uri, "repo": did,
                     "collection": nsid::BATCH, "rkey": record.rkey}))
                 .map_err(|_| Error::Malformed("conversation record deletion"))?;
-                transport
+                let acknowledgement = transport
                     .procedure(endpoint::DELETE_RECORD, &body, [0; 16])
                     .map_err(map_space_error)?;
+                if acknowledgement.len() > super::MAX_SPACE_RESPONSE_BYTES {
+                    return Err(Error::Backend(format!(
+                        "space response exceeds {} bytes",
+                        super::MAX_SPACE_RESPONSE_BYTES
+                    )));
+                }
+                response_bytes = response_bytes
+                    .checked_add(acknowledgement.len())
+                    .ok_or_else(|| {
+                        Error::Backend("conversation deletion response size overflow".into())
+                    })?;
+                if response_bytes > super::MAX_SPACE_LIST_RESPONSE_BYTES {
+                    return Err(Error::Backend(format!(
+                        "conversation deletion responses exceed {} bytes",
+                        super::MAX_SPACE_LIST_RESPONSE_BYTES
+                    )));
+                }
             }
         }
         Err(Error::Backend(
@@ -456,10 +615,80 @@ impl ThreadStore for SequencedSpaceThreadStore {
             params.push(("untilMs", until.to_string()));
         }
         let views: Vec<SpaceBatchView> = self.ds.list_all("listSpaceBatches", &params)?;
+        if let Some(sender) = sender
+            && views.iter().any(|view| view.author != sender)
+        {
+            return Err(Error::Malformed("sequencer returned another sender"));
+        }
         views
             .into_iter()
             .map(|v| self.resolve(thread, &placement, v))
             .collect()
+    }
+    fn list_batches_before(
+        &self,
+        thread: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Stored<Batch>>> {
+        let placement = self.placement(thread)?;
+        if placement.space.is_none() {
+            return self.legacy.list_batches_before(thread, before_ms, limit);
+        }
+        let target = limit.max(1).saturating_add(1);
+        let mut params = vec![
+            ("threadId", thread.into()),
+            ("generation", placement.generation.clone()),
+            ("reverse", "true".into()),
+        ];
+        if let Some(until) = before_ms {
+            params.push(("untilMs", until.to_string()));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut eligible = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        let mut floor_ts = None;
+        self.ds.list_pages(
+            "listSpaceBatches",
+            &params,
+            |views: Vec<SpaceBatchView>, has_more| {
+                for view in views {
+                    if !seen.insert((view.author.clone(), view.rkey.clone())) {
+                        continue;
+                    }
+                    let b = self.resolve(thread, &placement, view)?;
+                    for i in &b.value.items {
+                        if before_ms.is_none_or(|u| i.timestamp < u.saturating_sub(1)) {
+                            eligible.insert((i.timestamp, i.message_id.clone()));
+                        }
+                    }
+                    out.push(b);
+                }
+                if has_more && eligible.len() >= target {
+                    floor_ts = eligible.iter().rev().nth(target - 1).map(|(ts, _)| *ts);
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )?;
+        if let Some(floor) = floor_ts {
+            let mut sweep = params;
+            sweep.push(("fromMs", floor.to_string()));
+            let extra: Vec<SpaceBatchView> = self.ds.list_all("listSpaceBatches", &sweep)?;
+            for view in extra {
+                if seen.insert((view.author.clone(), view.rkey.clone())) {
+                    if out.len() >= crate::store::xrpc::MAX_LIST_ITEMS {
+                        return Err(Error::Backend(format!(
+                            "xrpc listing exceeds {} items",
+                            crate::store::xrpc::MAX_LIST_ITEMS
+                        )));
+                    }
+                    out.push(self.resolve(thread, &placement, view)?);
+                }
+            }
+        }
+        out.sort_by_key(|b| core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max()));
+        Ok(out)
     }
     fn list_threads(&self) -> Result<Vec<String>> {
         self.legacy.list_threads()

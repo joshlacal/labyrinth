@@ -91,7 +91,13 @@ impl MemoryBackend {
         }
         let contiguous = match chain.iter().next_back() {
             None => epoch.seq == 0,
-            Some((n, prev)) => epoch.seq == n + 1 && epoch.prev_head == Some(prev.head),
+            Some((n, prev)) => {
+                epoch.seq == n + 1
+                    && epoch.prev_head == Some(prev.head)
+                    && epoch
+                        .verify_link(prev.seq, &prev.head, &prev.keys.sig)
+                        .is_ok()
+            }
         };
         if !contiguous {
             return Err(Error::Malformed("InvalidEpochChain"));

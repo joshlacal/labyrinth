@@ -104,6 +104,22 @@ impl Labyrinth {
             .into_iter()
             .find(|m| m.vdevice_id == *vdevice_id)
             .ok_or(Error::NotFound("virtual device"))?;
+        if method.device_key == self.device.public().device_key_pub {
+            return Err(Error::DeviceTampered);
+        }
+        let dev = self
+            .b
+            .mailbox
+            .get_device(&method.device_key)?
+            .ok_or(Error::DeviceTampered)?;
+        let dev_pub = dev.to_public()?;
+        dev_pub.verify()?;
+        if !dev_pub.is_virtual
+            || dev.chat_binding.is_some()
+            || dev_pub.device_key_pub != method.device_key
+        {
+            return Err(Error::DeviceTampered);
+        }
         let report = self.revoke_device(&method.device_key)?;
         self.b.mailbox.delete_virtual_device(vdevice_id)?;
         Ok(report)

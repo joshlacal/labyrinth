@@ -11,10 +11,10 @@ use std::sync::Arc;
 use super::mailbox::range_params;
 use super::wire::{AuthoredView, RecordBody, RedactIn, RedactOut, RkeyOrderOut, ThreadView};
 use super::{Xrpc, XrpcTransport};
-use crate::Result;
 use crate::deletion::Redaction;
 use crate::records::{Batch, MekDistribution, RedactionDef};
 use crate::store::{Stored, ThreadListing, ThreadStore, TimeRange};
+use crate::{Error, Result};
 
 /// The conversation records on the sequencer DS, writing as one DID.
 pub struct XrpcThreadStore {
@@ -106,6 +106,12 @@ impl ThreadStore for XrpcThreadStore {
 
     /// `getMessages` (100 ids per call), deduplicated by batch.
     fn get_messages(&self, thread_id: &str, message_ids: &[&str]) -> Result<Vec<Stored<Batch>>> {
+        if message_ids.len() > super::MAX_LIST_ITEMS {
+            return Err(Error::Backend(format!(
+                "xrpc message lookup exceeds {} ids",
+                super::MAX_LIST_ITEMS
+            )));
+        }
         let mut seen = std::collections::BTreeSet::new();
         let mut out = Vec::new();
         for chunk in message_ids.chunks(super::MAX_PAGE) {
@@ -114,6 +120,12 @@ impl ThreadStore for XrpcThreadStore {
             let v: Vec<AuthoredView<Batch>> = self.x.list_all("getMessages", &p)?;
             for b in v {
                 if seen.insert((b.author.clone(), b.rkey.clone())) {
+                    if out.len() == super::MAX_LIST_ITEMS {
+                        return Err(Error::Backend(format!(
+                            "xrpc message lookup exceeds {} batches",
+                            super::MAX_LIST_ITEMS
+                        )));
+                    }
                     out.push(stored(b)?);
                 }
             }
@@ -121,15 +133,16 @@ impl ThreadStore for XrpcThreadStore {
         Ok(out)
     }
 
-    /// `listBatches` with `reverse=true` and `untilMs`, then sorted by
-    /// newest item (see the module docs; `limit` cannot stop it early).
+    /// `listBatches` with `reverse=true` and `untilMs`, stopping unbounded
+    /// seq pagination once `limit + 1` eligible items are collected and
+    /// finishing with a bounded `[floor_ts, before_ms)` sweep.
     fn list_batches_before(
         &self,
         thread_id: &str,
         before_ms: Option<u64>,
         limit: usize,
     ) -> Result<Vec<Stored<Batch>>> {
-        let _ = limit;
+        let target = limit.max(1).saturating_add(1);
         let mut p = vec![
             ("threadId", thread_id.to_owned()),
             ("reverse", "true".to_owned()),
@@ -137,10 +150,51 @@ impl ThreadStore for XrpcThreadStore {
         if let Some(b) = before_ms {
             p.push(("untilMs", b.to_string()));
         }
-        let v: Vec<AuthoredView<Batch>> = self.x.list_all("listBatches", &p)?;
-        let mut v = v.into_iter().map(stored).collect::<Result<Vec<_>>>()?;
-        v.sort_by_key(|b| core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max()));
-        Ok(v)
+        let mut seen = std::collections::BTreeSet::new();
+        let mut eligible = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        let mut floor_ts = None;
+        self.x.list_pages(
+            "listBatches",
+            &p,
+            |views: Vec<AuthoredView<Batch>>, has_more| {
+                for v in views {
+                    let b = stored(v)?;
+                    for i in &b.value.items {
+                        if before_ms.is_none_or(|u| i.timestamp < u.saturating_sub(1)) {
+                            eligible.insert((i.timestamp, i.message_id.clone()));
+                        }
+                    }
+                    if seen.insert((b.author.clone(), b.rkey.clone())) {
+                        out.push(b);
+                    }
+                }
+                if has_more && eligible.len() >= target {
+                    floor_ts = eligible.iter().rev().nth(target - 1).map(|(ts, _)| *ts);
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )?;
+        if let Some(floor) = floor_ts {
+            let mut sweep = p;
+            sweep.push(("fromMs", floor.to_string()));
+            let extra: Vec<AuthoredView<Batch>> = self.x.list_all("listBatches", &sweep)?;
+            for v in extra {
+                let b = stored(v)?;
+                if seen.insert((b.author.clone(), b.rkey.clone())) {
+                    if out.len() >= super::MAX_LIST_ITEMS {
+                        return Err(Error::Backend(format!(
+                            "xrpc listing exceeds {} items",
+                            super::MAX_LIST_ITEMS
+                        )));
+                    }
+                    out.push(b);
+                }
+            }
+        }
+        out.sort_by_key(|b| core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max()));
+        Ok(out)
     }
 
     /// `listThreads` (merged across sequencers by the home DS). Fails

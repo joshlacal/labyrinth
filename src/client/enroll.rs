@@ -3,17 +3,20 @@
 
 use std::cell::RefCell;
 
-use super::epochs::{chain_forward, check_integrity, epoch_record, verified_own};
+use super::epochs::{chain_forward, check_candidate_integrity, epoch_record, verified_own};
 use super::{Backends, Labyrinth};
 use crate::device::ChatBinding;
 use crate::epoch::{EpochKeys as _, EpochSecret, PendingEpoch, verify_public};
+use crate::mailbox::EpochPublic;
 use crate::orf::EvolveToken;
 use crate::otc::{Initiator, InitiatorMessage, OneTimeCode, Responder, ResponderMessage};
 use crate::records::mailbox::PasskeyWrap;
 use crate::records::{Device, EpochMember, VirtualDevice, datetime_from_ms};
 use crate::recovery_code::RecoveryCode;
 use crate::sign::{TransportSigner, XVerifyingKey};
-use crate::virtual_device::{self, Mechanism, OtcPayload, passkey};
+use crate::virtual_device::{
+    self, Mechanism, OtcPayload, RestoredState, VirtualDeviceRecord, passkey,
+};
 use crate::{Error, Result};
 
 /// A new recovery bundle. Show `code` to the user (or store it in the
@@ -70,6 +73,108 @@ impl core::fmt::Debug for RecoverySetup {
             .field("vdevice_id", &hex::encode(self.vdevice_id))
             .finish_non_exhaustive()
     }
+}
+
+fn prefer_passkey_error(current: &mut Option<Error>, candidate: Error) {
+    // A legitimate bundle opened with the wrong 32-byte PRF reports
+    // `Decrypt`. Keep that result stable even when an attacker prepends a
+    // malformed or unsupported matching record to the listing.
+    let rank = |error: &Error| match error {
+        Error::Backend(_) | Error::Forbidden => 6,
+        Error::Decrypt => 5,
+        Error::BadRecoveryCode => 4,
+        Error::Expired => 3,
+        Error::Unsupported(_) => 2,
+        _ => 1,
+    };
+    if current
+        .as_ref()
+        .is_none_or(|error| rank(&candidate) > rank(error))
+    {
+        *current = Some(candidate);
+    }
+}
+
+fn vdevice_expiry_ms(mechanism: Mechanism, vdev: &VirtualDevice) -> Result<Option<u64>> {
+    let created_ms = crate::records::ms_from_datetime(&vdev.created_at)?;
+    let last_used_ms = vdev
+        .last_used_at
+        .as_deref()
+        .map(crate::records::ms_from_datetime)
+        .transpose()?;
+    Ok(super::recovery::recovery_expiry(
+        mechanism,
+        created_ms,
+        last_used_ms,
+    ))
+}
+
+fn select_passkey_bundles<'a>(
+    did: &str,
+    prf_output: &[u8],
+    credential_id: &[u8],
+    bundles: &'a [VirtualDevice],
+) -> Result<Vec<(&'a VirtualDevice, RecoveryCode)>> {
+    let mut first_error = None;
+    let mut selected: Vec<(&VirtualDevice, RecoveryCode)> = Vec::new();
+    for candidate in bundles {
+        if candidate
+            .passkey_credential_id
+            .as_ref()
+            .is_none_or(|id| id.0 != credential_id)
+        {
+            continue;
+        }
+        let resolved = (|| {
+            let wrapped = candidate
+                .passkey_wrapped_code
+                .as_ref()
+                .ok_or(Error::Malformed("passkey fields must come together"))?;
+            let code = passkey::unwrap_code(prf_output, &wrapped.0)?;
+            let (vdevice_id, _) = code.derive(did);
+            let mut canonical_matches = bundles
+                .iter()
+                .filter(|bundle| bundle.vdevice_id.0.as_slice() == vdevice_id);
+            let canonical = canonical_matches.next().ok_or(Error::BadRecoveryCode)?;
+            if canonical_matches.next().is_some() {
+                return Err(Error::Conflict);
+            }
+            let canonical_wrap = canonical
+                .to_bundle()?
+                .1
+                .ok_or(Error::Malformed("passkey fields must come together"))?;
+            if canonical_wrap.credential_id != credential_id {
+                return Err(Error::BadRecoveryCode);
+            }
+            Ok((canonical, code))
+        })();
+        match resolved {
+            Ok((canonical, code)) => {
+                if !selected
+                    .iter()
+                    .any(|(known, _)| known.vdevice_id == canonical.vdevice_id)
+                {
+                    selected.push((canonical, code));
+                }
+            }
+            Err(Error::Conflict) => return Err(Error::Conflict),
+            Err(error) => {
+                prefer_passkey_error(&mut first_error, error);
+            }
+        }
+    }
+    if selected.is_empty() {
+        Err(first_error.unwrap_or(Error::NotFound("passkey bundle")))
+    } else {
+        Ok(selected)
+    }
+}
+
+struct PreparedRestore {
+    record: VirtualDeviceRecord,
+    restored: RestoredState,
+    reached: Vec<EpochSecret>,
+    latest_public: EpochPublic,
 }
 
 impl Labyrinth {
@@ -176,16 +281,40 @@ impl Labyrinth {
         transport: Box<dyn TransportSigner + Send>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
-        for bundle in b.mailbox.list_virtual_devices()? {
-            let Some(wrap) = bundle.to_bundle()?.1 else {
+        // Validate before listing records so an unknown credential cannot
+        // turn a malformed PRF input into a credential-existence oracle.
+        passkey::validate_prf_output(prf_output)?;
+        let bundles = b.mailbox.list_virtual_devices()?;
+        let candidates = select_passkey_bundles(did, prf_output, credential_id, &bundles)?;
+        let mut prepared = None;
+        let mut first_error = None;
+        let now = b.clock.now_ms();
+        for (bundle, code) in candidates {
+            if vdevice_expiry_ms(Mechanism::Passkey, bundle)?.is_some_and(|exp| now >= exp) {
+                prefer_passkey_error(&mut first_error, Error::Expired);
                 continue;
-            };
-            if wrap.credential_id == credential_id {
-                let code = passkey::unwrap_code(prf_output, &wrap.wrapped_code)?;
-                return Self::restore_from_bundle(did, &bundle, &code, transport, b);
+            }
+            match Self::prepare_restore_from_bundle(did, bundle, &code, &b) {
+                Ok(_) if prepared.is_some() => return Err(Error::Conflict),
+                Ok(candidate) => prepared = Some(candidate),
+                // A bundle conclusively absent from the newest epoch or
+                // expired by its recovery TTL may be skipped in favor of a
+                // fresh active bundle. Any other preflight failure is
+                // uncertainty about a potentially active matching bundle; do
+                // not let another candidate hide a backend, attestation, or
+                // chain-integrity failure.
+                Err(Error::NotEpochMember) => {
+                    prefer_passkey_error(&mut first_error, Error::NotEpochMember)
+                }
+                Err(Error::Expired) => {
+                    prefer_passkey_error(&mut first_error, Error::Expired);
+                }
+                Err(error) => return Err(error),
             }
         }
-        Err(Error::NotFound("passkey bundle"))
+        let prepared = prepared
+            .ok_or_else(|| first_error.unwrap_or(Error::NotFound("active passkey bundle")))?;
+        Self::finish_prepared_restore(did, prepared, transport, b)
     }
 
     fn restore_from_bundle(
@@ -195,7 +324,35 @@ impl Labyrinth {
         transport: Box<dyn TransportSigner + Send>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
+        let prepared = Self::prepare_restore_from_bundle(did, bundle, code, &b)?;
+        Self::finish_prepared_restore(did, prepared, transport, b)
+    }
+
+    /// Validate and open a bundle without touching it or creating device,
+    /// membership, or ORF state. Passkey recovery uses this to ignore a
+    /// retained revoked bundle while detecting multiple active matches
+    /// before any candidate can cause a write.
+    fn prepare_restore_from_bundle(
+        did: &str,
+        bundle: &VirtualDevice,
+        code: &RecoveryCode,
+        b: &Backends,
+    ) -> Result<PreparedRestore> {
         let (record, _) = bundle.to_bundle()?;
+        let vdev = b
+            .mailbox
+            .get_virtual_device(&record.vdevice_id)?
+            .ok_or(Error::NotFound("virtual device"))?;
+        let now = b.clock.now_ms();
+        if vdevice_expiry_ms(record.mechanism, bundle)?.is_some_and(|exp| now >= exp)
+            || vdevice_expiry_ms(record.mechanism, &vdev)?.is_some_and(|exp| now >= exp)
+        {
+            return Err(Error::Expired);
+        }
+        let (fresh_record, _) = vdev.to_bundle()?;
+        if fresh_record != record {
+            return Err(Error::Conflict);
+        }
         let restored = virtual_device::open(&record, code, did)?;
         let seq = restored.epoch.seq();
         let (id, start_record) = epoch_record(b.mailbox.as_ref(), seq)?;
@@ -214,14 +371,34 @@ impl Labyrinth {
         )?;
         let latest = reached.last().expect("non-empty");
         let latest_public = verified_own(b.mailbox.as_ref(), b.directory.as_ref(), did, latest)?;
-        check_integrity(b.directory.as_ref(), did, latest.seq, &latest_public.head)?;
-        // [CB-39] The bundle was used: keep it from expiring. Before any
-        // write, so a failure leaves nothing half-enrolled.
-        match b.mailbox.touch_virtual_device(&record.vdevice_id) {
-            Ok(()) | Err(Error::NotSupported(_)) => {}
-            Err(e) => return Err(e),
-        }
+        check_candidate_integrity(
+            b.mailbox.as_ref(),
+            b.directory.as_ref(),
+            did,
+            latest.seq,
+            &latest_public.head,
+        )?;
+        Ok(PreparedRestore {
+            record,
+            restored,
+            reached,
+            latest_public,
+        })
+    }
 
+    fn finish_prepared_restore(
+        did: &str,
+        prepared: PreparedRestore,
+        transport: Box<dyn TransportSigner + Send>,
+        b: Backends,
+    ) -> Result<(Self, Enrollment)> {
+        let PreparedRestore {
+            record,
+            restored,
+            reached,
+            latest_public,
+        } = prepared;
+        let latest = reached.last().expect("non-empty");
         let (device, public, evolve_token, member) =
             virtual_device::enroll_from_virtual(&restored, latest)?;
         let now = datetime_from_ms(b.clock.now_ms());
@@ -230,6 +407,13 @@ impl Labyrinth {
             .create_device(&Device::bound(&public, &binding, now.clone()))?;
         b.mailbox
             .create_epoch_member(&EpochMember::from_record(&member, now))?;
+        // [CB-39] The bundle was used: keep it from expiring. Run after
+        // `create_device` + `create_epoch_member` so the recovering chat device
+        // is already bound (`touchVirtualDevice` requires a bound device).
+        match b.mailbox.touch_virtual_device(&record.vdevice_id) {
+            Ok(()) | Err(Error::NotSupported(_)) => {}
+            Err(e) => return Err(e),
+        }
         b.orf.register(
             &public.device_key_pub,
             Some((&restored.device.public().device_key_pub, &evolve_token)),
@@ -301,7 +485,13 @@ impl Labyrinth {
         let payload = OtcPayload::open(&isk, sealed_payload)?;
         let epoch: &EpochSecret = &payload.epoch;
         let epoch_public = verified_own(b.mailbox.as_ref(), b.directory.as_ref(), did, epoch)?;
-        check_integrity(b.directory.as_ref(), did, epoch.seq, &epoch_public.head)?;
+        check_candidate_integrity(
+            b.mailbox.as_ref(),
+            b.directory.as_ref(),
+            did,
+            epoch.seq,
+            &epoch_public.head,
+        )?;
         let (device, public, evolve_token, member) = payload.enroll()?;
         let now = datetime_from_ms(b.clock.now_ms());
         let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());

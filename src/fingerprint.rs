@@ -13,7 +13,7 @@
 //! fp(did, head) = kdf(head, MINOS_SALT, "catbird.labyrinth.fingerprint.v1:" || did, 30)
 //! digits        = six 5-byte chunks, each big-endian mod 100000, zero-padded to 5 digits
 //! safety number = digits of both accounts, ordered by DID (60 digits)
-//! emoji         = the first 8 bytes of fp, each mod 64, indexing EMOJI
+//! emoji         = the first 16 bytes of fp, each mod 64, indexing EMOJI (96 bits)
 //! ```
 
 use crate::encoding::{kdf, minos_salt};
@@ -63,8 +63,8 @@ pub const EMOJI: [&str; 64] = [
     "🍄", "🌻", "🌙", "⭐", "🔥", "🌈", "⛄", "🍎", "🍋", "🍉", "🍇", "🍓", "🥕", "🌽", "🍞", "🧀",
 ];
 
-/// Eight emoji for one account's epoch head.
-pub fn account_emoji(did: &str, head: &[u8; 32]) -> [&'static str; 8] {
+/// Sixteen emoji (96 bits) for one account's epoch head.
+pub fn account_emoji(did: &str, head: &[u8; 32]) -> [&'static str; 16] {
     let f = fp(did, head);
     core::array::from_fn(|i| EMOJI[usize::from(f[i] % 64)])
 }
@@ -88,8 +88,11 @@ mod tests {
         let b = ("did:plc:b", &[2u8; 32]);
         assert_eq!(safety_number(a, b), safety_number(b, a));
         assert_eq!(safety_number(a, b).replace(' ', "").len(), 60);
-        let e = account_emoji("did:plc:a", &[1; 32]);
+        let e: [&str; 16] = account_emoji("did:plc:a", &[1; 32]);
+        assert_eq!(e.len(), 16);
         assert_eq!(e, account_emoji("did:plc:a", &[1; 32]));
+        assert_ne!(e, account_emoji("did:plc:a", &[2; 32]));
+        assert_ne!(e, account_emoji("did:plc:b", &[1; 32]));
         let unique: std::collections::BTreeSet<_> = EMOJI.iter().collect();
         assert_eq!(unique.len(), 64);
     }

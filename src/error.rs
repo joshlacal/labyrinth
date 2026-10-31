@@ -15,10 +15,16 @@ pub enum Error {
     NotEpochMember,
     #[error("recovery code is invalid or uncorrectable")]
     BadRecoveryCode,
+    #[error("recovery bundle has expired")]
+    Expired,
+    #[error("virtual device record names a non-virtual or active physical device")]
+    DeviceTampered,
     #[error("unsupported version or suite: {0}")]
     Unsupported(u8),
     #[error("store conflict: record already exists")]
     Conflict,
+    #[error("pending ciphertext must be flushed or discarded before revocation")]
+    PendingWrites,
     #[error("store refused access")]
     Forbidden,
     #[error("storage backend error: {0}")]
@@ -31,6 +37,10 @@ pub enum Error {
         "directories disagree on the account's epoch chain: PDS epoch {pds}, mls-ds epoch {ds}"
     )]
     DirectoryFork { pds: u64, ds: u64 },
+    #[error(
+        "directory evidence is incomplete: PDS present {pds_present}, mls-ds present {ds_present}"
+    )]
+    DirectoryIncomplete { pds_present: bool, ds_present: bool },
     #[error("epoch is not attested by one of the account's chat devices")]
     Unattested,
     #[error("not found: {0}")]

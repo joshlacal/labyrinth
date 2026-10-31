@@ -140,18 +140,33 @@ impl Labyrinth {
     }
 
     /// Fails with [`Error::MemberTampered`] if a member this client already
-    /// verified in epoch `seq` is among `excluded` for a reason the
-    /// store alone could cause (record or MAC failures). A dropped chat
-    /// binding is a legitimate exclusion and passes.
-    pub(super) fn check_not_tampered(&self, seq: u64, excluded: &[ExcludedMember]) -> Result<()> {
+    /// verified in epoch `seq` is among `audit.excluded` for a reason the
+    /// store alone could cause (record or MAC failures), or if a non-revoked
+    /// verified member vanished from both `audit.valid` and `audit.excluded`
+    /// in the same epoch without a rotation. A dropped chat binding is a
+    /// legitimate exclusion and passes.
+    pub(super) fn check_not_tampered(&self, seq: u64, audit: &Audit) -> Result<()> {
         if self.verified.0 != seq {
             return Ok(());
         }
-        let tampered = excluded.iter().any(|x| {
+        let tampered = audit.excluded.iter().any(|x| {
             !matches!(x.reason, ExclusionReason::ChatDeviceNotCurrent)
                 && x.device_key.is_some_and(|k| self.verified.1.contains(&k.0))
         });
-        if tampered {
+        let omitted = self
+            .verified
+            .1
+            .iter()
+            .filter(|k| !self.revoked.contains(*k))
+            .any(|k| {
+                let in_valid = audit.valid.iter().any(|v| v.record.device_key_pub.0 == *k);
+                let in_excluded = audit
+                    .excluded
+                    .iter()
+                    .any(|x| x.device_key.is_some_and(|dk| dk.0 == *k));
+                !in_valid && !in_excluded
+            });
+        if tampered || omitted {
             Err(Error::MemberTampered { seq })
         } else {
             Ok(())

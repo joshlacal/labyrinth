@@ -13,13 +13,18 @@
 //! - anything else, including two different heads for one number: a fork,
 //!   [`Error::DirectoryFork`].
 //!
-//! A source with nothing for the DID defers to the other. Chat device keys
-//! and the per-conversation leaf view come from mls-ds, which owns them.
+//! A head present in only one source is incomplete evidence and fails with
+//! [`Error::DirectoryIncomplete`]. Both sources returning nothing still means
+//! the DID is not enrolled. Callers that intentionally accept degraded,
+//! single-source trust-on-first-use must opt in with
+//! [`CompositeDirectory::new_allowing_single_source`]. Chat device keys and
+//! the per-conversation leaf view come from mls-ds, which owns them.
 //!
 //! Used as the client's directory, this makes the [CB-28] truncation check
-//! ([`super::Labyrinth::check_epoch_integrity`]) compare the mailbox
-//! against the newest head *either* directory knows, so truncation needs
-//! the mailbox host and the other directory to collude.
+//! ([`super::Labyrinth::check_epoch_integrity`]) compare the mailbox against
+//! the newest head the two directories can jointly anchor. An incomplete
+//! view blocks the check instead of weakening it to one source, so truncation
+//! needs the mailbox host and the other directory to collude.
 
 use super::pins::MAX_PIN_ADVANCE;
 use crate::mailbox::EpochPublic;
@@ -30,6 +35,7 @@ use crate::{Error, Result};
 pub struct CompositeDirectory {
     pds: Box<dyn MailboxDirectory + Send>,
     ds: Box<dyn MailboxDirectory + Send>,
+    allow_single_source: bool,
 }
 
 impl CompositeDirectory {
@@ -39,7 +45,50 @@ impl CompositeDirectory {
         pds: Box<dyn MailboxDirectory + Send>,
         ds: Box<dyn MailboxDirectory + Send>,
     ) -> Self {
-        Self { pds, ds }
+        Self {
+            pds,
+            ds,
+            allow_single_source: false,
+        }
+    }
+
+    /// A degraded, trust-on-first-use composition that accepts a head from
+    /// one source when the other has no record. Prefer [`Self::new`]: this
+    /// policy lets the sole source choose a first-contact epoch.
+    pub fn new_allowing_single_source(
+        pds: Box<dyn MailboxDirectory + Send>,
+        ds: Box<dyn MailboxDirectory + Send>,
+    ) -> Self {
+        Self {
+            pds,
+            ds,
+            allow_single_source: true,
+        }
+    }
+
+    fn one_source(
+        &self,
+        did: &str,
+        seq: Option<u64>,
+        pds: Option<EpochPublic>,
+        ds: Option<EpochPublic>,
+    ) -> Result<Option<EpochPublic>> {
+        debug_assert!(pds.is_some() ^ ds.is_some());
+        if self.allow_single_source {
+            let e = pds.or(ds).expect("one source present");
+            if let Some(s) = seq
+                && e.seq != s
+            {
+                return Err(Error::Malformed("directory epoch under the wrong number"));
+            }
+            e.verify(did, None)?;
+            Ok(Some(e))
+        } else {
+            Err(Error::DirectoryIncomplete {
+                pds_present: pds.is_some(),
+                ds_present: ds.is_some(),
+            })
+        }
     }
 
     /// The newer of two verified heads, if it chains from the older one.
@@ -65,11 +114,29 @@ impl CompositeDirectory {
         if newer.seq - older.seq > MAX_PIN_ADVANCE {
             return Err(Error::Malformed("directory epoch gap too long"));
         }
+        // Strict composition requires independent evidence for the newer
+        // endpoint too. A source whose mutable `latest` lags may still have
+        // the immutable per-epoch record (the PDS publisher writes that
+        // first), but the other source alone may not choose the recipient
+        // epoch at first contact.
+        if !self.allow_single_source {
+            let endpoint = self
+                .epoch(did, newer.seq)?
+                .ok_or(Error::DirectoryIncomplete {
+                    pds_present: false,
+                    ds_present: false,
+                })?;
+            if endpoint.seq != newer.seq || endpoint.head != newer.head {
+                return Err(fork);
+            }
+            endpoint.verify(did, None)?;
+        }
         let mut prev = older;
         for seq in prev.seq + 1..newer.seq {
-            let e = self
-                .epoch(did, seq)?
-                .ok_or(Error::NotFound("intermediate directory epoch"))?;
+            let e = self.epoch(did, seq)?.ok_or(Error::DirectoryIncomplete {
+                pds_present: false,
+                ds_present: false,
+            })?;
             if e.seq != seq {
                 return Err(Error::Malformed("directory epoch under the wrong number"));
             }
@@ -89,16 +156,27 @@ impl MailboxDirectory for CompositeDirectory {
     fn latest(&self, did: &str) -> Result<Option<EpochPublic>> {
         match (self.pds.latest(did)?, self.ds.latest(did)?) {
             (Some(p), Some(d)) => self.reconcile(did, p, d).map(Some),
-            (p, d) => Ok(p.or(d)),
+            (None, None) => Ok(None),
+            (p, d) => self.one_source(did, None, p, d),
         }
     }
 
     fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>> {
         match (self.pds.epoch(did, seq)?, self.ds.epoch(did, seq)?) {
-            (Some(p), Some(d)) if p.head != d.head => {
-                Err(Error::DirectoryFork { pds: seq, ds: seq })
+            (Some(p), Some(d)) => {
+                if p.seq != seq || d.seq != seq {
+                    return Err(Error::Malformed("directory epoch under the wrong number"));
+                }
+                p.verify(did, None)?;
+                d.verify(did, None)?;
+                if p.head != d.head {
+                    Err(Error::DirectoryFork { pds: seq, ds: seq })
+                } else {
+                    Ok(Some(d))
+                }
             }
-            (p, d) => Ok(d.or(p)),
+            (None, None) => Ok(None),
+            (p, d) => self.one_source(did, Some(seq), p, d),
         }
     }
 

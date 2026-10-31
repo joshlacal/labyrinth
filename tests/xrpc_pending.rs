@@ -122,7 +122,22 @@ fn pending_endpoints_follow_the_agreed_shapes() {
     .unwrap();
     assert_eq!(err_name(get("m1")), "NotFound");
 
-    // Recovery bundles and the mailbox.
+    // Recovery bundles and the mailbox: unbound callers are rejected with
+    // `LabyrinthDeviceNotBound`; bound callers get `VirtualDeviceNotFound`.
+    assert_eq!(
+        err_name(call(
+            &*t,
+            "touchVirtualDevice",
+            json!({"vdeviceId": b(&[1; 16])})
+        )),
+        "LabyrinthDeviceNotBound"
+    );
+    let dev_sec = labyrinth::device::DeviceSecrets::generate().unwrap();
+    let binding =
+        labyrinth::device::ChatBinding::sign(A, &dev_sec.public().device_key_pub, &signer(1));
+    let dev_rec =
+        labyrinth::records::Device::bound(dev_sec.public(), &binding, datetime_from_ms(1));
+    call(&*t, "createDevice", json!({"record": dev_rec})).unwrap();
     assert_eq!(
         err_name(call(
             &*t,

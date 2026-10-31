@@ -361,3 +361,158 @@ fn unknown_conversation_state_is_conversation_not_found() {
     net.add_leaf(T, A, tpub(1));
     assert!(q(T).is_ok());
 }
+
+#[test]
+fn tracked_leaves_reject_unsequenced_batches_and_non_member_writes() {
+    let s = server();
+    s.backend().set_server_time(500);
+    // Write a batch BEFORE leaves are tracked (`chat_seq` is `None`).
+    let th_a = XrpcThreadStore::new(A, s.transport(A, tpub(1)));
+    let (mek_pre, m_pre) = mek_and_message(1, "pre-join");
+    th_a.create_mek(&mek_pre).unwrap();
+    th_a.append_batch(&Batch::from_messages(T, &[m_pre], datetime_from_ms(1)).unwrap())
+        .unwrap();
+    let pre_order = th_a.list_batches(T, None, TimeRange::ALL).unwrap()[0]
+        .order
+        .unwrap();
+    assert_eq!(pre_order.chat_seq, None);
+
+    // Enable leaf tracking for A's device 1 only; Bob's device 2 has NO leaf in `T`.
+    let b_did = "did:plc:bob";
+    s.backend().register_chat_device(b_did, tpub(2));
+    s.backend().add_leaf(T, A, tpub(1));
+
+    // Non-member (or removed-leaf) caller device is rejected on both createMek and appendBatch.
+    let th_b = XrpcThreadStore::new(b_did, s.transport(b_did, tpub(2)));
+    let (mek_b, _) = mek_and_message(2, "b1");
+    assert_eq!(th_b.create_mek(&mek_b).unwrap_err(), Error::Forbidden);
+
+    let (mek_a, m_a) = mek_and_message(1, "after-leaf");
+    th_a.create_mek(&mek_a).unwrap();
+    s.backend().remove_leaf(T, A, tpub(1));
+    assert_eq!(
+        th_a.append_batch(&Batch::from_messages(T, &[m_a], datetime_from_ms(2)).unwrap())
+            .unwrap_err(),
+        Error::Forbidden
+    );
+}
+
+#[test]
+fn unbound_caller_rejected_on_vdevice_and_hosted_orf_mutations() {
+    use labyrinth::recovery_code::RecoveryCode;
+    use labyrinth::store::OrfServer;
+    use labyrinth::store::xrpc::XrpcOrf;
+    use labyrinth::virtual_device::{self, Mechanism};
+
+    let s = server();
+    s.backend().register_chat_device(A, tpub(2));
+
+    let d1 = DeviceSecrets::generate().unwrap();
+    let (pending, new0) = labyrinth::epoch::open_genesis(A, &d1, &signer(1)).unwrap();
+    let epoch0 = pending.assign_id("000000000000");
+    let code = RecoveryCode::generate().unwrap();
+    let (vrec, _, _) =
+        virtual_device::create(A, &code, &d1, &epoch0, &[5u8; 32], Mechanism::Code).unwrap();
+    let vdev_wire =
+        labyrinth::records::VirtualDevice::from_bundle(&vrec, None, datetime_from_ms(1));
+
+    // Before a mailbox is hosted here, PDS-Space accounts may manage ORF state,
+    // while mailbox virtual-device mutations still require a bound Labyrinth device.
+    let orf2 = XrpcOrf::new(s.transport(A, tpub(2)));
+    let mb2 = XrpcMailboxStore::new(A, s.transport(A, tpub(2)));
+    let space_dev = DeviceSecrets::generate().unwrap().public().device_key_pub;
+    orf2.register(&space_dev, None).unwrap();
+    orf2.delete(&space_dev).unwrap();
+    assert_eq!(mb2.create_virtual_device(&vdev_wire), Err(Error::Forbidden));
+    assert_eq!(
+        mb2.touch_virtual_device(&vrec.vdevice_id),
+        Err(Error::Forbidden)
+    );
+    assert_eq!(
+        mb2.delete_virtual_device(&vrec.vdevice_id),
+        Err(Error::Forbidden)
+    );
+
+    // Once the server hosts the account's mailbox, unbound chat device 2 is
+    // rejected on ORF mutations as well as virtual-device mutations.
+    let mb1 = XrpcMailboxStore::new(A, s.transport(A, tpub(1)));
+    mb1.create_device(&bound(&d1, 1, &datetime_from_ms(1)))
+        .unwrap();
+    let _ = new0;
+
+    let rogue_key = DeviceSecrets::generate().unwrap().public().device_key_pub;
+    assert_eq!(orf2.register(&rogue_key, None), Err(Error::Forbidden));
+    assert_eq!(
+        orf2.delete(&d1.public().device_key_pub),
+        Err(Error::Forbidden)
+    );
+    assert_eq!(mb2.create_virtual_device(&vdev_wire), Err(Error::Forbidden));
+    assert_eq!(
+        mb2.touch_virtual_device(&vrec.vdevice_id),
+        Err(Error::Forbidden)
+    );
+    assert_eq!(
+        mb2.delete_virtual_device(&vrec.vdevice_id),
+        Err(Error::Forbidden)
+    );
+}
+
+#[test]
+fn epoch_head_and_mailbox_epoch_reject_forged_prev_sig() {
+    use labyrinth::epoch::{EpochKeys as _, EpochRecord, PendingEpoch};
+    use labyrinth::mailbox::EpochPublic;
+
+    let s = server();
+    let d0 = DeviceSecrets::generate().unwrap();
+    let (_, new0) = labyrinth::epoch::open_genesis(A, &d0, &signer(1)).unwrap();
+    let g0 = new0.record.public.clone();
+    let at = datetime_from_ms(1);
+
+    // 1. Space-account head publish (`record_ds_head`): Epoch 0 succeeds,
+    //    Epoch 1 with valid `self_sig`, valid `attestation`, and matching
+    //    `prev_head == Some(g0.head)` MUST still be rejected when `prev_sig`
+    //    is signed by the wrong key.
+    let dir1 = XrpcDirectory::new(s.transport(A, tpub(1)));
+    dir1.publish(&MailboxKeysRecord::from_public(&g0, None, at.clone()))
+        .unwrap();
+
+    let pending1 = PendingEpoch::new(1, [0x44; 32]);
+    let wrong_prev_signer = DeviceSecrets::generate().unwrap();
+    let forged_e1 = EpochPublic::sign(
+        A,
+        1,
+        &pending1.mailbox_keys(),
+        Some(g0.head),
+        Some(&wrong_prev_signer.device_key),
+        &signer(1),
+    )
+    .unwrap();
+    forged_e1.verify(A, None).unwrap();
+
+    assert!(
+        dir1.publish(&MailboxKeysRecord::from_public(
+            &forged_e1,
+            None,
+            at.clone()
+        ))
+        .is_err(),
+        "record_ds_head must reject forged prev_sig"
+    );
+
+    // 2. Direct `MemoryMailbox::create_epoch`: Epoch 0 succeeds, Epoch 1 with
+    //    forged `prev_sig` MUST be rejected.
+    let mb = s.backend().mailbox(A);
+    let epoch0_wire = Epoch::from_record(&new0.record, at.clone());
+    mb.create_epoch(&epoch0_wire, &[]).unwrap();
+    let forged_rec = EpochRecord {
+        public: forged_e1,
+        encrypted_prev_seq: Some(vec![1; 40]),
+        encrypted_prev_root: Some(vec![2; 60]),
+        opened_by: d0.public().device_key_pub,
+    };
+    let forged_wire = Epoch::from_record(&forged_rec, at);
+    assert!(
+        mb.create_epoch(&forged_wire, &[]).is_err(),
+        "MemoryMailbox::create_epoch must reject forged prev_sig"
+    );
+}

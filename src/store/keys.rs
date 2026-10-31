@@ -120,12 +120,13 @@ pub fn keys_valid_for(
     keys.iter()
         .filter(|k| match at {
             VouchAt::Current => k.is_current(),
-            VouchAt::SenderClaim(t) => k.valid_at(t),
+            VouchAt::SenderClaim(t) => leaves.is_none() && k.valid_at(t),
             VouchAt::Server(o) => {
                 k.valid_at(o.received_at_ms)
                     && match (leaves, o.chat_seq) {
                         (Some(l), Some(s)) => l.iter().any(|m| m.key == k.key && m.active_at(s)),
-                        _ => true,
+                        (None, None) => true,
+                        (Some(_), None) | (None, Some(_)) => false,
                     }
             }
         })
@@ -179,8 +180,10 @@ mod tests {
         assert_eq!(keys_valid_for(&keys, l, stamp(1, Some(3))), [[1; 32]]);
         assert_eq!(keys_valid_for(&keys, l, stamp(1, Some(6))), [[1; 32]]);
         assert!(keys_valid_for(&keys, l, stamp(1, Some(7))).is_empty());
-        // Without a chat seq the leaf view is not consulted.
-        assert_eq!(keys_valid_for(&keys, l, stamp(1, None)).len(), 2);
+        // Mismatched leaf tracking vs chat_seq (or stripped order) fails closed.
+        assert!(keys_valid_for(&keys, l, stamp(1, None)).is_empty());
+        assert!(keys_valid_for(&keys, None, stamp(1, Some(3))).is_empty());
+        assert!(keys_valid_for(&keys, l, VouchAt::SenderClaim(1)).is_empty());
         // The fallback keeps the sender-claim rule.
         assert_eq!(keys_valid_at(&keys, Some(99)).len(), 2);
         assert_eq!(keys_valid_at(&keys, None), [[1; 32]]);

@@ -168,10 +168,10 @@ impl Labyrinth {
 
     /// Verifies `did`'s current chain from its genesis (see
     /// [`repin_peer`](Self::repin_peer)) and returns the safety-number
-    /// change to show the user. Changes nothing.
-    pub fn propose_repin(&self, did: &str) -> Result<RepinProposal> {
+    /// change to show the user. Syncs own epochs first; mutates no peer pins.
+    pub fn propose_repin(&mut self, did: &str) -> Result<RepinProposal> {
+        let me = self.own_latest_checked()?.head;
         let latest = self.verified_fresh_chain(did)?;
-        let me = self.latest_public()?.head;
         let pin = self.pins.get(did);
         Ok(RepinProposal {
             did: did.to_owned(),
@@ -193,6 +193,7 @@ impl Labyrinth {
     /// `confirmed_head` (the one whose safety number the user accepted);
     /// otherwise [`Error::Conflict`] and nothing changes.
     pub fn repin_peer(&mut self, did: &str, confirmed_head: &[u8; 32]) -> Result<PeerPin> {
+        self.own_latest_checked()?;
         let latest = self.verified_fresh_chain(did)?;
         if latest.head != *confirmed_head {
             return Err(Error::Conflict);

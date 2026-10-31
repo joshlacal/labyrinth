@@ -1,18 +1,19 @@
 //! Regression tests for the 2026-10-04 security review (DECISIONS.md,
 //! "security review fixes"). Each test asserts the *secure* behaviour.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use labyrinth::Error;
 use labyrinth::client::{Backends, Clock, Labyrinth};
-use labyrinth::mailbox::EpochPublic;
+use labyrinth::mailbox::{EpochPublic, MailboxKeys};
 use labyrinth::records::{
-    Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, VirtualDevice,
+    Bytes, Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, VirtualDevice,
 };
 use labyrinth::sign::{Ed25519Transport, XVerifyingKey};
 use labyrinth::store::memory::{MemoryBackend, MemoryDirectory, MemoryMailbox};
 use labyrinth::store::{ChatDeviceKey, MailboxDirectory, MailboxStore, Stored, TimeRange};
+use labyrinth::virtual_device::Mechanism;
 
 const A: &str = "did:plc:alice";
 const B: &str = "did:plc:bob";
@@ -35,10 +36,20 @@ fn tpub(seed: u8) -> [u8; 32] {
 /// Mailbox that silently ignores revocation (malicious / buggy backend),
 /// and fails every epoch create while `fail_epochs` is set (a crash or
 /// outage in the middle of a revocation).
-struct IgnoresRevoke(MemoryMailbox, Arc<AtomicBool>);
+struct IgnoresRevoke(
+    MemoryMailbox,
+    Arc<AtomicBool>,
+    Arc<Mutex<Option<(XVerifyingKey, bool)>>>,
+    Arc<AtomicBool>,
+);
 impl IgnoresRevoke {
     fn new(m: MemoryMailbox) -> Self {
-        Self(m, Arc::new(AtomicBool::new(false)))
+        Self(
+            m,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 }
 impl MailboxStore for IgnoresRevoke {
@@ -61,7 +72,12 @@ impl MailboxStore for IgnoresRevoke {
         if self.1.load(Ordering::Relaxed) {
             return Err(Error::Backend("injected outage".into()));
         }
-        self.0.create_epoch(e, m)
+        let created = self.0.create_epoch(e, m);
+        if self.3.swap(false, Ordering::Relaxed) {
+            created?;
+            return Err(Error::Backend("committed epoch response lost".into()));
+        }
+        created
     }
     fn get_epoch(&self, s: u64) -> labyrinth::Result<Option<Stored<Epoch>>> {
         self.0.get_epoch(s)
@@ -73,7 +89,20 @@ impl MailboxStore for IgnoresRevoke {
         self.0.create_epoch_member(m)
     }
     fn list_epoch_members(&self, s: u64) -> labyrinth::Result<Vec<EpochMember>> {
-        self.0.list_epoch_members(s)
+        let mut members = self.0.list_epoch_members(s)?;
+        if let Some((key, hide)) = *self.2.lock().unwrap() {
+            if hide {
+                members.retain(|member| member.device_key_pubkey.0 != key.0);
+            } else if let Some(member) = members
+                .iter_mut()
+                .find(|member| member.device_key_pubkey.0 == key.0)
+            {
+                let mut mac = member.device_mac.0.clone();
+                mac[0] ^= 1;
+                member.device_mac = Bytes(mac);
+            }
+        }
+        Ok(members)
     }
     fn create_virtual_device(&self, v: &VirtualDevice) -> labyrinth::Result<()> {
         self.0.create_virtual_device(v)
@@ -113,6 +142,303 @@ fn backends(
         publishers: vec![],
         clock: Box::new(clock.clone()),
     }
+}
+
+#[derive(Clone, Default)]
+struct DirectoryControls {
+    latest: Arc<Mutex<Option<EpochPublic>>>,
+    keys: Arc<Mutex<Option<Vec<ChatDeviceKey>>>>,
+    key_calls: Arc<AtomicU64>,
+    fail_key_call: Arc<AtomicU64>,
+}
+
+struct ControlledDirectory {
+    inner: MemoryDirectory,
+    controls: DirectoryControls,
+}
+
+impl MailboxDirectory for ControlledDirectory {
+    fn latest(&self, did: &str) -> labyrinth::Result<Option<EpochPublic>> {
+        if let Some(epoch) = self.controls.latest.lock().unwrap().clone() {
+            Ok(Some(epoch))
+        } else {
+            self.inner.latest(did)
+        }
+    }
+
+    fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
+        self.inner.epoch(did, seq)
+    }
+
+    fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
+        let call = self.controls.key_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.controls.fail_key_call.load(Ordering::Relaxed) == call {
+            return Err(Error::Backend("injected member-audit outage".into()));
+        }
+        if let Some(keys) = self.controls.keys.lock().unwrap().clone() {
+            Ok(keys)
+        } else {
+            self.inner.device_transport_keys(did)
+        }
+    }
+}
+
+fn controlled_backends(
+    net: &MemoryBackend,
+    clock: &TestClock,
+    did: &str,
+) -> (Backends, DirectoryControls) {
+    let controls = DirectoryControls::default();
+    let mut b = backends(net, clock, did, Box::new(net.mailbox(did)));
+    b.directory = Box::new(ControlledDirectory {
+        inner: net.directory(),
+        controls: controls.clone(),
+    });
+    (b, controls)
+}
+
+fn candidate_epoch_fixture() -> (
+    MemoryBackend,
+    TestClock,
+    Labyrinth,
+    DirectoryControls,
+    EpochPublic,
+) {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    let (b, controls) = controlled_backends(&net, &clock, A);
+    let mut phone = Labyrinth::initialize(A, Box::new(signer(1)), b).unwrap();
+    let mut laptop = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(net.mailbox(A)));
+    let tablet = enroll_sibling(&net, &clock, &mut phone, 3, Box::new(net.mailbox(A)));
+    laptop
+        .revoke_device(&tablet.device_public().device_key_pub)
+        .unwrap();
+    let candidate = laptop.latest_public().unwrap();
+    assert_eq!((phone.latest_epoch(), candidate.seq), (0, 1));
+    (net, clock, phone, controls, candidate)
+}
+
+fn assert_unchanged(client: &Labyrinth, latest: u64, state: &[u8]) {
+    assert_eq!(client.latest_epoch(), latest);
+    assert_eq!(client.export_state().unwrap().as_slice(), state);
+}
+
+#[test]
+fn committed_epoch_with_lost_response_is_reconciled_before_keys_are_dropped() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    let uncertain = IgnoresRevoke::new(net.mailbox(A));
+    uncertain.3.store(true, Ordering::Relaxed);
+
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(uncertain)),
+    )
+    .unwrap();
+
+    assert_eq!(phone.latest_epoch(), 0);
+    phone.create_recovery_code(Mechanism::Code).unwrap();
+}
+
+#[test]
+fn failed_integrity_check_does_not_activate_candidate_epoch() {
+    let (_net, _clock, mut phone, controls, candidate) = candidate_epoch_fixture();
+    let previous = MailboxKeys::derive(&[8; 32], 1);
+    let published = EpochPublic::sign(
+        A,
+        2,
+        &MailboxKeys::derive(&[9; 32], 2),
+        Some(candidate.head),
+        Some(&previous.sig_secret),
+        &signer(1),
+    )
+    .unwrap();
+    *controls.latest.lock().unwrap() = Some(published);
+    let latest = phone.latest_epoch();
+    let state = phone.export_state().unwrap();
+
+    assert_eq!(
+        phone.sync_epochs().unwrap_err(),
+        Error::EpochTruncated {
+            published: 2,
+            reached: 1
+        }
+    );
+    assert_unchanged(&phone, latest, &state);
+}
+
+#[test]
+fn foreign_attested_ahead_head_cannot_block_sync_as_truncation() {
+    let (_net, _clock, mut phone, controls, candidate) = candidate_epoch_fixture();
+    let previous = MailboxKeys::derive(&[8; 32], 1);
+    let published = EpochPublic::sign(
+        A,
+        2,
+        &MailboxKeys::derive(&[9; 32], 2),
+        Some(candidate.head),
+        Some(&previous.sig_secret),
+        &signer(99),
+    )
+    .unwrap();
+    *controls.latest.lock().unwrap() = Some(published);
+    let latest = phone.latest_epoch();
+    let state = phone.export_state().unwrap();
+
+    assert_eq!(phone.sync_epochs().unwrap_err(), Error::Unattested);
+    assert_unchanged(&phone, latest, &state);
+}
+
+#[test]
+fn removed_attester_cannot_publish_an_ahead_head() {
+    let (_net, _clock, mut phone, controls, candidate) = candidate_epoch_fixture();
+    let removed = signer(98);
+    *controls.keys.lock().unwrap() = Some(vec![
+        ChatDeviceKey::current(candidate.attestation.transport_public_key),
+        ChatDeviceKey {
+            key: removed.0.verifying_key().to_bytes(),
+            removed_at: Some(1),
+        },
+    ]);
+    let previous = MailboxKeys::derive(&[8; 32], 1);
+    let published = EpochPublic::sign(
+        A,
+        2,
+        &MailboxKeys::derive(&[9; 32], 2),
+        Some(candidate.head),
+        Some(&previous.sig_secret),
+        &removed,
+    )
+    .unwrap();
+    *controls.latest.lock().unwrap() = Some(published);
+    let latest = phone.latest_epoch();
+    let state = phone.export_state().unwrap();
+
+    assert_eq!(phone.sync_epochs().unwrap_err(), Error::Unattested);
+    assert_unchanged(&phone, latest, &state);
+}
+
+#[test]
+fn failed_attester_check_does_not_activate_candidate_epoch() {
+    let (_net, _clock, mut phone, controls, _candidate) = candidate_epoch_fixture();
+    *controls.keys.lock().unwrap() = Some(vec![ChatDeviceKey::current(tpub(1))]);
+    let latest = phone.latest_epoch();
+    let state = phone.export_state().unwrap();
+
+    assert_eq!(phone.sync_epochs().unwrap_err(), Error::Unattested);
+    assert_unchanged(&phone, latest, &state);
+}
+
+#[test]
+fn failed_member_audit_does_not_activate_candidate_epoch() {
+    let (_net, _clock, mut phone, controls, _candidate) = candidate_epoch_fixture();
+    controls.key_calls.store(0, Ordering::Relaxed);
+    controls.fail_key_call.store(2, Ordering::Relaxed);
+    let latest = phone.latest_epoch();
+    let state = phone.export_state().unwrap();
+
+    assert_eq!(
+        phone.sync_epochs().unwrap_err(),
+        Error::Backend("injected member-audit outage".into())
+    );
+    assert_unchanged(&phone, latest, &state);
+}
+
+#[test]
+fn older_published_head_must_be_an_ancestor_of_the_candidate() {
+    let (_net, _clock, mut phone, controls, _candidate) = candidate_epoch_fixture();
+    let fork = EpochPublic::sign(
+        A,
+        0,
+        &MailboxKeys::derive(&[7; 32], 0),
+        None,
+        None,
+        &signer(1),
+    )
+    .unwrap();
+    *controls.latest.lock().unwrap() = Some(fork);
+    let latest = phone.latest_epoch();
+    let state = phone.export_state().unwrap();
+
+    assert_eq!(
+        phone.sync_epochs().unwrap_err(),
+        Error::Malformed("published epoch head forks from mailbox")
+    );
+    assert_unchanged(&phone, latest, &state);
+}
+
+#[test]
+fn older_published_ancestor_allows_candidate_activation() {
+    let (net, _clock, mut phone, controls, _candidate) = candidate_epoch_fixture();
+    let published = net
+        .mailbox(A)
+        .get_epoch(0)
+        .unwrap()
+        .unwrap()
+        .value
+        .public
+        .to_public()
+        .unwrap();
+    *controls.latest.lock().unwrap() = Some(published);
+
+    assert_eq!(phone.sync_epochs().unwrap().to, 1);
+    assert_eq!(phone.latest_epoch(), 1);
+}
+
+#[test]
+fn recovery_rejects_an_older_published_head_from_another_branch() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let recovery = phone.create_recovery_code(Mechanism::Code).unwrap();
+    let sibling = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(net.mailbox(A)));
+    phone
+        .revoke_device(&sibling.device_public().device_key_pub)
+        .unwrap();
+    assert_eq!(phone.latest_epoch(), 1);
+
+    let controls = DirectoryControls::default();
+    *controls.latest.lock().unwrap() = Some(
+        EpochPublic::sign(
+            A,
+            0,
+            &MailboxKeys::derive(&[7; 32], 0),
+            None,
+            None,
+            &signer(1),
+        )
+        .unwrap(),
+    );
+    let mut b = backends(&net, &clock, A, Box::new(net.mailbox(A)));
+    b.directory = Box::new(ControlledDirectory {
+        inner: net.directory(),
+        controls,
+    });
+    net.register_chat_device(A, tpub(6));
+
+    let restored =
+        Labyrinth::restore_with_recovery_code(A, recovery.code.as_str(), Box::new(signer(6)), b);
+    assert_eq!(
+        restored.map(|_| ()).unwrap_err(),
+        Error::Malformed("published epoch head forks from mailbox")
+    );
+}
+
+#[test]
+fn removed_historical_attester_still_allows_candidate_activation() {
+    let (net, _clock, mut phone, _controls, _candidate) = candidate_epoch_fixture();
+    net.remove_chat_device(A, tpub(2), 1);
+
+    assert_eq!(phone.sync_epochs().unwrap().to, 1);
+    assert_eq!(phone.latest_epoch(), 1);
 }
 
 /// Enrolls a second device of `existing`'s account via one-time code.
@@ -308,6 +634,16 @@ fn stale_head_replay_after_contact_is_rejected() {
         5000,
         b"secret after revocation",
     );
+    assert!(matches!(
+        bob.flush(),
+        Err(Error::EpochRollback {
+            pinned: 1,
+            offered: 0
+        })
+    ));
+    // The safe epoch-1 message remains queued. Once the directory stops
+    // replaying epoch 0, it can be published under its original roster.
+    active.store(false, Ordering::Relaxed);
     bob.flush().unwrap();
     let h = phone.load_thread("t", TimeRange::ALL).unwrap();
     assert!(
@@ -450,10 +786,7 @@ fn pins_reject_rollback_and_advance_only_through_a_verified_chain() {
     assert_eq!(
         bob.archive_outgoing("t", &forced, "m", 1, b"x")
             .unwrap_err(),
-        Error::EpochRollback {
-            pinned: 2,
-            offered: 0
-        }
+        Error::Malformed("roster epoch is not the directory head")
     );
 }
 
@@ -587,6 +920,19 @@ fn with_server_order_a_removed_leaf_stops_vouching_at_its_removal_commit() {
     let h = carol.load_thread("v", TimeRange::ALL).unwrap();
     assert!(h.messages.is_empty());
     assert_eq!(h.undecryptable[0].error, Error::BadPublicKey);
+
+    // An unsequenced batch (`chat_seq: None`, written before leaf tracking was
+    // enabled on `"w"`) is rejected fail-closed once leaves are tracked on `"w"`.
+    phone
+        .archive_outgoing("w", &roster, "unsequenced-pre-leaf", 1, b"u")
+        .unwrap();
+    phone.flush().unwrap();
+    net.add_leaf("w", A, tpub(1));
+    net.add_leaf("w", C, tpub(3));
+    let h = carol.load_thread("w", TimeRange::ALL).unwrap();
+    assert!(h.messages.is_empty());
+    assert_eq!(h.undecryptable.len(), 1);
+    assert_eq!(h.undecryptable[0].error, Error::BadPublicKey);
 }
 
 // ---- Finding 7: client state persistence ----
@@ -670,7 +1016,7 @@ fn state_round_trips_and_a_restarted_client_keeps_working() {
 }
 
 #[test]
-fn restarted_client_still_enforces_the_revoked_set() {
+fn reached_epoch_readmitting_a_revoked_device_is_not_activated() {
     let net = MemoryBackend::new();
     let clock = TestClock::default();
     net.register_chat_device(A, tpub(1));
@@ -683,7 +1029,8 @@ fn restarted_client_still_enforces_the_revoked_set() {
     let flaky = IgnoresRevoke::new(net.mailbox(A));
     let outage = flaky.1.clone();
     let mut laptop = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(flaky));
-    let tablet = enroll_sibling(&net, &clock, &mut phone, 4, Box::new(net.mailbox(A)));
+    let mut tablet = enroll_sibling(&net, &clock, &mut phone, 4, Box::new(net.mailbox(A)));
+    let spare = enroll_sibling(&net, &clock, &mut phone, 5, Box::new(net.mailbox(A)));
 
     // The revocation is recorded locally, but its rotation never happens.
     outage.store(true, Ordering::Relaxed);
@@ -692,8 +1039,42 @@ fn restarted_client_still_enforces_the_revoked_set() {
         laptop.revoke_device(&phone_key),
         Err(Error::Backend(_))
     ));
+    let blocked = Error::EpochSquatted {
+        seq: 0,
+        reason: "it re-admits a device this client revoked",
+    };
+    assert_eq!(
+        laptop
+            .archive_owner("blocked", "m", 1, b"must not encrypt")
+            .unwrap_err(),
+        blocked
+    );
+    assert_eq!(laptop.resolve_roster(&[A]).unwrap_err(), blocked);
+    assert_eq!(
+        laptop
+            .archive_outgoing("blocked", &[], "m", 1, b"must not encrypt")
+            .unwrap_err(),
+        blocked
+    );
+    assert_eq!(laptop.publish_latest_keys().unwrap_err(), blocked);
+    let latest = laptop.latest_epoch();
+    let before_same_epoch = laptop.export_state().unwrap();
+    assert_eq!(
+        laptop.sync_epochs().unwrap_err(),
+        Error::EpochSquatted {
+            seq: 0,
+            reason: "it re-admits a device this client revoked"
+        }
+    );
+    assert_unchanged(&laptop, latest, &before_same_epoch);
     let state = laptop.export_state().unwrap();
     drop(laptop);
+
+    // An unaware sibling advances the chain from the still-inclusive epoch.
+    // Because the store discarded revokedAt, it carries the phone forward.
+    tablet
+        .revoke_device(&spare.device_public().device_key_pub)
+        .unwrap();
 
     // After a restart (on a store that never recorded revokedAt), the
     // laptop still knows the phone is revoked ...
@@ -713,13 +1094,263 @@ fn restarted_client_still_enforces_the_revoked_set() {
         laptop.revoked_devices().collect::<Vec<_>>(),
         vec![phone_key]
     );
-    assert_eq!(laptop.sync_epochs().unwrap().readmitted, vec![phone_key]);
-    // ... and its next rotation, for another device, excludes it too.
-    laptop
-        .revoke_device(&tablet.device_public().device_key_pub)
+    let latest = laptop.latest_epoch();
+    let state = laptop.export_state().unwrap();
+    assert_eq!(
+        laptop.sync_epochs().unwrap_err(),
+        Error::EpochSquatted {
+            seq: 0,
+            reason: "it re-admits a device this client revoked"
+        }
+    );
+    assert_unchanged(&laptop, latest, &state);
+}
+
+#[test]
+fn revocation_refuses_to_cross_pending_ciphertext() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    phone.create_recovery_code(Mechanism::Code).unwrap();
+    let target = phone.list_recovery_methods().unwrap()[0].device_key;
+    let roster = phone.resolve_roster(&[A]).unwrap();
+    phone
+        .archive_outgoing("queued", &roster, "m", 1, b"before revocation")
         .unwrap();
+
+    assert_eq!(
+        phone.revoke_device(&target).unwrap_err(),
+        Error::PendingWrites
+    );
+    assert_eq!(phone.latest_epoch(), 0);
+    assert!(phone.revoked_devices().next().is_none());
+    assert_eq!(phone.pending("queued"), 1);
+
+    assert_eq!(phone.discard_pending("queued"), 1);
+    assert_eq!(phone.revoke_device(&target).unwrap().new_epoch, 1);
+}
+
+#[test]
+fn flush_rejects_ciphertext_buffered_under_an_old_epoch() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let mut laptop = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(net.mailbox(A)));
+    let spare = enroll_sibling(&net, &clock, &mut phone, 3, Box::new(net.mailbox(A)));
+    let roster = phone.resolve_roster(&[A]).unwrap();
+    phone
+        .archive_outgoing("queued", &roster, "m", 1, b"before sibling rotation")
+        .unwrap();
+    phone
+        .archive_owner("owner-queued", "o", 1, b"before sibling rotation")
+        .unwrap();
+
+    laptop
+        .revoke_device(&spare.device_public().device_key_pub)
+        .unwrap();
+
+    assert_eq!(phone.flush().unwrap_err(), Error::RosterMismatch);
+    assert_eq!(phone.pending("queued"), 1);
+    assert_eq!(phone.pending("owner-queued"), 1);
+}
+
+#[test]
+fn flush_revalidates_a_peers_epoch_before_publishing() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    net.register_chat_device(B, tpub(4));
+    let mut alice = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let mut bob = Labyrinth::initialize(
+        B,
+        Box::new(signer(4)),
+        backends(&net, &clock, B, Box::new(net.mailbox(B))),
+    )
+    .unwrap();
+    bob.create_recovery_code(Mechanism::Code).unwrap();
+    let recovery = bob.list_recovery_methods().unwrap()[0].device_key;
+    let roster = alice.resolve_roster(&[A, B]).unwrap();
+    alice
+        .archive_outgoing("peer-queued", &roster, "m", 1, b"before peer rotation")
+        .unwrap();
+
+    bob.revoke_device(&recovery).unwrap();
+
+    assert_eq!(alice.flush().unwrap_err(), Error::RosterMismatch);
+    assert_eq!(alice.pending("peer-queued"), 1);
+}
+
+#[test]
+fn removed_chat_binding_does_not_hide_a_failed_revocation_membership() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let flaky = IgnoresRevoke::new(net.mailbox(A));
+    let outage = flaky.1.clone();
+    let mut laptop = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(flaky));
+
+    net.remove_chat_device(A, tpub(1), 1);
+    outage.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        laptop.revoke_chat_device(&tpub(1)),
+        Err(Error::Backend(_))
+    ));
+    assert_eq!(
+        laptop.sync_epochs().unwrap_err(),
+        Error::EpochSquatted {
+            seq: 0,
+            reason: "it re-admits a device this client revoked"
+        }
+    );
+}
+
+#[test]
+fn store_cannot_hide_a_previously_verified_revoked_member() {
+    for hide in [false, true] {
+        let net = MemoryBackend::new();
+        let clock = TestClock::default();
+        net.register_chat_device(A, tpub(1));
+        let mut phone = Labyrinth::initialize(
+            A,
+            Box::new(signer(1)),
+            backends(&net, &clock, A, Box::new(net.mailbox(A))),
+        )
+        .unwrap();
+        let hostile = IgnoresRevoke::new(net.mailbox(A));
+        let outage = hostile.1.clone();
+        let membership_fault = hostile.2.clone();
+        let mut laptop = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(hostile));
+        let phone_key = phone.device_public().device_key_pub;
+
+        // The preparatory audit verifies and remembers the target, but the
+        // rotation fails after the local revocation decision.
+        outage.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            laptop.revoke_device(&phone_key),
+            Err(Error::Backend(_))
+        ));
+        *membership_fault.lock().unwrap() = Some((phone_key, hide));
+
+        assert_eq!(
+            laptop.sync_epochs().unwrap_err(),
+            Error::EpochSquatted {
+                seq: 0,
+                reason: "it re-admits a device this client revoked",
+            }
+        );
+    }
+}
+
+#[test]
+fn revocation_catches_up_through_an_epoch_previously_opened_by_its_target() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let mut laptop = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(net.mailbox(A)));
+    let spare = enroll_sibling(&net, &clock, &mut phone, 3, Box::new(net.mailbox(A)));
+
+    // While the laptop is offline at epoch 0, the phone legitimately opens
+    // epoch 1. The later decision to revoke that phone must be allowed to
+    // catch up in quarantine and immediately rotate again; it must not use
+    // epoch 1 for ordinary archiving in between.
+    phone
+        .revoke_device(&spare.device_public().device_key_pub)
+        .unwrap();
+    assert_eq!((laptop.latest_epoch(), phone.latest_epoch()), (0, 1));
+
+    let phone_key = phone.device_public().device_key_pub;
+    let report = laptop.revoke_device(&phone_key).unwrap();
+    assert_eq!(report.new_epoch, 2);
     assert_eq!(phone.sync_epochs().unwrap_err(), Error::NotEpochMember);
-    assert!(laptop.sync_epochs().unwrap().readmitted.is_empty());
+}
+
+#[test]
+fn intermediate_epoch_readmitting_a_revoked_device_is_not_activated() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let flaky = IgnoresRevoke::new(net.mailbox(A));
+    let outage = flaky.1.clone();
+    let mut laptop = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(flaky));
+    let mut tablet = enroll_sibling(&net, &clock, &mut phone, 4, Box::new(net.mailbox(A)));
+    let spare = enroll_sibling(&net, &clock, &mut phone, 5, Box::new(net.mailbox(A)));
+
+    outage.store(true, Ordering::Relaxed);
+    let phone_key = phone.device_public().device_key_pub;
+    assert!(matches!(
+        laptop.revoke_device(&phone_key),
+        Err(Error::Backend(_))
+    ));
+    let state = laptop.export_state().unwrap();
+    drop(laptop);
+
+    // Epoch 1 incorrectly carries the locally revoked phone. Epoch 2 is
+    // clean again, so auditing only the final reached epoch misses the
+    // compromise already present at the starting epoch and carried through
+    // the intermediate epoch.
+    tablet
+        .revoke_device(&spare.device_public().device_key_pub)
+        .unwrap();
+    tablet.revoke_device(&phone_key).unwrap();
+    assert_eq!(tablet.latest_epoch(), 2);
+
+    let mut laptop = Labyrinth::from_state(
+        &state,
+        A,
+        Box::new(signer(2)),
+        backends(
+            &net,
+            &clock,
+            A,
+            Box::new(IgnoresRevoke::new(net.mailbox(A))),
+        ),
+    )
+    .unwrap();
+    let latest = laptop.latest_epoch();
+    let before = laptop.export_state().unwrap();
+    assert_eq!(
+        laptop.sync_epochs().unwrap_err(),
+        Error::EpochSquatted {
+            seq: 0,
+            reason: "it re-admits a device this client revoked"
+        }
+    );
+    assert_unchanged(&laptop, latest, &before);
 }
 
 #[test]
@@ -1172,4 +1803,179 @@ fn an_offline_restart_defers_the_attester_check_until_the_roster_needs_it() {
         restored.resolve_roster(&[A]).unwrap_err(),
         Error::Unattested
     );
+}
+
+#[test]
+fn owner_archive_and_rearchive_fail_closed_when_outbox_holds_stale_epoch_items() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    net.register_chat_device(B, tpub(4));
+    let mut phone = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    )
+    .unwrap();
+    let mut laptop = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(net.mailbox(A)));
+    let spare = enroll_sibling(&net, &clock, &mut phone, 3, Box::new(net.mailbox(A)));
+    let mut bob = Labyrinth::initialize(
+        B,
+        Box::new(signer(4)),
+        backends(&net, &clock, B, Box::new(net.mailbox(B))),
+    )
+    .unwrap();
+    let roster_ab = bob.resolve_roster(&[A, B]).unwrap();
+    bob.archive_outgoing("t-leave", &roster_ab, "m-bob", 5, b"hello")
+        .unwrap();
+    bob.flush().unwrap();
+
+    phone
+        .archive_owner("owner-queued", "o1", 1, b"epoch-0")
+        .unwrap();
+    assert_eq!(phone.pending("owner-queued"), 1);
+
+    laptop
+        .revoke_device(&spare.device_public().device_key_pub)
+        .unwrap();
+
+    assert_eq!(
+        phone
+            .archive_owner("owner-queued", "o2", 2, b"epoch-1")
+            .unwrap_err(),
+        Error::WrongEpoch
+    );
+    assert_eq!(phone.pending("owner-queued"), 1);
+    assert_eq!(
+        phone
+            .archive_owner("other-thread", "o3", 3, b"epoch-1")
+            .unwrap_err(),
+        Error::WrongEpoch
+    );
+    assert_eq!(phone.pending("other-thread"), 0);
+    assert_eq!(
+        phone.rearchive_thread_before_leave("t-empty").unwrap_err(),
+        Error::WrongEpoch
+    );
+    assert_eq!(
+        phone.rearchive_thread_before_leave("t-leave").unwrap_err(),
+        Error::WrongEpoch
+    );
+
+    assert_eq!(phone.discard_pending("owner-queued"), 1);
+    assert_eq!(phone.rearchive_thread_before_leave("t-leave").unwrap(), 1);
+}
+
+struct TrackMeksAndFailAppend {
+    inner: labyrinth::store::memory::MemoryThreads,
+    created_meks: Arc<std::sync::atomic::AtomicUsize>,
+    fail_append: Arc<AtomicBool>,
+}
+
+impl labyrinth::store::ThreadStore for TrackMeksAndFailAppend {
+    fn author(&self) -> &str {
+        self.inner.author()
+    }
+    fn create_mek(&self, mek: &labyrinth::records::MekDistribution) -> labyrinth::Result<()> {
+        self.created_meks.fetch_add(1, Ordering::Relaxed);
+        self.inner.create_mek(mek)
+    }
+    fn find_meks(
+        &self,
+        t: &str,
+        id: &[u8; 12],
+    ) -> labyrinth::Result<Vec<Stored<labyrinth::records::MekDistribution>>> {
+        self.inner.find_meks(t, id)
+    }
+    fn append_batch(&self, b: &labyrinth::records::Batch) -> labyrinth::Result<String> {
+        if self.fail_append.load(Ordering::Relaxed) {
+            return Err(Error::Backend("append down".into()));
+        }
+        self.inner.append_batch(b)
+    }
+    fn list_batches(
+        &self,
+        t: &str,
+        s: Option<&str>,
+        r: TimeRange,
+    ) -> labyrinth::Result<Vec<Stored<labyrinth::records::Batch>>> {
+        self.inner.list_batches(t, s, r)
+    }
+}
+
+#[test]
+fn archive_outgoing_flushes_prior_roster_before_publishing_new_mek() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    const C: &str = "did:plc:carol";
+    net.register_chat_device(A, tpub(1));
+    net.register_chat_device(B, tpub(2));
+    net.register_chat_device(C, tpub(3));
+    let created_meks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fail_append = Arc::new(AtomicBool::new(false));
+    let mut alice = Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        Backends {
+            threads: Box::new(TrackMeksAndFailAppend {
+                inner: net.threads(A),
+                created_meks: created_meks.clone(),
+                fail_append: fail_append.clone(),
+            }),
+            ..backends(&net, &clock, A, Box::new(net.mailbox(A)))
+        },
+    )
+    .unwrap();
+    let mut bob = Labyrinth::initialize(
+        B,
+        Box::new(signer(2)),
+        backends(&net, &clock, B, Box::new(net.mailbox(B))),
+    )
+    .unwrap();
+    let _carol = Labyrinth::initialize(
+        C,
+        Box::new(signer(3)),
+        backends(&net, &clock, C, Box::new(net.mailbox(C))),
+    )
+    .unwrap();
+
+    let roster_ab = alice.resolve_roster(&[A, B]).unwrap();
+    alice
+        .archive_outgoing("t", &roster_ab, "m1", 10, b"first")
+        .unwrap();
+    assert_eq!(created_meks.load(Ordering::Relaxed), 1);
+    assert_eq!(alice.pending("t"), 1);
+
+    // If flushing the buffered [A, B] batch fails, the new [A, B, C] MEK must
+    // not be published beforehand and orphaned on the thread store.
+    fail_append.store(true, Ordering::Relaxed);
+    let roster_abc = alice.resolve_roster(&[A, B, C]).unwrap();
+    assert!(matches!(
+        alice.archive_outgoing("t", &roster_abc, "m2", 20, b"second"),
+        Err(Error::Backend(_))
+    ));
+    assert_eq!(created_meks.load(Ordering::Relaxed), 1);
+    assert_eq!(alice.pending("t"), 1);
+
+    // Likewise, if Bob rotated while m1 was buffered, flushing m1 fails with
+    // RosterMismatch before any new MEK for Bob's new epoch is published.
+    fail_append.store(false, Ordering::Relaxed);
+    bob.create_recovery_code(Mechanism::Code).unwrap();
+    let bob_recovery = bob.list_recovery_methods().unwrap()[0].device_key;
+    bob.revoke_device(&bob_recovery).unwrap();
+    let roster_ab_v2 = alice.resolve_roster(&[A, B]).unwrap();
+    assert_eq!(
+        alice
+            .archive_outgoing("t", &roster_ab_v2, "m2", 20, b"after bob rotate")
+            .unwrap_err(),
+        Error::RosterMismatch
+    );
+    assert_eq!(created_meks.load(Ordering::Relaxed), 1);
+    assert_eq!(alice.pending("t"), 1);
+
+    assert_eq!(alice.discard_pending("t"), 1);
+    alice
+        .archive_outgoing("t", &roster_ab_v2, "m2", 20, b"after discard")
+        .unwrap();
+    assert_eq!(created_meks.load(Ordering::Relaxed), 2);
 }

@@ -80,7 +80,7 @@ impl Labyrinth {
         let ids = [message_id];
         let batches = self.readable(&mut h, self.b.threads.get_messages(thread_id, &ids))?;
         let keep = |id: &str, _| id == message_id;
-        self.open_batches(thread_id, batches, &keep, &mut h);
+        self.open_batches(thread_id, batches, &keep, &mut h)?;
         let owner = self.b.mailbox.get_owner_messages(thread_id, &ids)?;
         let tombstones = self.open_owner_batches(thread_id, owner, &keep, &mut h)?;
         finish(&mut h, &tombstones);
@@ -141,7 +141,7 @@ impl Labyrinth {
                 message_id: id.clone(),
             });
         let keep = |id: &str, ts: u64| selected.contains(&(ts, id.to_owned()));
-        self.open_batches(thread_id, batches, &keep, &mut h);
+        self.open_batches(thread_id, batches, &keep, &mut h)?;
         let tombstones = self.open_owner_batches(thread_id, owner, &keep, &mut h)?;
         finish(&mut h, &tombstones);
         h.messages.reverse();
