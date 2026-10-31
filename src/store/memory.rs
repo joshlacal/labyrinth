@@ -1,29 +1,20 @@
 //! In-memory backend for tests and examples.
-//!
-//! One [`MemoryBackend`] plays every server at once: each DID's personal
-//! mailbox space and public repo, every conversation space, and the MLS
-//! device view the [`super::MailboxDirectory`] reports. Handles bound to a DID
-//! ([`MemoryBackend::mailbox`], [`MemoryBackend::threads`]) can only write
-//! that DID's repos, as Spaces enforce.
-//!
-//! Conversation spaces have **no read ACL by default**: any handle can read
-//! any thread, as a leaky or malicious backend would. Confidentiality must
-//! come from the cryptography. [`MemoryBackend::revoke_thread_access`]
-//! models a Space removing a member ([CB-22]).
-//!
-//! By default nothing carries server order, as on a Space.
-//! [`MemoryBackend::enable_server_order`] switches to mls-ds behaviour:
-//! every MEK, batch and owner batch is stamped with a [`ServerOrder`] from
-//! a test-controlled server clock and the thread's chat sequence, and
-//! [`MemoryBackend::add_leaf`] / [`MemoryBackend::remove_leaf`] model the
-//! per-conversation device view ([CB-27]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::{ChatDeviceKey, MailboxStore, MemberDeviceKey, ServerOrder, Stored, TimeRange};
+use sha2::{Digest, Sha256};
+
+use super::{
+    AtomicEnrollBundle, ChatDeviceKey, EnrollCleanup, MailboxStore, MemberDeviceKey,
+    SequencerReceiptKey, ServerOrder, Stored, TimeRange,
+};
+use crate::attachment::{AttachmentCiphertextMeta, verify_attachment_ciphertext};
 use crate::epoch::space_epoch_id;
-use crate::records::{Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, VirtualDevice};
+use crate::records::{
+    AttachmentManifest, Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch,
+    VirtualDevice,
+};
 use crate::sign::XVerifyingKey;
 use crate::{Error, Result};
 
@@ -42,7 +33,9 @@ struct Mailbox {
     epochs: BTreeMap<String, Epoch>,
     members: BTreeMap<String, EpochMember>,
     vdevices: BTreeMap<String, VirtualDevice>,
+    otc_sessions: BTreeMap<String, OtcSession>,
     owner_batches: BTreeMap<String, (OwnerBatch, Option<ServerOrder>)>,
+    attachments: BTreeMap<String, AttachmentManifest>,
     next_seq: u64,
 }
 
@@ -50,6 +43,7 @@ struct Mailbox {
 struct Repo {
     meks: BTreeMap<String, (crate::records::MekDistribution, Option<ServerOrder>)>,
     batches: BTreeMap<String, (crate::records::Batch, Option<ServerOrder>)>,
+    attachments: BTreeMap<String, AttachmentManifest>,
 }
 
 #[derive(Default)]
@@ -74,21 +68,27 @@ struct ChatDevices {
 #[derive(Default)]
 struct State {
     mailboxes: HashMap<String, Mailbox>,
+    blobs: HashMap<(String, String), Vec<u8>>,
     public_keys: HashMap<String, MailboxKeysRecord>,
     /// Every published `mailboxKeys`, by DID and epoch number ([CB-29]).
     public_history: HashMap<String, BTreeMap<u64, MailboxKeysRecord>>,
     threads: HashMap<String, ThreadSpace>,
     chat_devices: HashMap<String, ChatDevices>,
     tid: u64,
-    /// Stamp writes with [`ServerOrder`] (mls-ds mode).
+    /// Stamp writes with [`ServerOrder`].
     stamping: bool,
     /// The server clock for stamps (ms), set by tests.
     server_now: u64,
-    /// mls-ds `labyrinth.epoch_heads`, by DID and epoch number.
+    /// `mls-ds` `labyrinth.epoch_heads`, by DID and epoch number.
     ds_heads: HashMap<String, BTreeMap<u64, crate::mailbox::EpochPublic>>,
-    /// The DS that sequences every thread here: its DID and, when it
-    /// signs its own redactions, its Ed25519 seed ([CB-38]).
+    /// Pruned `floor_seq` per DID (`L-F01`, Gate 6).
+    ds_floors: HashMap<String, u64>,
+    /// Adversarial override for `floor_seq` (`Gate 6` test injection).
+    ds_floor_overrides: HashMap<String, u64>,
+    /// The DS that sequences every thread here: its DID and optional Ed25519 seed ([CB-38]).
     sequencer: Option<(String, Option<[u8; 32]>)>,
+    /// Per-thread `I13` ES256 receipt verification keys (`Gate 1`).
+    receipt_keys: HashMap<String, SequencerReceiptKey>,
 }
 
 impl State {
@@ -100,6 +100,17 @@ impl State {
             .rev()
             .map(|i| S32[((self.tid >> (5 * i)) & 31) as usize] as char)
             .collect()
+    }
+
+    fn store_blob(&mut self, did: &str, bytes: &[u8]) -> String {
+        self.tid += 1;
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.update(self.tid.to_be_bytes());
+        let cid = format!("bafkrei{}", hex::encode(&h.finalize()[..16]));
+        self.blobs
+            .insert((did.to_owned(), cid.clone()), bytes.to_vec());
+        cid
     }
 
     /// Writes `did`'s public `mailboxKeys` (`self` and the per-epoch copy).
@@ -127,8 +138,7 @@ impl State {
         Ok(())
     }
 
-    /// The server stamp for a write into `thread_id` (`None` unless
-    /// stamping).
+    /// The server stamp for a write into `thread_id` (`None` unless stamping).
     fn stamp_thread(&mut self, thread_id: &str) -> Option<ServerOrder> {
         if !self.stamping {
             return None;
@@ -177,39 +187,32 @@ impl MemoryBackend {
         MemoryDirectory::new(self.clone())
     }
 
-    /// The mls-ds epoch-head directory ([CB-28], [CB-29]): heads recorded
-    /// by [`ds_publisher`](Self::ds_publisher), plus the MLS device view.
+    /// The `mls-ds` epoch-head directory ([CB-28], [CB-29], Gate 6).
     pub fn ds_directory(&self) -> MemoryDsDirectory {
         MemoryDsDirectory::new(self.clone())
     }
 
-    /// Publishes `did`'s heads to the mls-ds directory, with its
-    /// server-side checks (`publishEpochHead`).
+    /// Publishes `did`'s heads to the `mls-ds` directory (`publishEpochHead`).
     pub fn ds_publisher(&self, did: &str) -> MemoryDsPublisher {
         MemoryDsPublisher::new(did, self.clone())
     }
 
-    /// Publishes `did`'s public `mailboxKeys` records (what a Space
-    /// mailbox does in [`MailboxStore::publish_mailbox_keys`]).
+    /// Publishes `did`'s public `mailboxKeys` records.
     pub fn pds_publisher(&self, did: &str) -> MemoryPdsPublisher {
         MemoryPdsPublisher::new(did, self.clone())
     }
 
-    /// From now on, stamp every MEK, batch and owner batch with a
-    /// [`ServerOrder`] as mls-ds does ([CB-27]). Without this the backend
-    /// behaves like a Space: no server order.
+    /// Stamp every MEK, batch and owner batch with [`ServerOrder`].
     pub fn enable_server_order(&self) {
         self.lock().stamping = true;
     }
 
-    /// Sets the server clock that stamps writes and that
-    /// [`remove_chat_device`](Self::remove_chat_device) times are read on.
+    /// Sets the server clock (ms).
     pub fn set_server_time(&self, ms: u64) {
         self.lock().server_now = ms;
     }
 
-    /// Fault-injection helper for tests modelling a compromised or unvalidated
-    /// store that holds an epoch with a broken `prev_sig`.
+    /// Fault-injection helper for tests modelling an unvalidated store.
     #[doc(hidden)]
     pub fn insert_epoch_unchecked(&self, did: &str, epoch: &Epoch) {
         let mut s = self.lock();
@@ -225,8 +228,7 @@ impl MemoryBackend {
         t.chat_seq
     }
 
-    /// An MLS commit adds a leaf for `did`'s device `key` to `thread_id`
-    /// (one chat entry). Returns the commit's seq.
+    /// Adds a leaf for `did`'s device `key` to `thread_id`.
     pub fn add_leaf(&self, thread_id: &str, did: &str, key: [u8; 32]) -> u64 {
         let seq = self.append_chat_entry(thread_id);
         let mut s = self.lock();
@@ -243,8 +245,7 @@ impl MemoryBackend {
         seq
     }
 
-    /// An MLS commit removes `did`'s leaf `key` from `thread_id`. Returns
-    /// the commit's seq.
+    /// Removes `did`'s leaf `key` from `thread_id`.
     pub fn remove_leaf(&self, thread_id: &str, did: &str, key: [u8; 32]) -> u64 {
         let seq = self.append_chat_entry(thread_id);
         let mut s = self.lock();
@@ -271,8 +272,14 @@ impl MemoryBackend {
         }
     }
 
-    /// Removes a chat device from the current MLS view at `removed_at_ms`
-    /// (it stays historical, valid for history before that time).
+    /// Replaces `did`'s active chat device transport keys.
+    pub fn set_chat_devices(&self, did: &str, keys: Vec<[u8; 32]>) {
+        let mut s = self.lock();
+        let d = s.chat_devices.entry(did.to_owned()).or_default();
+        d.current = keys;
+    }
+
+    /// Removes a chat device from the current MLS view at `removed_at_ms`.
     pub fn remove_chat_device(&self, did: &str, transport_pub: [u8; 32], removed_at_ms: u64) {
         let mut s = self.lock();
         let d = s.chat_devices.entry(did.to_owned()).or_default();
@@ -299,13 +306,39 @@ impl MemoryBackend {
             .unwrap_or_default()
     }
 
-    /// Every thread is sequenced by DS `did`; with `signing_seed`, its
-    /// account-deletion redactions are signed by that Ed25519 key and the
-    /// directories report it ([`crate::store::MailboxDirectory::sequencer_key`]).
-    /// Without a call, account deletion writes bare `{redactedAt}`
-    /// redactions.
+    /// Configures the sequencer DS DID and optional Ed25519 redaction signing seed.
     pub fn set_sequencer(&self, did: &str, signing_seed: Option<[u8; 32]>) {
         self.lock().sequencer = Some((did.to_owned(), signing_seed));
+    }
+
+    /// Registers the ES256 receipt verification key `{did}#mls-receipt-1` for `thread_id` (`Gate 1`).
+    pub fn set_sequencer_receipt_key(&self, thread_id: &str, key: SequencerReceiptKey) {
+        self.lock().receipt_keys.insert(thread_id.to_owned(), key);
+    }
+
+    pub(super) fn receipt_key(&self, thread_id: &str) -> Option<SequencerReceiptKey> {
+        self.lock().receipt_keys.get(thread_id).cloned()
+    }
+
+    /// Prunes `mls-ds` epoch heads strictly below `floor_seq` (`L-F01`, Gate 6).
+    pub fn prune_ds_heads_below(&self, did: &str, floor_seq: u64) {
+        let mut s = self.lock();
+        if let Some(chain) = s.ds_heads.get_mut(did) {
+            chain.retain(|&seq, _| seq >= floor_seq);
+        }
+        s.ds_floors.insert(did.to_owned(), floor_seq);
+    }
+
+    /// Adversarial helper overwriting `did`'s PDS `mailboxKeys/self` without rollback checks (`Gate 6`).
+    pub fn tamper_pds_latest(&self, did: &str, record: MailboxKeysRecord) {
+        self.lock().public_keys.insert(did.to_owned(), record);
+    }
+
+    /// Adversarial helper overriding the `floor_seq` reported by `ds_directory` (`Gate 6`).
+    pub fn set_ds_floor_seq_override_for_test(&self, did: &str, floor_seq: u64) {
+        self.lock()
+            .ds_floor_overrides
+            .insert(did.to_owned(), floor_seq);
     }
 
     fn sequencer_key(&self) -> Option<super::SequencerKey> {
@@ -329,18 +362,6 @@ impl MemoryBackend {
         let s = self.lock();
         let leaves = s.threads.get(thread_id)?.leaves.as_ref()?;
         Some(leaves.get(did).cloned().unwrap_or_default())
-    }
-
-    #[cfg(feature = "xrpc")]
-    pub(crate) fn thread_leaves(
-        &self,
-        thread_id: &str,
-        did: &str,
-    ) -> Option<(u64, Vec<MemberDeviceKey>)> {
-        let s = self.lock();
-        let t = s.threads.get(thread_id)?;
-        let leaves = t.leaves.as_ref()?;
-        Some((t.chat_seq, leaves.get(did).cloned().unwrap_or_default()))
     }
 
     fn chat_keys(&self, did: &str) -> Vec<ChatDeviceKey> {
@@ -382,17 +403,19 @@ fn create<T: Clone>(map: &mut BTreeMap<String, T>, key: String, value: &T) -> Re
     Ok(())
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl MailboxStore for MemoryMailbox {
     fn owner(&self) -> &str {
         &self.did
     }
 
-    fn create_device(&self, device: &Device) -> Result<()> {
+    async fn create_device(&self, device: &Device) -> Result<()> {
         let key = hex::encode(&device.device_key_pubkey.0);
         self.with(|m| create(&mut m.devices, key, device))
     }
 
-    fn set_device_revoked(&self, device_key: &XVerifyingKey, revoked_at: &str) -> Result<()> {
+    async fn set_device_revoked(&self, device_key: &XVerifyingKey, revoked_at: &str) -> Result<()> {
         self.with(|m| {
             let d = m
                 .devices
@@ -405,15 +428,15 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
-    fn get_device(&self, device_key: &XVerifyingKey) -> Result<Option<Device>> {
+    async fn get_device(&self, device_key: &XVerifyingKey) -> Result<Option<Device>> {
         self.with(|m| Ok(m.devices.get(&hex::encode(device_key.0)).cloned()))
     }
 
-    fn list_devices(&self) -> Result<Vec<Device>> {
+    async fn list_devices(&self) -> Result<Vec<Device>> {
         self.with(|m| Ok(m.devices.values().cloned().collect()))
     }
 
-    fn create_epoch(&self, epoch: &Epoch, members: &[EpochMember]) -> Result<String> {
+    async fn create_epoch(&self, epoch: &Epoch, members: &[EpochMember]) -> Result<String> {
         let seq = epoch.seq();
         let id = space_epoch_id(seq);
         let cur_pub = epoch.public.to_public()?;
@@ -443,7 +466,65 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
-    fn get_epoch(&self, seq: u64) -> Result<Option<Stored<Epoch>>> {
+    async fn atomic_enroll(&self, bundle: &AtomicEnrollBundle) -> Result<String> {
+        let seq = bundle.epoch.seq();
+        let id = space_epoch_id(seq);
+        let cur_pub = bundle.epoch.public.to_public()?;
+        let dev_key = hex::encode(&bundle.device.device_key_pubkey.0);
+        self.with(|m| {
+            if m.devices.contains_key(&dev_key)
+                || m.epochs.contains_key(&id)
+                || bundle
+                    .members
+                    .iter()
+                    .any(|x| x.epoch_number != seq || m.members.contains_key(&x.rkey()))
+            {
+                return Err(Error::Conflict);
+            }
+            if let Some(cleanup) = &bundle.cleanup {
+                match cleanup {
+                    EnrollCleanup::ConsumeOtcSession { rkey } => {
+                        if !m.otc_sessions.contains_key(rkey) {
+                            return Err(Error::Conflict);
+                        }
+                    }
+                    EnrollCleanup::TouchVirtualDevice { updated } => {
+                        if !m.vdevices.contains_key(&updated.rkey()) {
+                            return Err(Error::NotFound("virtual device"));
+                        }
+                    }
+                }
+            }
+            if seq > 0 {
+                let prev = m
+                    .epochs
+                    .get(&space_epoch_id(seq - 1))
+                    .ok_or(Error::Malformed("InvalidEpochChain"))?;
+                let prev_pub = prev.public.to_public()?;
+                cur_pub
+                    .verify_link(prev_pub.seq, &prev_pub.head, &prev_pub.keys.sig)
+                    .map_err(|_| Error::Malformed("InvalidEpochChain"))?;
+            }
+            if let Some(cleanup) = &bundle.cleanup {
+                match cleanup {
+                    EnrollCleanup::ConsumeOtcSession { rkey } => {
+                        m.otc_sessions.remove(rkey);
+                    }
+                    EnrollCleanup::TouchVirtualDevice { updated } => {
+                        m.vdevices.insert(updated.rkey(), updated.clone());
+                    }
+                }
+            }
+            m.devices.insert(dev_key, bundle.device.clone());
+            m.epochs.insert(id.clone(), bundle.epoch.clone());
+            for x in &bundle.members {
+                m.members.insert(x.rkey(), x.clone());
+            }
+            Ok(id)
+        })
+    }
+
+    async fn get_epoch(&self, seq: u64) -> Result<Option<Stored<Epoch>>> {
         let id = space_epoch_id(seq);
         self.with(|m| {
             Ok(m.epochs.get(&id).map(|e| Stored {
@@ -455,7 +536,7 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
-    fn list_epochs(&self) -> Result<Vec<Stored<Epoch>>> {
+    async fn list_epochs(&self) -> Result<Vec<Stored<Epoch>>> {
         self.with(|m| {
             Ok(m.epochs
                 .iter()
@@ -469,7 +550,7 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
-    fn create_epoch_member(&self, member: &EpochMember) -> Result<()> {
+    async fn create_epoch_member(&self, member: &EpochMember) -> Result<()> {
         self.with(|m| {
             if !m.epochs.contains_key(&space_epoch_id(member.epoch_number)) {
                 return Err(Error::NotFound("epoch"));
@@ -478,7 +559,7 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
-    fn list_epoch_members(&self, seq: u64) -> Result<Vec<EpochMember>> {
+    async fn list_epoch_members(&self, seq: u64) -> Result<Vec<EpochMember>> {
         let prefix = format!("{seq:012}-");
         self.with(|m| {
             Ok(m.members
@@ -489,11 +570,11 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
-    fn create_virtual_device(&self, vdevice: &VirtualDevice) -> Result<()> {
+    async fn create_virtual_device(&self, vdevice: &VirtualDevice) -> Result<()> {
         self.with(|m| create(&mut m.vdevices, vdevice.rkey(), vdevice))
     }
 
-    fn get_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<Option<VirtualDevice>> {
+    async fn get_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<Option<VirtualDevice>> {
         let s = self.backend.lock();
         let now = s.server_now;
         Ok(s.mailboxes
@@ -503,7 +584,7 @@ impl MailboxStore for MemoryMailbox {
             .cloned())
     }
 
-    fn list_virtual_devices(&self) -> Result<Vec<VirtualDevice>> {
+    async fn list_virtual_devices(&self) -> Result<Vec<VirtualDevice>> {
         let s = self.backend.lock();
         let now = s.server_now;
         Ok(s.mailboxes
@@ -518,7 +599,20 @@ impl MailboxStore for MemoryMailbox {
             .unwrap_or_default())
     }
 
-    fn append_owner_batch(&self, batch: &OwnerBatch) -> Result<String> {
+    async fn put_otc_session(&self, session: &OtcSession) -> Result<()> {
+        session.check()?;
+        self.with(|m| {
+            m.otc_sessions
+                .insert(session.rkey().to_owned(), session.clone());
+            Ok(())
+        })
+    }
+
+    async fn get_otc_session(&self, session_id: &str) -> Result<Option<OtcSession>> {
+        self.with(|m| Ok(m.otc_sessions.get(session_id).cloned()))
+    }
+
+    async fn append_owner_batch(&self, batch: &OwnerBatch) -> Result<String> {
         let mut s = self.backend.lock();
         let tid = s.next_tid();
         let (stamping, now) = (s.stamping, s.server_now);
@@ -535,7 +629,7 @@ impl MailboxStore for MemoryMailbox {
         Ok(tid)
     }
 
-    fn list_owner_batches(
+    async fn list_owner_batches(
         &self,
         thread_id: &str,
         range: TimeRange,
@@ -556,7 +650,40 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
-    fn list_owner_batches_before(
+    async fn upload_and_commit_owner_attachment(
+        &self,
+        rkey: &str,
+        ciphertext: &[u8],
+        meta: &AttachmentCiphertextMeta,
+        created_at: &str,
+    ) -> Result<String> {
+        verify_attachment_ciphertext(ciphertext, meta)?;
+        let mut s = self.backend.lock();
+        let cid = s.store_blob(&self.did, ciphertext);
+        let manifest = AttachmentManifest::from_meta(&cid, meta, created_at.to_owned());
+        let m = s.mailboxes.entry(self.did.clone()).or_default();
+        m.attachments.insert(rkey.to_owned(), manifest);
+        Ok(cid)
+    }
+
+    async fn get_owner_attachment_verified(&self, rkey: &str) -> Result<Vec<u8>> {
+        let s = self.backend.lock();
+        let manifest = s
+            .mailboxes
+            .get(&self.did)
+            .and_then(|m| m.attachments.get(rkey))
+            .ok_or(Error::NotFound("attachmentManifest"))?;
+        let (cid, meta) = manifest.to_meta()?;
+        let bytes = s
+            .blobs
+            .get(&(self.did.clone(), cid))
+            .ok_or(Error::NotFound("attachment blob"))?
+            .clone();
+        verify_attachment_ciphertext(&bytes, &meta)?;
+        Ok(bytes)
+    }
+
+    async fn list_owner_batches_before(
         &self,
         thread_id: &str,
         before_ms: Option<u64>,
@@ -613,23 +740,23 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
-    fn publish_mailbox_keys(&self, record: &MailboxKeysRecord) -> Result<()> {
+    async fn publish_mailbox_keys(&self, record: &MailboxKeysRecord) -> Result<()> {
         self.backend.lock().publish_pds(&self.did, record)
     }
 
-    fn list_owner_threads(&self) -> Result<Vec<String>> {
+    async fn list_owner_threads(&self) -> Result<Vec<String>> {
         Ok(self.backend.lock().owner_threads(&self.did))
     }
 
-    fn touch_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
+    async fn touch_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
         self.backend.lock().touch_vdevice(&self.did, vdevice_id)
     }
 
-    fn delete_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
+    async fn delete_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
         self.backend.lock().delete_vdevice(&self.did, vdevice_id)
     }
 
-    fn purge_mailbox(&self) -> Result<()> {
+    async fn purge_mailbox(&self) -> Result<()> {
         self.backend.lock().purge(&self.did);
         Ok(())
     }

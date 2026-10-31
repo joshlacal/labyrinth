@@ -6,6 +6,10 @@ pub mod limits;
 pub mod receipt;
 pub mod transcripts;
 
+pub use epoch_chain::*;
+pub use limits::*;
+pub use receipt::*;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProtocolError {
     #[error("malformed sequencer receipt: {0}")]

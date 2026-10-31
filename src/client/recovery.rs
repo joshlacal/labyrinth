@@ -59,48 +59,52 @@ impl RecoveryMethod {
 
 impl Labyrinth {
     /// Every recovery method (virtual device) of the account.
-    pub fn list_recovery_methods(&self) -> Result<Vec<RecoveryMethod>> {
+    pub async fn list_recovery_methods(&self) -> Result<Vec<RecoveryMethod>> {
         let mb = self.b.mailbox.as_ref();
-        mb.list_virtual_devices()?
-            .into_iter()
-            .map(|v| {
-                let (rec, _) = v.to_bundle()?;
-                let created_at_ms = ms_from_datetime(&v.created_at)?;
-                let last_used_at_ms = v
-                    .last_used_at
-                    .as_deref()
-                    .map(ms_from_datetime)
-                    .transpose()?;
-                let revoked = mb
-                    .get_device(&rec.public.device_key_pub)?
-                    .is_some_and(|d| d.revoked_at.is_some());
-                Ok(RecoveryMethod {
-                    vdevice_id: rec.vdevice_id,
-                    mechanism: rec.mechanism,
-                    device_key: rec.public.device_key_pub,
-                    created_at_ms,
-                    last_used_at_ms,
-                    expires_at_ms: recovery_expiry(rec.mechanism, created_at_ms, last_used_at_ms),
-                    revoked,
-                })
-            })
-            .collect()
+        let mut out = Vec::new();
+        for v in mb.list_virtual_devices().await? {
+            let (rec, _) = v.to_bundle()?;
+            let created_at_ms = ms_from_datetime(&v.created_at)?;
+            let last_used_at_ms = v
+                .last_used_at
+                .as_deref()
+                .map(ms_from_datetime)
+                .transpose()?;
+            let revoked = mb
+                .get_device(&rec.public.device_key_pub)
+                .await?
+                .is_some_and(|d| d.revoked_at.is_some());
+            out.push(RecoveryMethod {
+                vdevice_id: rec.vdevice_id,
+                mechanism: rec.mechanism,
+                device_key: rec.public.device_key_pub,
+                created_at_ms,
+                last_used_at_ms,
+                expires_at_ms: recovery_expiry(rec.mechanism, created_at_ms, last_used_at_ms),
+                revoked,
+            });
+        }
+        Ok(out)
     }
 
     /// Keep a platform-stored method alive, e.g. after the app confirmed
     /// its keychain copy is still present ([CB-39]).
-    pub fn touch_recovery_method(&self, vdevice_id: &[u8; 16]) -> Result<()> {
-        self.b.mailbox.touch_virtual_device(vdevice_id)
+    pub async fn touch_recovery_method(&self, vdevice_id: &[u8; 16]) -> Result<()> {
+        self.b.mailbox.touch_virtual_device(vdevice_id).await
     }
 
     /// Remove a recovery method: revoke its virtual device (a new epoch
-    /// without it, its ORF state deleted) and delete its bundle, so the
-    /// code no longer opens anything new and the bundle is gone. History
-    /// up to the rotation stays readable to anyone who already copied the
-    /// bundle and code, as with any revoked device.
-    pub fn remove_recovery_method(&mut self, vdevice_id: &[u8; 16]) -> Result<RotationReport> {
+    /// without it) and delete its bundle, so the code no longer opens
+    /// anything new and the bundle is gone. History up to the rotation
+    /// stays readable to anyone who already copied the bundle and code,
+    /// as with any revoked device.
+    pub async fn remove_recovery_method(
+        &mut self,
+        vdevice_id: &[u8; 16],
+    ) -> Result<RotationReport> {
         let method = self
-            .list_recovery_methods()?
+            .list_recovery_methods()
+            .await?
             .into_iter()
             .find(|m| m.vdevice_id == *vdevice_id)
             .ok_or(Error::NotFound("virtual device"))?;
@@ -110,7 +114,8 @@ impl Labyrinth {
         let dev = self
             .b
             .mailbox
-            .get_device(&method.device_key)?
+            .get_device(&method.device_key)
+            .await?
             .ok_or(Error::DeviceTampered)?;
         let dev_pub = dev.to_public()?;
         dev_pub.verify()?;
@@ -120,23 +125,24 @@ impl Labyrinth {
         {
             return Err(Error::DeviceTampered);
         }
-        let report = self.revoke_device(&method.device_key)?;
-        self.b.mailbox.delete_virtual_device(vdevice_id)?;
+        let report = self.revoke_device(&method.device_key).await?;
+        self.b.mailbox.delete_virtual_device(vdevice_id).await?;
         Ok(report)
     }
 
     /// Remove every method that expired by the client clock; returns the
     /// removed ids. One rotation per method (rare, and each is reported).
-    pub fn remove_expired_recovery_methods(&mut self) -> Result<Vec<[u8; 16]>> {
+    pub async fn remove_expired_recovery_methods(&mut self) -> Result<Vec<[u8; 16]>> {
         let now = self.b.clock.now_ms();
         let expired: Vec<[u8; 16]> = self
-            .list_recovery_methods()?
+            .list_recovery_methods()
+            .await?
             .into_iter()
             .filter(|m| m.expired_at(now))
             .map(|m| m.vdevice_id)
             .collect();
         for id in &expired {
-            self.remove_recovery_method(id)?;
+            self.remove_recovery_method(id).await?;
         }
         Ok(expired)
     }

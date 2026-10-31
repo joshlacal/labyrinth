@@ -4,43 +4,44 @@
 use std::collections::HashSet;
 
 use super::Labyrinth;
-use super::read::{MessageSource, ThreadHistory};
+use super::read::{MessageSource, OpenedSealed, ThreadHistory};
 use crate::epoch::EpochKeys as _;
-use crate::message::seal_owner;
-use crate::records::{BATCH_BYTE_BUDGET, MAX_BATCH_ITEMS};
-use crate::store::TimeRange;
+use crate::message::{seal_owner, seal_owner_committed};
+use crate::records::{BATCH_BYTE_BUDGET, BatchEntry, MAX_BATCH_ITEMS};
+use crate::store::{LeaveArchiveReport, TimeRange, VouchAt};
 use crate::{Error, Result};
 
 impl Labyrinth {
     /// Archive a message into my own mailbox in owner mode (cipher version
     /// 5, [CB-37]) under my latest epoch. Buffered like sender batches.
-    pub fn archive_owner(
+    pub async fn archive_owner(
         &mut self,
         thread_id: &str,
         message_id: &str,
         timestamp: u64,
         frame: &[u8],
     ) -> Result<Option<super::FlushedBatch>> {
-        self.sync_epochs()?;
+        self.sync_epochs().await?;
         self.archive_owner_synced(thread_id, message_id, timestamp, frame)
+            .await
     }
 
     /// Owner-mode archive after the caller has completed the epoch/revocation
     /// safety check. Kept private so public callers cannot skip it.
-    fn archive_owner_synced(
+    async fn archive_owner_synced(
         &mut self,
         thread_id: &str,
         message_id: &str,
         timestamp: u64,
         frame: &[u8],
     ) -> Result<Option<super::FlushedBatch>> {
-        let e = self.epoch_secret(self.latest)?;
+        let e = self.epoch_secret(self.latest).await?;
         let m = seal_owner(e.root(), e.seq, thread_id, message_id, timestamp, frame)?;
-        self.queue_owner(thread_id, m)
+        self.queue_owner(thread_id, m).await
     }
 
     /// Buffers one owner record, flushing at the batch limits.
-    pub(super) fn queue_owner(
+    pub(super) async fn queue_owner(
         &mut self,
         thread_id: &str,
         m: crate::message::OwnerMessage,
@@ -61,12 +62,12 @@ impl Labyrinth {
             .get(thread_id)
             .map_or(0, |v| v.iter().map(size).sum());
         if pending > 0 && pending + size(&m) > BATCH_BYTE_BUDGET {
-            flushed = self.flush_owner(thread_id)?;
+            flushed = self.flush_owner(thread_id).await?;
         }
         let queue = self.owner_outbox.entry(thread_id.to_owned()).or_default();
         queue.push(m);
         if queue.len() >= MAX_BATCH_ITEMS {
-            flushed = self.flush_owner(thread_id)?;
+            flushed = self.flush_owner(thread_id).await?;
         }
         Ok(flushed)
     }
@@ -74,15 +75,58 @@ impl Labyrinth {
     /// [CB-22]: before leaving a conversation (and losing read access to
     /// its space), copy every message I can read that is not already in my
     /// owner archive into my mailbox. Returns how many were archived.
-    ///
-    /// Owner records carry no sender DID; a client that needs it must keep
-    /// it inside the frame.
-    pub fn rearchive_thread_before_leave(&mut self, thread_id: &str) -> Result<usize> {
-        // One safety check covers the whole local batch. No external call in
-        // the loop can advance this client's epoch; re-running a full member
-        // audit for every historical message would make this path quadratic
-        // in remote work.
-        self.sync_epochs()?;
+    pub async fn rearchive_thread_before_leave(&mut self, thread_id: &str) -> Result<usize> {
+        self.rearchive_messages_before_leave_inner(thread_id).await
+    }
+
+    /// `Gate 5`: before leaving a conversation Space, flush pending writes,
+    /// re-archive all readable messages (preserving `I13` committed frames
+    /// and sequencer receipts) and own encrypted attachments into the
+    /// personal mailbox Space, then call `clear_records` to purge this
+    /// caller's repo in the conversation Space.
+    pub async fn rearchive_and_clear_before_leave(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<LeaveArchiveReport> {
+        self.flush_thread(thread_id).await?;
+        let messages_archived = self
+            .rearchive_messages_before_leave_inner(thread_id)
+            .await?;
+
+        let mut attachments_archived = 0;
+        let mut rearchived_blob_cids = Vec::new();
+        let own_manifests = self
+            .b
+            .threads
+            .list_own_attachment_manifests(thread_id)
+            .await?;
+        for (rkey, manifest) in own_manifests {
+            let (_, meta) = manifest.to_meta()?;
+            let ciphertext = self
+                .b
+                .threads
+                .get_attachment_verified(thread_id, &self.did, &rkey)
+                .await?;
+            let new_cid = self
+                .b
+                .mailbox
+                .upload_and_commit_owner_attachment(&rkey, &ciphertext, &meta, &manifest.created_at)
+                .await?;
+            rearchived_blob_cids.push(new_cid);
+            attachments_archived += 1;
+        }
+
+        self.b.threads.clear_records(thread_id).await?;
+
+        Ok(LeaveArchiveReport {
+            messages_archived,
+            attachments_archived,
+            rearchived_blob_cids,
+        })
+    }
+
+    async fn rearchive_messages_before_leave_inner(&mut self, thread_id: &str) -> Result<usize> {
+        self.sync_epochs().await?;
         if self
             .owner_outbox
             .values()
@@ -91,35 +135,111 @@ impl Labyrinth {
         {
             return Err(Error::WrongEpoch);
         }
-        let history = self.load_thread(thread_id, TimeRange::ALL)?;
-        // What the owner archive already holds, by (messageId, frame): a
-        // copy counts as archived only if its plaintext is byte-equal, so
-        // two distinct messages sharing an id are both kept.
-        let mut owner = ThreadHistory::default();
-        let batches = self
+
+        let mut h = ThreadHistory {
+            space_readable: true,
+            ..ThreadHistory::default()
+        };
+        let batches = self.readable(
+            &mut h,
+            self.b
+                .threads
+                .list_batches(thread_id, None, TimeRange::ALL)
+                .await,
+        )?;
+        let owner_batches = self
             .b
             .mailbox
-            .list_owner_batches(thread_id, TimeRange::ALL)?;
-        self.open_owner_batches(thread_id, batches, &|_, _| true, &mut owner)?;
+            .list_owner_batches(thread_id, TimeRange::ALL)
+            .await?;
+        let mut owner = ThreadHistory::default();
+        let tombstones = self
+            .open_owner_batches(thread_id, owner_batches, &|_, _| true, &mut owner)
+            .await?;
+
+        let hidden = |id: &str, sender: Option<&str>| {
+            tombstones
+                .iter()
+                .any(|(t, author)| t == id && (author.is_none() || author.as_deref() == sender))
+        };
+
         let mut archived: HashSet<(String, Vec<u8>)> = owner
             .messages
             .into_iter()
+            .filter(|m| m.source == MessageSource::Owner)
             .map(|m| (m.message_id, m.frame))
             .collect();
-        let mut n = 0;
-        for m in history.messages {
-            if m.source != MessageSource::Sender {
+
+        let epoch = self.epoch_secret(self.latest).await?;
+        let mut candidates: Vec<(u64, String, OpenedSealed)> = Vec::new();
+        for b in batches {
+            if b.value.thread_id != thread_id {
                 continue;
             }
-            let key = (m.message_id, m.frame);
-            if archived.contains(&key) {
+            let Ok(entries) = b.value.entries() else {
                 continue;
+            };
+            for entry in entries {
+                let BatchEntry::Sealed(s) = entry else {
+                    continue;
+                };
+                if hidden(&s.message_id, Some(&b.author)) {
+                    continue;
+                }
+                let at = VouchAt::of(b.order, s.timestamp);
+                if let Ok(opened) = self.open_sealed_inner(thread_id, &b.author, &s, at).await {
+                    candidates.push((s.timestamp, s.message_id, opened));
+                }
             }
-            self.archive_owner_synced(thread_id, &key.0, m.timestamp, &key.1)?;
-            archived.insert(key);
-            n += 1;
         }
-        self.flush_owner(thread_id)?;
+        candidates.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+
+        let mut n = 0;
+        for (timestamp, message_id, opened) in candidates {
+            match opened {
+                OpenedSealed::Plain(frame) => {
+                    let key = (message_id, frame);
+                    if archived.contains(&key) {
+                        continue;
+                    }
+                    let m = seal_owner(
+                        epoch.root(),
+                        epoch.seq,
+                        thread_id,
+                        &key.0,
+                        timestamp,
+                        &key.1,
+                    )?;
+                    self.queue_owner(thread_id, m).await?;
+                    archived.insert(key);
+                    n += 1;
+                }
+                OpenedSealed::Committed {
+                    frame_nonce,
+                    frame,
+                    receipt,
+                } => {
+                    let key = (message_id, frame);
+                    if archived.contains(&key) {
+                        continue;
+                    }
+                    let m = seal_owner_committed(
+                        epoch.root(),
+                        epoch.seq,
+                        thread_id,
+                        &key.0,
+                        timestamp,
+                        &frame_nonce,
+                        &key.1,
+                        &receipt,
+                    )?;
+                    self.queue_owner(thread_id, m).await?;
+                    archived.insert(key);
+                    n += 1;
+                }
+            }
+        }
+        self.flush_owner(thread_id).await?;
         Ok(n)
     }
 }

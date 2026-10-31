@@ -329,7 +329,7 @@ impl OwnerBatch {
     pub fn to_messages(&self) -> Result<Vec<OwnerMessage>> {
         check_type(&self.type_, nsid::OWNER_BATCH)?;
         self.check()?;
-        Ok(self.items.iter().map(OwnerMessageDef::to_message).collect())
+        self.items.iter().map(OwnerMessageDef::to_message).collect()
     }
 
     fn check(&self) -> Result<()> {
@@ -343,6 +343,62 @@ impl OwnerBatch {
             super::check_epoch_number(i.epoch_number)?;
         }
         Ok(())
+    }
+}
+
+/// `blue.catbird.labyrinth.otcSession`, ephemeral hybrid PQ OTC pairing session (`I16`, Gate 3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OtcSession {
+    #[serde(rename = "$type")]
+    pub type_: String,
+    pub session_id: String,
+    pub initiator_device_key_pubkey: Bytes,
+    pub ya: Bytes,
+    pub ek_otc: Bytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yb: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem_ct: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_payload: Option<Bytes>,
+    pub expires_at: String,
+    pub created_at: String,
+}
+
+impl OtcSession {
+    pub fn check(&self) -> Result<()> {
+        check_type(&self.type_, nsid::OTC_SESSION)?;
+        if self.session_id.is_empty() || self.session_id.len() > 64 {
+            return Err(Error::Malformed("otcSession sessionId length"));
+        }
+        let _ = self
+            .initiator_device_key_pubkey
+            .array::<32>("otcSession initiatorDeviceKeyPubkey length")?;
+        let _ = self.ya.array::<32>("otcSession ya length")?;
+        let _ = self.ek_otc.array::<1184>("otcSession ekOtc length")?;
+        match (&self.yb, &self.kem_ct, &self.sealed_payload) {
+            (None, None, None) => {}
+            (Some(yb), Some(kem_ct), Some(sealed)) => {
+                let _ = yb.array::<32>("otcSession yb length")?;
+                let _ = kem_ct.array::<1088>("otcSession kemCt length")?;
+                if sealed.0.is_empty() || sealed.0.len() > 4096 {
+                    return Err(Error::Malformed("otcSession sealedPayload length"));
+                }
+            }
+            _ => {
+                return Err(Error::Malformed(
+                    "otcSession responder fields must come together",
+                ));
+            }
+        }
+        let _ = super::ms_from_datetime(&self.expires_at)?;
+        let _ = super::ms_from_datetime(&self.created_at)?;
+        Ok(())
+    }
+
+    pub fn rkey(&self) -> &str {
+        &self.session_id
     }
 }
 

@@ -1,21 +1,20 @@
-//! The PDS × mls-ds directory cross-check ([CB-28], [CB-29]), head
-//! publishing to both directories, and the client's ORF server calls
-//! ([CB-17]). Design: `docs/MLSDS_BACKEND.md` §1a, §1c, §6.
+//! The PDS × mls-ds directory cross-check ([CB-28], [CB-29], Gate 6), head
+//! publishing to both directories, and hybrid PQ `otcSession` mailbox Space
+//! enrollment (`Gate 3`, `2A` ORF retired).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use futures::executor::block_on;
 use labyrinth::Error;
 use labyrinth::client::{Backends, Clock, CompositeDirectory, Labyrinth};
 use labyrinth::mailbox::{EpochPublic, MailboxKeys};
-use labyrinth::records::{
-    Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, VirtualDevice,
-};
-use labyrinth::sign::{Ed25519Transport, XVerifyingKey};
-use labyrinth::store::memory::{MemoryBackend, MemoryDirectory, MemoryMailbox};
-use labyrinth::store::{
-    ChatDeviceKey, KeyPublisher, MailboxDirectory, MailboxStore, Stored, TimeRange,
-};
+use labyrinth::records::MailboxKeysRecord;
+use labyrinth::sign::Ed25519Transport;
+use labyrinth::store::memory::{MemoryBackend, MemoryDirectory};
+use labyrinth::store::space::host::MemorySpaceHost;
+use labyrinth::store::space::{SpaceMailboxStore, SpaceRef};
+use labyrinth::store::{ChatDeviceKey, KeyPublisher, MailboxDirectory, MailboxStore};
 use labyrinth::virtual_device::Mechanism;
 
 const A: &str = "did:plc:alice";
@@ -41,14 +40,13 @@ fn tpub(seed: u8) -> [u8; 32] {
 fn backends(
     net: &MemoryBackend,
     did: &str,
-    mailbox: Box<dyn MailboxStore + Send>,
-    directory: Box<dyn MailboxDirectory + Send>,
+    mailbox: Box<dyn MailboxStore>,
+    directory: Box<dyn MailboxDirectory>,
 ) -> Backends {
     Backends {
         mailbox,
         threads: Box::new(net.threads(did)),
         directory,
-        orf: Box::new(net.orf(did)),
         publishers: vec![Box::new(net.ds_publisher(did))],
         clock: Box::new(TestClock::default()),
     }
@@ -64,7 +62,7 @@ fn composite(net: &MemoryBackend) -> Box<CompositeDirectory> {
 fn init(net: &MemoryBackend, did: &str, seed: u8) -> Labyrinth {
     net.register_chat_device(did, tpub(seed));
     let b = backends(net, did, Box::new(net.mailbox(did)), composite(net));
-    Labyrinth::initialize(did, Box::new(signer(seed)), b).unwrap()
+    block_on(Labyrinth::initialize(did, Box::new(signer(seed)), b)).unwrap()
 }
 
 fn enroll_otc(net: &MemoryBackend, existing: &mut Labyrinth, seed: u8) -> Labyrinth {
@@ -72,136 +70,137 @@ fn enroll_otc(net: &MemoryBackend, existing: &mut Labyrinth, seed: u8) -> Labyri
     let mut r = existing.otc_offer().unwrap();
     let typed = r.code().as_str().to_owned();
     let (init, hello) = Labyrinth::otc_start(&did, &typed).unwrap();
-    let reply = existing.otc_respond(&mut r, &hello).unwrap();
+    let reply = block_on(existing.otc_respond(&mut r, &hello)).unwrap();
     net.register_chat_device(&did, tpub(seed));
     let b = backends(net, &did, Box::new(net.mailbox(&did)), composite(net));
-    Labyrinth::enroll_via_otc(
+    block_on(Labyrinth::enroll_via_otc(
         &did,
         init,
         &reply.message,
         &reply.sealed_payload,
         Box::new(signer(seed)),
         b,
-    )
+    ))
     .unwrap()
     .0
 }
 
-/// A PDS that hides every epoch after `max_seq`, in the mailbox and in
-/// `mailboxKeys` alike (it hosts both).
-struct TruncatingPds {
-    mailbox: MemoryMailbox,
-    pds: MemoryDirectory,
-    max_seq: u64,
-}
-
-impl MailboxStore for TruncatingPds {
-    fn owner(&self) -> &str {
-        self.mailbox.owner()
-    }
-    fn create_device(&self, d: &Device) -> labyrinth::Result<()> {
-        self.mailbox.create_device(d)
-    }
-    fn set_device_revoked(&self, k: &XVerifyingKey, at: &str) -> labyrinth::Result<()> {
-        self.mailbox.set_device_revoked(k, at)
-    }
-    fn get_device(&self, k: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
-        self.mailbox.get_device(k)
-    }
-    fn list_devices(&self) -> labyrinth::Result<Vec<Device>> {
-        self.mailbox.list_devices()
-    }
-    fn create_epoch(&self, e: &Epoch, m: &[EpochMember]) -> labyrinth::Result<String> {
-        self.mailbox.create_epoch(e, m)
-    }
-    fn get_epoch(&self, seq: u64) -> labyrinth::Result<Option<Stored<Epoch>>> {
-        Ok(self.mailbox.get_epoch(seq)?.filter(|_| seq <= self.max_seq))
-    }
-    fn list_epochs(&self) -> labyrinth::Result<Vec<Stored<Epoch>>> {
-        let mut v = self.mailbox.list_epochs()?;
-        v.retain(|e| e.value.seq() <= self.max_seq);
-        Ok(v)
-    }
-    fn create_epoch_member(&self, m: &EpochMember) -> labyrinth::Result<()> {
-        self.mailbox.create_epoch_member(m)
-    }
-    fn list_epoch_members(&self, seq: u64) -> labyrinth::Result<Vec<EpochMember>> {
-        self.mailbox.list_epoch_members(seq)
-    }
-    fn create_virtual_device(&self, v: &VirtualDevice) -> labyrinth::Result<()> {
-        self.mailbox.create_virtual_device(v)
-    }
-    fn get_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<Option<VirtualDevice>> {
-        self.mailbox.get_virtual_device(id)
-    }
-    fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
-        self.mailbox.list_virtual_devices()
-    }
-    fn append_owner_batch(&self, b: &OwnerBatch) -> labyrinth::Result<String> {
-        self.mailbox.append_owner_batch(b)
-    }
-    fn list_owner_batches(
-        &self,
-        t: &str,
-        r: TimeRange,
-    ) -> labyrinth::Result<Vec<Stored<OwnerBatch>>> {
-        self.mailbox.list_owner_batches(t, r)
-    }
-    fn publish_mailbox_keys(&self, r: &MailboxKeysRecord) -> labyrinth::Result<()> {
-        self.mailbox.publish_mailbox_keys(r)
-    }
-}
-
-impl MailboxDirectory for TruncatingPds {
-    fn latest(&self, did: &str) -> labyrinth::Result<Option<EpochPublic>> {
-        self.epoch(did, self.max_seq)
-    }
-    fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
-        Ok(self.pds.epoch(did, seq)?.filter(|_| seq <= self.max_seq))
-    }
-    fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
-        self.pds.device_transport_keys(did)
-    }
-}
-
-fn truncating(net: &MemoryBackend) -> TruncatingPds {
-    TruncatingPds {
-        mailbox: net.mailbox(A),
-        pds: net.directory(),
-        max_seq: 0,
-    }
-}
-
 #[test]
 fn composite_directory_detects_truncation_by_the_mailbox_host() {
-    let net = MemoryBackend::new();
-    let mut phone = init(&net, A, 1);
-    let code = phone
-        .create_recovery_code(Mechanism::Code)
+    let space_host = MemorySpaceHost::new();
+    let pds_net = MemoryBackend::new();
+    let ds_net = MemoryBackend::new();
+    let space = SpaceRef::mailbox(A);
+
+    let reg = |seed: u8| {
+        pds_net.register_chat_device(A, tpub(seed));
+        ds_net.register_chat_device(A, tpub(seed));
+    };
+    let make_backends = |with_ds_cross_check: bool| -> Backends {
+        let mb = SpaceMailboxStore::for_owner(
+            A,
+            space_host.client(A),
+            Box::new(pds_net.pds_publisher(A)),
+        );
+        let dir: Box<dyn MailboxDirectory> = if with_ds_cross_check {
+            Box::new(CompositeDirectory::new(
+                Box::new(pds_net.directory()),
+                Box::new(ds_net.ds_directory()),
+            ))
+        } else {
+            Box::new(pds_net.directory())
+        };
+        let publishers: Vec<Box<dyn KeyPublisher>> = if with_ds_cross_check {
+            vec![Box::new(ds_net.ds_publisher(A))]
+        } else {
+            vec![]
+        };
+        Backends {
+            mailbox: Box::new(mb),
+            threads: Box::new(pds_net.threads(A)),
+            directory: dir,
+            publishers,
+            clock: Box::new(TestClock::default()),
+        }
+    };
+
+    reg(1);
+    let mut phone = block_on(Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        make_backends(true),
+    ))
+    .unwrap();
+    let e0_pub = phone.latest_public().unwrap();
+    let code = block_on(phone.create_recovery_code(Mechanism::Code))
         .unwrap()
         .code
         .as_str()
         .to_owned();
-    let mut laptop = enroll_otc(&net, &mut phone, 2);
-    laptop
-        .revoke_device(&phone.device_public().device_key_pub)
-        .unwrap();
-    // Epoch 1 reached both directories.
-    assert_eq!(net.directory().latest(A).unwrap().unwrap().seq, 1);
-    assert_eq!(net.ds_directory().latest(A).unwrap().unwrap().seq, 1);
 
-    // A PDS that hosts the mailbox and the public record can hide epoch 1
-    // from a restoring device when it is the only directory ...
-    let restore = |directory: Box<dyn MailboxDirectory + Send>, seed: u8| {
-        net.register_chat_device(A, tpub(seed));
-        let b = backends(&net, A, Box::new(truncating(&net)), directory);
-        Labyrinth::restore_with_recovery_code(A, &code, Box::new(signer(seed)), b).map(|_| ())
-    };
-    restore(Box::new(truncating(&net)), 5).unwrap();
-    // ... but not once mls-ds's head chain is cross-checked.
-    let dir = CompositeDirectory::new(Box::new(truncating(&net)), Box::new(net.ds_directory()));
+    // Enroll laptop (opens epoch 1) and revoke phone (opens epoch 2).
+    let mut r = phone.otc_offer().unwrap();
+    let typed = r.code().as_str().to_owned();
+    let (init_otc, hello) = Labyrinth::otc_start(A, &typed).unwrap();
+    let reply = block_on(phone.otc_respond(&mut r, &hello)).unwrap();
+    reg(2);
+    let (mut laptop, _) = block_on(Labyrinth::enroll_via_otc(
+        A,
+        init_otc,
+        &reply.message,
+        &reply.sealed_payload,
+        Box::new(signer(2)),
+        make_backends(true),
+    ))
+    .unwrap();
+    block_on(laptop.revoke_device(&phone.device_public().device_key_pub)).unwrap();
+
+    // Epoch 2 reached both directories.
     assert_eq!(
-        restore(Box::new(dir), 6).unwrap_err(),
+        block_on(pds_net.directory().latest(A))
+            .unwrap()
+            .unwrap()
+            .seq,
+        2
+    );
+    assert_eq!(
+        block_on(ds_net.ds_directory().latest(A))
+            .unwrap()
+            .unwrap()
+            .seq,
+        2
+    );
+
+    // Malicious PDS rolls back the mailbox Space and its `mailboxKeys` view to epoch 0,
+    // hiding epochs 1 and 2 while `mls-ds` retains epoch 2.
+    for rkey in ["000000000001", "000000000002"] {
+        let _ = space_host.remove(&space, A, labyrinth::records::nsid::EPOCH, rkey);
+    }
+    // Build a truncated PDS directory view serving only `e0_pub`.
+    let truncated_pds = || FixedForDid {
+        did: A,
+        fixed: FixedPds::all(vec![e0_pub.clone()]),
+        fallback: pds_net.directory(),
+    };
+
+    // With `CompositeDirectory` cross-checking `mls-ds`, the truncation is caught immediately!
+    reg(6);
+    let mut b_checked = make_backends(true);
+    b_checked.directory = Box::new(CompositeDirectory::new(
+        Box::new(truncated_pds()),
+        Box::new(ds_net.ds_directory()),
+    ));
+    let err = match block_on(Labyrinth::restore_with_recovery_code(
+        A,
+        &code,
+        Box::new(signer(6)),
+        b_checked,
+    )) {
+        Ok(_) => panic!("expected truncation to be caught by CompositeDirectory"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err,
         Error::DirectoryIncomplete {
             pds_present: false,
             ds_present: true,
@@ -232,35 +231,40 @@ struct FixedForDid {
     fallback: MemoryDirectory,
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl MailboxDirectory for FixedForDid {
-    fn latest(&self, did: &str) -> labyrinth::Result<Option<EpochPublic>> {
+    async fn latest(&self, did: &str) -> labyrinth::Result<Option<EpochPublic>> {
         if did == self.did {
-            self.fixed.latest(did)
+            self.fixed.latest(did).await
         } else {
-            self.fallback.latest(did)
+            self.fallback.latest(did).await
         }
     }
 
-    fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
+    async fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
         if did == self.did {
-            self.fixed.epoch(did, seq)
+            self.fixed.epoch(did, seq).await
         } else {
-            self.fallback.epoch(did, seq)
+            self.fallback.epoch(did, seq).await
         }
     }
 
-    fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
-        self.fallback.device_transport_keys(did)
+    async fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
+        self.fallback.device_transport_keys(did).await
     }
 }
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl MailboxDirectory for FixedPds {
-    fn latest(&self, _: &str) -> labyrinth::Result<Option<EpochPublic>> {
+    async fn latest(&self, _: &str) -> labyrinth::Result<Option<EpochPublic>> {
         Ok(self.latest.clone())
     }
-    fn epoch(&self, _: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
+    async fn epoch(&self, _: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
         Ok(self.epochs.iter().find(|e| e.seq == seq).cloned())
     }
-    fn device_transport_keys(&self, _: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
+    async fn device_transport_keys(&self, _: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
         Ok(vec![])
     }
 }
@@ -279,8 +283,8 @@ fn composite_directory_rejects_one_sided_latest_and_epoch() {
         pds_present: true,
         ds_present: false,
     };
-    assert_eq!(pds_only.latest(A), Err(missing_ds.clone()));
-    assert_eq!(pds_only.epoch(A, 0), Err(missing_ds));
+    assert_eq!(block_on(pds_only.latest(A)), Err(missing_ds.clone()));
+    assert_eq!(block_on(pds_only.epoch(A, 0)), Err(missing_ds));
 
     let ds_only = CompositeDirectory::new(
         Box::new(FixedPds::all(vec![])),
@@ -290,28 +294,28 @@ fn composite_directory_rejects_one_sided_latest_and_epoch() {
         pds_present: false,
         ds_present: true,
     };
-    assert_eq!(ds_only.latest(A), Err(missing_pds.clone()));
-    assert_eq!(ds_only.epoch(A, 0), Err(missing_pds));
+    assert_eq!(block_on(ds_only.latest(A)), Err(missing_pds.clone()));
+    assert_eq!(block_on(ds_only.epoch(A, 0)), Err(missing_pds));
 
     let neither = CompositeDirectory::new(
         Box::new(FixedPds::all(vec![])),
         Box::new(FixedPds::all(vec![])),
     );
-    assert_eq!(neither.latest(A), Ok(None));
-    assert_eq!(neither.epoch(A, 0), Ok(None));
+    assert_eq!(block_on(neither.latest(A)), Ok(None));
+    assert_eq!(block_on(neither.epoch(A, 0)), Ok(None));
 
     let pds_tofu = CompositeDirectory::new_allowing_single_source(
         Box::new(FixedPds::all(vec![e0.clone()])),
         Box::new(FixedPds::all(vec![])),
     );
-    assert_eq!(pds_tofu.latest(A), Ok(Some(e0.clone())));
-    assert_eq!(pds_tofu.epoch(A, 0), Ok(Some(e0.clone())));
+    assert_eq!(block_on(pds_tofu.latest(A)), Ok(Some(e0.clone())));
+    assert_eq!(block_on(pds_tofu.epoch(A, 0)), Ok(Some(e0.clone())));
     let ds_tofu = CompositeDirectory::new_allowing_single_source(
         Box::new(FixedPds::all(vec![])),
         Box::new(FixedPds::all(vec![e0.clone()])),
     );
-    assert_eq!(ds_tofu.latest(A), Ok(Some(e0.clone())));
-    assert_eq!(ds_tofu.epoch(A, 0), Ok(Some(e0)));
+    assert_eq!(block_on(ds_tofu.latest(A)), Ok(Some(e0.clone())));
+    assert_eq!(block_on(ds_tofu.epoch(A, 0)), Ok(Some(e0)));
 }
 
 #[test]
@@ -319,24 +323,19 @@ fn composite_directory_accepts_only_a_verified_chain() {
     let net = MemoryBackend::new();
     let mut laptop = init(&net, A, 1);
     let e0 = laptop.latest_public().unwrap();
+    // Gate 3: enrolling `phone` opens epoch 1; revoking `phone` opens epoch 2.
     let phone = enroll_otc(&net, &mut laptop, 2);
-    let tablet = enroll_otc(&net, &mut laptop, 3);
-    for d in [&phone, &tablet] {
-        laptop
-            .revoke_device(&d.device_public().device_key_pub)
-            .unwrap();
-    }
-    let e1 = net.ds_directory().epoch(A, 1).unwrap().unwrap();
+    block_on(laptop.revoke_device(&phone.device_public().device_key_pub)).unwrap();
+    let e1 = block_on(net.ds_directory().epoch(A, 1)).unwrap().unwrap();
     let e2 = laptop.latest_public().unwrap();
+    assert_eq!(e2.seq, 2);
     let dir = |pds: Vec<EpochPublic>| {
         CompositeDirectory::new(Box::new(FixedPds::all(pds)), Box::new(net.ds_directory()))
     };
 
     // Equal heads pass.
     assert_eq!(
-        dir(vec![e0.clone(), e1.clone(), e2.clone()])
-            .latest(A)
-            .unwrap(),
+        block_on(dir(vec![e0.clone(), e1.clone(), e2.clone()]).latest(A)).unwrap(),
         Some(e2.clone())
     );
 
@@ -350,7 +349,7 @@ fn composite_directory_accepts_only_a_verified_chain() {
         Box::new(net.ds_directory()),
     );
     assert_eq!(
-        missing_endpoint.latest(A),
+        block_on(missing_endpoint.latest(A)),
         Err(Error::DirectoryIncomplete {
             pds_present: false,
             ds_present: true,
@@ -367,7 +366,7 @@ fn composite_directory_accepts_only_a_verified_chain() {
         }),
         Box::new(net.ds_directory()),
     );
-    assert_eq!(lagging.latest(A).unwrap(), Some(e2.clone()));
+    assert_eq!(block_on(lagging.latest(A)).unwrap(), Some(e2.clone()));
 
     // A mutable newer head with its required immutable endpoint missing
     // from both sources is incomplete evidence, not a per-recipient trust
@@ -383,7 +382,7 @@ fn composite_directory_accepts_only_a_verified_chain() {
         }),
     );
     assert_eq!(
-        missing_everywhere.latest(A),
+        block_on(missing_everywhere.latest(A)),
         Err(Error::DirectoryIncomplete {
             pds_present: false,
             ds_present: false,
@@ -395,7 +394,7 @@ fn composite_directory_accepts_only_a_verified_chain() {
         Box::new(FixedPds::all(vec![])),
         Box::new(net.ds_directory()),
     );
-    assert_eq!(degraded.latest(A).unwrap(), Some(e2.clone()));
+    assert_eq!(block_on(degraded.latest(A)).unwrap(), Some(e2.clone()));
 
     // A different, validly attested epoch 0 (the PDS lies): a fork, both
     // at the head and along the chain to mls-ds's newer head.
@@ -403,6 +402,7 @@ fn composite_directory_accepts_only_a_verified_chain() {
         A,
         0,
         &MailboxKeys::derive(&[9; 32], 0),
+        [0u8; 32],
         None,
         None,
         &signer(1),
@@ -419,11 +419,11 @@ fn composite_directory_accepts_only_a_verified_chain() {
         )
     };
     assert_eq!(
-        forked(forged.clone()).latest(A).unwrap_err(),
+        block_on(forked(forged.clone()).latest(A)).unwrap_err(),
         Error::DirectoryFork { pds: 0, ds: 2 }
     );
     assert_eq!(
-        forked(forged).epoch(A, 0).unwrap_err(),
+        block_on(forked(forged).epoch(A, 0)).unwrap_err(),
         Error::DirectoryFork { pds: 0, ds: 0 }
     );
 
@@ -432,6 +432,7 @@ fn composite_directory_accepts_only_a_verified_chain() {
         A,
         0,
         &MailboxKeys::derive(&[8; 32], 0),
+        [0u8; 32],
         None,
         None,
         &signer(1),
@@ -448,9 +449,9 @@ fn composite_directory_accepts_only_a_verified_chain() {
     };
     let peer_fork = CompositeDirectory::new(Box::new(pds), Box::new(net.ds_directory()));
     let b = backends(&net, B, Box::new(net.mailbox(B)), Box::new(peer_fork));
-    let mut bob = Labyrinth::initialize(B, Box::new(signer(4)), b).unwrap();
+    let mut bob = block_on(Labyrinth::initialize(B, Box::new(signer(4)), b)).unwrap();
     assert_eq!(
-        bob.resolve_roster(&[A, B]).unwrap_err(),
+        block_on(bob.resolve_roster(&[A, B])).unwrap_err(),
         Error::DirectoryFork { pds: 0, ds: 2 }
     );
 }
@@ -467,6 +468,7 @@ fn archive_outgoing_rejects_a_roster_not_anchored_in_the_directory() {
         B,
         0,
         &MailboxKeys::derive(&[9; 32], 0),
+        [0u8; 32],
         None,
         None,
         &signer(2),
@@ -476,8 +478,7 @@ fn archive_outgoing_rejects_a_roster_not_anchored_in_the_directory() {
     assert_ne!(substituted.head, bob.latest_public().unwrap().head);
 
     assert!(
-        alice
-            .archive_outgoing("t", &[(B.to_owned(), substituted)], "m", 1, b"secret")
+        block_on(alice.archive_outgoing("t", &[(B.to_owned(), substituted)], "m", 1, b"secret"))
             .is_err()
     );
     assert_eq!(alice.pending("t"), 0);
@@ -488,11 +489,10 @@ fn ds_publisher_enforces_the_head_chain() {
     let net = MemoryBackend::new();
     let mut laptop = init(&net, A, 1);
     let e0 = laptop.latest_public().unwrap();
-    let phone = enroll_otc(&net, &mut laptop, 2);
-    laptop
-        .revoke_device(&phone.device_public().device_key_pub)
-        .unwrap();
+    let vd = block_on(laptop.create_recovery_code(Mechanism::Code)).unwrap();
+    block_on(laptop.remove_recovery_method(&vd.vdevice_id)).unwrap();
     let e1 = laptop.latest_public().unwrap();
+    assert_eq!(e1.seq, 1);
     let rec = |e: &EpochPublic| {
         MailboxKeysRecord::from_public(e, None, "2026-10-04T00:00:00.000Z".into())
     };
@@ -501,58 +501,77 @@ fn ds_publisher_enforces_the_head_chain() {
     let p = fresh.ds_publisher(A);
     // Not contiguous: epoch 1 before epoch 0.
     assert_eq!(
-        p.publish(&rec(&e1)),
+        block_on(p.publish(&rec(&e1))),
         Err(Error::Malformed("InvalidEpochChain"))
     );
-    p.publish(&rec(&e0)).unwrap();
-    p.publish(&rec(&e0)).unwrap(); // identical bytes are idempotent
+    block_on(p.publish(&rec(&e0))).unwrap();
+    block_on(p.publish(&rec(&e0))).unwrap(); // identical bytes are idempotent
     let other = EpochPublic::sign(
         A,
         0,
         &MailboxKeys::derive(&[7; 32], 0),
+        [0u8; 32],
         None,
         None,
         &signer(1),
     )
     .unwrap();
-    assert_eq!(p.publish(&rec(&other)), Err(Error::Conflict));
+    assert_eq!(block_on(p.publish(&rec(&other))), Err(Error::Conflict));
     // Only a current chat device of the DID may attest a head.
     fresh.remove_chat_device(A, tpub(1), 1);
-    assert_eq!(p.publish(&rec(&e1)), Err(Error::Unattested));
+    assert_eq!(block_on(p.publish(&rec(&e1))), Err(Error::Unattested));
 }
 
 #[test]
-fn client_registers_and_deletes_orf_states() {
+fn otc_session_enrolls_sibling_and_cleans_up_atomically() {
+    use labyrinth::records::{Bytes, OtcSession, nsid};
+
     let net = MemoryBackend::new();
     let mut phone = init(&net, A, 1);
-    let orf = net.orf(A);
-    let phone_key = phone.device_public().device_key_pub;
-    assert!(orf.has_state(&phone_key));
-    let orf_out = |l: &Labyrinth| l.orf_evaluate(b"attachment_key_scope", b"server", b"blob-1");
-    let base = orf_out(&phone).unwrap();
+    let mut responder = phone.otc_offer().unwrap();
+    let typed = responder.code().as_str().to_owned();
+    let (initiator, hello) = Labyrinth::otc_start(A, &typed).unwrap();
+    let reply = block_on(phone.otc_respond(&mut responder, &hello)).unwrap();
 
-    // Bundle, restore and one-time-code enrollment all evolve the state:
-    // the full evaluation is unchanged on every new device.
-    let setup = phone.create_recovery_code(Mechanism::Code).unwrap();
-    let mut laptop = enroll_otc(&net, &mut phone, 2);
-    assert_eq!(orf_out(&laptop).unwrap(), base);
-    net.register_chat_device(A, tpub(3));
-    let b = backends(&net, A, Box::new(net.mailbox(A)), composite(&net));
-    let (tablet, enrollment) =
-        Labyrinth::restore_with_recovery_code(A, setup.code.as_str(), Box::new(signer(3)), b)
-            .unwrap();
-    assert!(orf.has_state(&enrollment.device_key));
-    assert_eq!(orf_out(&tablet).unwrap(), base);
-    assert_ne!(
-        orf_out(&tablet).unwrap(),
-        tablet
-            .orf_evaluate(b"attachment_key_scope", b"server", b"blob-2")
+    // Persist the OTC session in the mailbox Space and enroll via `enroll_via_otc_session`,
+    // proving Gate 3 atomically consumes `otcSession/<session_id>` when opening E+1.
+    let session = OtcSession {
+        type_: nsid::OTC_SESSION.into(),
+        session_id: "sess-clean-slate-1".into(),
+        initiator_device_key_pubkey: Bytes::from_slice(&tpub(2)),
+        ya: Bytes::from_slice(&hello.ya),
+        ek_otc: Bytes::from_slice(&hello.ek_otc),
+        yb: Some(Bytes::from_slice(&reply.message.yb)),
+        kem_ct: Some(Bytes::from_slice(&reply.message.kem_ct)),
+        sealed_payload: Some(Bytes(reply.sealed_payload.clone())),
+        created_at: "2026-10-31T00:00:00.000Z".into(),
+        expires_at: "2026-10-31T00:10:00.000Z".into(),
+    };
+    block_on(net.mailbox(A).put_otc_session(&session)).unwrap();
+    assert!(
+        block_on(net.mailbox(A).get_otc_session("sess-clean-slate-1"))
             .unwrap()
+            .is_some()
     );
 
-    // Revocation deletes the revoked device's server state.
-    laptop.revoke_device(&phone_key).unwrap();
-    assert!(!orf.has_state(&phone_key));
-    assert_eq!(orf_out(&phone).unwrap_err(), Error::NotFound("orf state"));
-    assert_eq!(orf_out(&laptop).unwrap(), base);
+    net.register_chat_device(A, tpub(2));
+    let b = backends(&net, A, Box::new(net.mailbox(A)), composite(&net));
+    let (laptop, enrollment) = block_on(Labyrinth::enroll_via_otc_session(
+        A,
+        initiator,
+        &reply.message,
+        &reply.sealed_payload,
+        Some("sess-clean-slate-1".into()),
+        Box::new(signer(2)),
+        b,
+    ))
+    .unwrap();
+    assert_eq!(laptop.latest_epoch(), 1);
+    assert_eq!(enrollment.device_key, laptop.device_public().device_key_pub);
+    assert!(
+        block_on(net.mailbox(A).get_otc_session("sess-clean-slate-1"))
+            .unwrap()
+            .is_none(),
+        "Gate 3 atomic_enroll must consume the one-shot otcSession record"
+    );
 }

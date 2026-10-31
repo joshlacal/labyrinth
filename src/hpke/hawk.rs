@@ -308,6 +308,7 @@ pub fn hawk_encrypt_with_psk(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn hawk_encrypt_with_psk_deterministic(
     recipient: &HawkEncPublic,
     sender_auth_priv: &HawkAuthSecret,

@@ -1,20 +1,22 @@
 //! The PDS `mailboxKeys` directory and publisher (`store::pds`) over a mock
-//! repo host, cross-checked against mls-ds in a `CompositeDirectory`.
+//! repo host with `swapRecord` CAS, cross-checked against mls-ds in a
+//! `CompositeDirectory`.
 
-#![cfg(feature = "xrpc")]
-
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
+use futures::executor::block_on;
 use labyrinth::Error;
 use labyrinth::client::{Backends, Clock, CompositeDirectory, Labyrinth};
+use labyrinth::records::MailboxKeysRecord;
 use labyrinth::sign::Ed25519Transport;
-use labyrinth::store::MailboxDirectory;
 use labyrinth::store::memory::MemoryBackend;
-use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PdsRecords, epoch_rkey};
-use labyrinth::store::xrpc::server::MemoryXrpcServer;
-use labyrinth::store::xrpc::{XrpcDirectory, XrpcMailboxStore, XrpcOrf, XrpcThreadStore};
+use labyrinth::store::pds::{
+    MemoryPublicRepoHost, PdsDirectory, PdsPublisher, PublicRepoBackend, epoch_rkey,
+};
+use labyrinth::store::space::host::MemorySpaceHost;
+use labyrinth::store::space::{SpaceMailboxStore, SpaceThreadStore};
+use labyrinth::store::{KeyPublisher, MailboxDirectory};
 
 const A: &str = "did:plc:alice";
 const B: &str = "did:plc:bob";
@@ -31,222 +33,190 @@ fn signer(seed: u8) -> Ed25519Transport {
     Ed25519Transport(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]))
 }
 
-/// Every account's repo: (did, rkey) → record bytes.
-type Repos = Arc<Mutex<HashMap<(String, String), Vec<u8>>>>;
-
-/// One signed-in account's view of the PDS network.
-struct MockPds {
-    me: String,
-    repos: Repos,
-}
-
-impl PdsRecords for MockPds {
-    fn put_mailbox_keys(&self, rkey: &str, record: &[u8]) -> Result<(), String> {
-        self.repos
-            .lock()
-            .unwrap()
-            .insert((self.me.clone(), rkey.to_owned()), record.to_vec());
-        Ok(())
-    }
-    fn get_mailbox_keys(&self, did: &str, rkey: &str) -> Result<Option<Vec<u8>>, String> {
-        Ok(self
-            .repos
-            .lock()
-            .unwrap()
-            .get(&(did.to_owned(), rkey.to_owned()))
-            .cloned())
-    }
-    fn delete_all_mailbox_keys(&self) -> Result<(), String> {
-        self.repos.lock().unwrap().retain(|(d, _), _| *d != self.me);
-        Ok(())
-    }
-}
-
-fn setup(s: &MemoryXrpcServer, repos: &Repos, did: &str, seed: u8) -> (Backends, Arc<MockPds>) {
+fn setup(
+    net: &MemoryBackend,
+    spaces: &MemorySpaceHost,
+    repos: &MemoryPublicRepoHost,
+    did: &str,
+    seed: u8,
+) -> Backends {
     let key = signer(seed).0.verifying_key().to_bytes();
-    s.backend().register_chat_device(did, key);
-    let t = s.transport(did, key);
-    let pds = Arc::new(MockPds {
-        me: did.to_owned(),
-        repos: repos.clone(),
-    });
-    let b = Backends {
-        mailbox: Box::new(XrpcMailboxStore::new(did, t.clone())),
-        threads: Box::new(XrpcThreadStore::new(did, t.clone())),
+    net.register_chat_device(did, key);
+    let space_client = spaces.client(did);
+    let pds_client = repos.client(did);
+    let mb = SpaceMailboxStore::for_owner(
+        did,
+        space_client.clone(),
+        Box::new(PdsPublisher::new(pds_client.clone(), did)),
+    );
+    let threads = SpaceThreadStore::new(space_client, did).with_authority_did(did);
+    Backends {
+        mailbox: Box::new(mb),
+        threads: Box::new(threads),
         directory: Box::new(CompositeDirectory::new(
-            Box::new(PdsDirectory::new(pds.clone())),
-            Box::new(XrpcDirectory::new(t.clone())),
+            Box::new(PdsDirectory::new(pds_client)),
+            Box::new(net.ds_directory()),
         )),
-        orf: Box::new(XrpcOrf::new(t)),
-        publishers: vec![Box::new(PdsPublisher::new(did, pds.clone()))],
+        publishers: vec![Box::new(net.ds_publisher(did))],
         clock: Box::new(TestClock::default()),
-    };
-    (b, pds)
+    }
 }
 
 #[test]
 fn pds_records_are_an_independent_directory() {
-    let s = MemoryXrpcServer::new(MemoryBackend::new());
-    let repos = Repos::default();
-    let (ab, apds) = setup(&s, &repos, A, 1);
-    let alice = Labyrinth::initialize(A, Box::new(signer(1)), ab).unwrap();
-    let (bb, _) = setup(&s, &repos, B, 2);
-    let _bob = Labyrinth::initialize(B, Box::new(signer(2)), bb).unwrap();
+    let net = MemoryBackend::new();
+    let spaces = MemorySpaceHost::new();
+    let repos = MemoryPublicRepoHost::new();
+
+    let ab = setup(&net, &spaces, &repos, A, 1);
+    let alice = block_on(Labyrinth::initialize(A, Box::new(signer(1)), ab)).unwrap();
+    let bb = setup(&net, &spaces, &repos, B, 2);
+    let _bob = block_on(Labyrinth::initialize(B, Box::new(signer(2)), bb)).unwrap();
 
     // Both the latest and the per-epoch copy are in Alice's repo.
+    let apds = repos.client(A);
     let pds = PdsDirectory::new(apds.clone());
     let head = alice.latest_public().unwrap().head;
-    assert_eq!(pds.latest(A).unwrap().unwrap().head, head);
-    assert_eq!(pds.epoch(A, 0).unwrap().unwrap().head, head);
+    assert_eq!(block_on(pds.latest(A)).unwrap().unwrap().head, head);
+    assert_eq!(block_on(pds.epoch(A, 0)).unwrap().unwrap().head, head);
     assert!(
-        repos
-            .lock()
+        block_on(apds.get_mailbox_keys(A, &epoch_rkey(0)))
             .unwrap()
-            .contains_key(&(A.into(), epoch_rkey(0)))
+            .is_some()
     );
     assert!(matches!(
-        pds.device_transport_keys(A),
+        block_on(pds.device_transport_keys(A)),
         Err(Error::NotSupported(_))
     ));
 
     // Republishing the same epoch is fine; another one under its number is not.
-    let pub_a = PdsPublisher::new(A, apds.clone());
-    let rec = serde_json::from_slice(&repos.lock().unwrap()[&(A.into(), "self".into())]).unwrap();
-    use labyrinth::store::KeyPublisher as _;
-    pub_a.publish(&rec).unwrap();
+    let pub_a = PdsPublisher::new(apds.clone(), A);
+    let (self_bytes, _) = block_on(apds.get_mailbox_keys(A, "self")).unwrap().unwrap();
+    let rec: MailboxKeysRecord = serde_json::from_slice(&self_bytes).unwrap();
+    block_on(pub_a.publish(&rec)).unwrap();
 
     // A PDS lying about Alice's head is a fork against mls-ds.
-    let bob_key = signer(2).0.verifying_key().to_bytes();
     let composite = CompositeDirectory::new(
         Box::new(PdsDirectory::new(apds.clone())),
-        Box::new(XrpcDirectory::new(s.transport(B, bob_key))),
+        Box::new(net.ds_directory()),
     );
-    assert_eq!(composite.latest(A).unwrap().unwrap().head, head);
-    let bob_self = repos.lock().unwrap()[&(B.into(), "self".into())].clone();
-    repos
-        .lock()
-        .unwrap()
-        .insert((A.into(), "self".into()), bob_self);
-    assert!(composite.latest(A).is_err());
+    assert_eq!(block_on(composite.latest(A)).unwrap().unwrap().head, head);
+    let (bob_self, _) = block_on(apds.get_mailbox_keys(B, "self")).unwrap().unwrap();
+    let (_, a_cid) = block_on(apds.get_mailbox_keys(A, "self")).unwrap().unwrap();
+    block_on(apds.put_mailbox_keys(A, "self", &bob_self, Some(&a_cid))).unwrap();
+    assert!(block_on(composite.latest(A)).is_err());
 
     // Retract removes every record of the signed-in account only.
-    pub_a.retract().unwrap();
-    assert!(pds.latest(A).unwrap().is_none());
-    assert!(pds.latest(B).unwrap().is_some());
+    block_on(pub_a.retract()).unwrap();
+    assert!(block_on(pds.latest(A)).unwrap().is_none());
+    assert!(block_on(pds.latest(B)).unwrap().is_some());
 }
 
 #[test]
 fn pds_publisher_refuses_to_regress_mailbox_keys_self() {
-    use labyrinth::records::MailboxKeysRecord;
-    use labyrinth::store::KeyPublisher as _;
+    let net = MemoryBackend::new();
+    let spaces = MemorySpaceHost::new();
+    let repos = MemoryPublicRepoHost::new();
 
-    let s = MemoryXrpcServer::new(MemoryBackend::new());
-    let repos = Repos::default();
-    let (ab, apds) = setup(&s, &repos, A, 1);
-    let mut alice = Labyrinth::initialize(A, Box::new(signer(1)), ab).unwrap();
+    let ab = setup(&net, &spaces, &repos, A, 1);
+    let mut alice = block_on(Labyrinth::initialize(A, Box::new(signer(1)), ab)).unwrap();
 
-    // Enroll two siblings and revoke both so Alice advances to Epoch 2.
-    for seed in [11u8, 12u8] {
-        let mut r = alice.otc_offer().unwrap();
-        let typed = r.code().as_str().to_owned();
-        let (init, hello) = Labyrinth::otc_start(A, &typed).unwrap();
-        let reply = alice.otc_respond(&mut r, &hello).unwrap();
-        let (sib_b, _) = setup(&s, &repos, A, seed);
-        let (sib, _) = Labyrinth::enroll_via_otc(
-            A,
-            init,
-            &reply.message,
-            &reply.sealed_payload,
-            Box::new(signer(seed)),
-            sib_b,
-        )
-        .unwrap();
-        alice
-            .revoke_device(&sib.device_public().device_key_pub)
-            .unwrap();
-    }
+    // Gate 3: enrolling one sibling opens Epoch 1; revoking it opens Epoch 2.
+    let mut r = alice.otc_offer().unwrap();
+    let typed = r.code().as_str().to_owned();
+    let (init_otc, hello) = Labyrinth::otc_start(A, &typed).unwrap();
+    let reply = block_on(alice.otc_respond(&mut r, &hello)).unwrap();
+    let sib_b = setup(&net, &spaces, &repos, A, 11);
+    let (sib, _) = block_on(Labyrinth::enroll_via_otc(
+        A,
+        init_otc,
+        &reply.message,
+        &reply.sealed_payload,
+        Box::new(signer(11)),
+        sib_b,
+    ))
+    .unwrap();
+    block_on(alice.revoke_device(&sib.device_public().device_key_pub)).unwrap();
     assert_eq!(alice.latest_epoch(), 2);
 
+    let apds = repos.client(A);
     let pds = PdsDirectory::new(apds.clone());
-    assert_eq!(pds.latest(A).unwrap().unwrap().seq, 2);
+    assert_eq!(block_on(pds.latest(A)).unwrap().unwrap().seq, 2);
 
     // Grab Epoch 1's record, remove its per-epoch history copy to simulate an
     // incomplete historical backfill, and replay `publish` for Epoch 1.
-    let e1_bytes = repos
-        .lock()
-        .unwrap()
-        .remove(&(A.into(), epoch_rkey(1)))
-        .unwrap();
+    let e1_bytes = repos.remove_raw(A, &epoch_rkey(1)).unwrap();
     let rec_e1: MailboxKeysRecord = serde_json::from_slice(&e1_bytes).unwrap();
-    let pub_a = PdsPublisher::new(A, apds.clone());
+    let pub_a = PdsPublisher::new(apds, A);
     assert_eq!(
-        pub_a.publish(&rec_e1).unwrap_err(),
+        block_on(pub_a.publish(&rec_e1)).unwrap_err(),
         Error::EpochRollback {
             pinned: 2,
             offered: 1
         }
     );
     // Per-epoch copy `000000000001` WAS backfilled, while `self` stayed at Epoch 2!
-    assert_eq!(pds.epoch(A, 1).unwrap().unwrap().seq, 1);
-    assert_eq!(pds.latest(A).unwrap().unwrap().seq, 2);
+    assert_eq!(block_on(pds.epoch(A, 1)).unwrap().unwrap().seq, 1);
+    assert_eq!(block_on(pds.latest(A)).unwrap().unwrap().seq, 2);
 
     // `finish_initialize` replays 0..=2 without regressing `self` or failing.
-    repos.lock().unwrap().remove(&(A.into(), epoch_rkey(0)));
-    alice.finish_initialize().unwrap();
-    assert_eq!(pds.epoch(A, 0).unwrap().unwrap().seq, 0);
-    assert_eq!(pds.latest(A).unwrap().unwrap().seq, 2);
+    repos.remove_raw(A, &epoch_rkey(0));
+    block_on(alice.finish_initialize()).unwrap();
+    assert_eq!(block_on(pds.epoch(A, 0)).unwrap().unwrap().seq, 0);
+    assert_eq!(block_on(pds.latest(A)).unwrap().unwrap().seq, 2);
 }
 
 #[test]
 fn composite_directory_verifies_epoch_signatures_in_epoch_and_single_source() {
-    use labyrinth::records::MailboxKeysRecord;
+    let net = MemoryBackend::new();
+    let spaces = MemorySpaceHost::new();
+    let repos = MemoryPublicRepoHost::new();
 
-    let s = MemoryXrpcServer::new(MemoryBackend::new());
-    let repos = Repos::default();
-    let (ab, apds) = setup(&s, &repos, A, 1);
-    let _alice = Labyrinth::initialize(A, Box::new(signer(1)), ab).unwrap();
+    let ab = setup(&net, &spaces, &repos, A, 1);
+    let _alice = block_on(Labyrinth::initialize(A, Box::new(signer(1)), ab)).unwrap();
 
     // Tamper `self_sig` in PDS `000000000000` while leaving `epoch_head` intact:
     // `CompositeDirectory::epoch` MUST verify `p.verify(did, None)` and reject!
-    let orig_e0 = repos.lock().unwrap()[&(A.into(), epoch_rkey(0))].clone();
+    let apds = repos.client(A);
+    let (orig_e0, _) = block_on(apds.get_mailbox_keys(A, &epoch_rkey(0)))
+        .unwrap()
+        .unwrap();
     let mut bad_e0: MailboxKeysRecord = serde_json::from_slice(&orig_e0).unwrap();
     bad_e0.current.self_sig.0[0] ^= 1;
-    repos.lock().unwrap().insert(
-        (A.into(), epoch_rkey(0)),
-        serde_json::to_vec(&bad_e0).unwrap(),
-    );
+    repos.force_overwrite(A, &epoch_rkey(0), &bad_e0);
 
-    let bob_key = signer(2).0.verifying_key().to_bytes();
-    s.backend().register_chat_device(B, bob_key);
     let composite = CompositeDirectory::new(
         Box::new(PdsDirectory::new(apds.clone())),
-        Box::new(XrpcDirectory::new(s.transport(B, bob_key))),
+        Box::new(net.ds_directory()),
     );
-    assert_eq!(composite.epoch(A, 0).unwrap_err(), Error::BadSignature);
+    assert_eq!(
+        block_on(composite.epoch(A, 0)).unwrap_err(),
+        Error::BadSignature
+    );
 
     // Single-source fallback (`new_allowing_single_source`) must also verify `e.verify(did, None)`:
     // 1) wrong DID (`ghost`) fails `verify` with `Malformed("epoch head mismatch")`,
     // 2) right DID (`A`) against an empty DS with tampered `self_sig` fails with `BadSignature`.
     let ghost = "did:plc:ghost";
-    repos.lock().unwrap().insert(
-        (ghost.into(), "self".into()),
-        serde_json::to_vec(&bad_e0).unwrap(),
+    repos.force_overwrite(ghost, "self", &bad_e0);
+    repos.force_overwrite(A, "self", &bad_e0);
+    assert_eq!(
+        block_on(composite.latest(A)).unwrap_err(),
+        Error::BadSignature
     );
-    repos.lock().unwrap().insert(
-        (A.into(), "self".into()),
-        serde_json::to_vec(&bad_e0).unwrap(),
-    );
-    assert_eq!(composite.latest(A).unwrap_err(), Error::BadSignature);
-    let empty_s = MemoryXrpcServer::new(MemoryBackend::new());
-    empty_s.backend().register_chat_device(B, bob_key);
+
+    let empty_net = MemoryBackend::new();
     let single = CompositeDirectory::new_allowing_single_source(
         Box::new(PdsDirectory::new(apds)),
-        Box::new(XrpcDirectory::new(empty_s.transport(B, bob_key))),
+        Box::new(empty_net.ds_directory()),
     );
     assert_eq!(
-        single.latest(ghost).unwrap_err(),
+        block_on(single.latest(ghost)).unwrap_err(),
         Error::Malformed("epoch head mismatch")
     );
-    assert_eq!(single.latest(A).unwrap_err(), Error::BadSignature);
-    assert_eq!(single.epoch(A, 0).unwrap_err(), Error::BadSignature);
+    assert_eq!(block_on(single.latest(A)).unwrap_err(), Error::BadSignature);
+    assert_eq!(
+        block_on(single.epoch(A, 0)).unwrap_err(),
+        Error::BadSignature
+    );
 }

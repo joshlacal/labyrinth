@@ -28,7 +28,7 @@ impl Member {
         let mut root = [n; 32];
         root[31] = salt;
         let keys = MailboxKeys::derive(&root, 0);
-        let epoch = EpochPublic::sign(&did, 0, &keys, None, None, &transport).unwrap();
+        let epoch = EpochPublic::sign(&did, 0, &keys, [n; 32], None, None, &transport).unwrap();
         Self {
             did,
             transport,

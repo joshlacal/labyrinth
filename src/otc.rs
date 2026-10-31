@@ -106,6 +106,11 @@ impl OneTimeCode {
         core::str::from_utf8(&self.0).expect("ASCII digits")
     }
 
+    pub fn format_grouped(&self) -> String {
+        let s = self.as_str();
+        format!("{}-{}", &s[..3], &s[3..])
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }

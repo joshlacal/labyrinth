@@ -40,6 +40,7 @@ pub mod state;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+pub use crate::store::LeaveArchiveReport;
 pub use composite::CompositeDirectory;
 pub use delete::{PurgeReport, delete_account_remote};
 pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
@@ -59,48 +60,48 @@ use crate::message::{OwnerMessage, SealedMessage};
 use crate::records::datetime_from_ms;
 use crate::sign::TransportSigner;
 use crate::store::{
-    KeyPublisher, MailboxDirectory, MailboxStore, ThreadStore, VouchAt, keys_valid_for,
+    KeyPublisher, MailboxDirectory, MailboxStore, MaybeSend, MaybeSync, ThreadStore, VouchAt,
+    keys_valid_for,
 };
 use crate::{Error, Result};
 
 /// Wall-clock source (milliseconds since the Unix epoch) for `createdAt`.
-pub trait Clock {
+pub trait Clock: MaybeSend + MaybeSync {
     fn now_ms(&self) -> u64;
 }
 
-/// [`Clock`] backed by [`std::time::SystemTime`].
+/// [`Clock`] backed by [`web_time::SystemTime`] (native + `wasm32`-compatible).
 pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64)
     }
 }
 
 /// Everything the client talks to.
 pub struct Backends {
-    /// The account's own personal mailbox.
-    pub mailbox: Box<dyn MailboxStore + Send>,
-    /// The conversation spaces, writing as this account.
-    pub threads: Box<dyn ThreadStore + Send>,
+    /// The account's own personal mailbox Space.
+    pub mailbox: Box<dyn MailboxStore>,
+    /// The conversation Spaces, writing as this account.
+    pub threads: Box<dyn ThreadStore>,
     /// Discovery of other accounts and of MLS chat devices; a
-    /// [`CompositeDirectory`] over the PDS and mls-ds in production.
-    pub directory: Box<dyn MailboxDirectory + Send>,
-    /// Where every new epoch is published besides
-    /// [`MailboxStore::publish_mailbox_keys`]: the mls-ds directory for a
-    /// Space mailbox, the PDS `mailboxKeys` record for an mls-ds mailbox,
-    /// so both directories stay current ([CB-28]).
-    pub publishers: Vec<Box<dyn KeyPublisher + Send>>,
-    pub clock: Box<dyn Clock + Send>,
+    /// [`CompositeDirectory`] over the PDS and `mls-ds` in production.
+    pub directory: Box<dyn MailboxDirectory>,
+    /// Extra destinations where every new epoch is published besides
+    /// [`MailboxStore::publish_mailbox_keys`], so both directories stay
+    /// current ([CB-28]).
+    pub publishers: Vec<Box<dyn KeyPublisher>>,
+    pub clock: Box<dyn Clock>,
 }
 
 /// One enrolled device of one account.
 pub struct Labyrinth {
     did: String,
     device: DeviceSecrets,
-    transport: Box<dyn TransportSigner + Send>,
+    transport: Box<dyn TransportSigner>,
     b: Backends,
     mailbox_root_salt: [u8; 32],
     /// Epoch secrets this device holds, by sequence number.
@@ -136,6 +137,12 @@ pub struct Labyrinth {
     owner_outbox: BTreeMap<String, Vec<OwnerMessage>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Labyrinth>();
+};
+
 impl core::fmt::Debug for Labyrinth {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Labyrinth")
@@ -149,7 +156,7 @@ impl Labyrinth {
     fn assemble(
         did: &str,
         device: DeviceSecrets,
-        transport: Box<dyn TransportSigner + Send>,
+        transport: Box<dyn TransportSigner>,
         b: Backends,
         mailbox_root_salt: [u8; 32],
         epochs: impl IntoIterator<Item = EpochSecret>,
@@ -215,7 +222,7 @@ impl Labyrinth {
     /// and keeps it as the copy [`latest_public`](Self::latest_public)
     /// returns. When that copy is already held, only finishes a deferred
     /// attester check.
-    fn adopt_latest(&mut self) -> Result<()> {
+    async fn adopt_latest(&mut self) -> Result<()> {
         if self
             .own_latest
             .as_ref()
@@ -223,18 +230,19 @@ impl Labyrinth {
         {
             if !self.own_attester_checked {
                 let public = self.latest_public()?;
-                epochs::check_own_attester(self.b.directory.as_ref(), &self.did, &public)?;
+                epochs::check_own_attester(self.b.directory.as_ref(), &self.did, &public).await?;
                 self.own_attester_checked = true;
             }
             return Ok(());
         }
-        let secret = self.epoch_secret(self.latest)?;
+        let secret = self.epoch_secret(self.latest).await?;
         let public = epochs::verified_own(
             self.b.mailbox.as_ref(),
             self.b.directory.as_ref(),
             &self.did,
             &secret,
-        )?;
+        )
+        .await?;
         self.adopted(public);
         Ok(())
     }
@@ -247,13 +255,13 @@ impl Labyrinth {
 
     /// [`latest_public`](Self::latest_public) after finishing a deferred
     /// attester check: the copy that goes into a roster.
-    fn own_latest_checked(&mut self) -> Result<EpochPublic> {
+    async fn own_latest_checked(&mut self) -> Result<EpochPublic> {
         // A failed revocation deliberately remains in the persisted local
         // revoked set. Before this account contributes a recipient epoch to
         // any new archive, prove that the active epoch excludes every such
         // device; otherwise it may still know the encryption root.
-        self.sync_epochs()?;
-        self.adopt_latest()?;
+        self.sync_epochs().await?;
+        self.adopt_latest().await?;
         self.latest_public()
     }
 
@@ -265,9 +273,9 @@ impl Labyrinth {
     /// one of the DID's chat devices that may vouch at `at` — a current one
     /// for [`VouchAt::Current`], otherwise one not yet revoked when the
     /// record that carries the epoch was written ([CB-27]).
-    fn check_attested(&self, did: &str, epoch: &EpochPublic, at: VouchAt) -> Result<()> {
+    async fn check_attested(&self, did: &str, epoch: &EpochPublic, at: VouchAt) -> Result<()> {
         epoch.verify(did, None)?;
-        let keys = self.transport_keys(did, None, at)?;
+        let keys = self.transport_keys(did, None, at).await?;
         if keys.contains(&epoch.attestation.transport_public_key) {
             Ok(())
         } else {
@@ -279,15 +287,15 @@ impl Labyrinth {
     /// `at` ([CB-27]). With `thread` set and a server stamp, the key must
     /// also have had a leaf in that conversation at the stamp's chat seq
     /// (when the directory reports the conversation's leaves).
-    fn transport_keys(
+    async fn transport_keys(
         &self,
         did: &str,
         thread: Option<&str>,
         at: VouchAt,
     ) -> Result<Vec<[u8; 32]>> {
-        let keys = self.b.directory.device_transport_keys(did)?;
+        let keys = self.b.directory.device_transport_keys(did).await?;
         let (leaves, at) = match (thread, at) {
-            (Some(t), at) => (self.b.directory.member_device_keys(t, did)?, at),
+            (Some(t), at) => (self.b.directory.member_device_keys(t, did).await?, at),
             (None, VouchAt::Server(mut o)) => {
                 o.chat_seq = None;
                 (None, VouchAt::Server(o))
@@ -300,14 +308,14 @@ impl Labyrinth {
     /// [`check_attested`](Self::check_attested) against the DID's
     /// *current* chat devices, then the [CB-29] pin: the epoch a MEK is
     /// about to be addressed to.
-    fn accept_for_addressing(&mut self, did: &str, epoch: &EpochPublic) -> Result<()> {
-        self.check_attested(did, epoch, VouchAt::Current)?;
-        self.pin_peer(did, epoch)
+    async fn accept_for_addressing(&mut self, did: &str, epoch: &EpochPublic) -> Result<()> {
+        self.check_attested(did, epoch, VouchAt::Current).await?;
+        self.pin_peer(did, epoch).await
     }
 
     /// My epoch `seq` (backward-chained if needed) and its mailbox keys.
-    fn my_keys(&mut self, seq: u64) -> Result<(EpochSecret, crate::mailbox::MailboxKeys)> {
-        let e = self.epoch_secret(seq)?;
+    async fn my_keys(&mut self, seq: u64) -> Result<(EpochSecret, crate::mailbox::MailboxKeys)> {
+        let e = self.epoch_secret(seq).await?;
         let keys = e.mailbox_keys();
         Ok((e, keys))
     }

@@ -32,6 +32,7 @@ pub struct TransportSenderDef {
 }
 
 /// The closed `sender` union, tagged by `$type`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum MekSenderDef {
@@ -151,6 +152,7 @@ impl MekDistribution {
 }
 
 /// One item of a [`Batch`].
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchEntry {
     Sealed(SealedMessage),
@@ -238,5 +240,63 @@ impl Batch {
             .iter()
             .map(SealedMessageDef::to_message)
             .collect()
+    }
+}
+
+/// `blue.catbird.labyrinth.attachmentManifest` (`Gate 5`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentManifest {
+    #[serde(rename = "$type")]
+    pub type_: String,
+    pub blob: super::defs::BlobRefDef,
+    pub sha256: Bytes,
+    pub ciphertext_size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type_hint: Option<String>,
+    pub created_at: String,
+}
+
+impl AttachmentManifest {
+    pub fn from_meta(
+        cid: &str,
+        meta: &crate::attachment::AttachmentCiphertextMeta,
+        created_at: String,
+    ) -> Self {
+        let mime = meta
+            .mime_type_hint
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_owned());
+        Self {
+            type_: nsid::ATTACHMENT_MANIFEST.into(),
+            blob: super::defs::BlobRefDef::new(cid, mime, meta.ciphertext_size),
+            sha256: Bytes::from_slice(&meta.sha256),
+            ciphertext_size: meta.ciphertext_size,
+            mime_type_hint: meta.mime_type_hint.clone(),
+            created_at,
+        }
+    }
+
+    pub fn to_meta(&self) -> Result<(String, crate::attachment::AttachmentCiphertextMeta)> {
+        check_type(&self.type_, nsid::ATTACHMENT_MANIFEST)?;
+        self.blob.check()?;
+        if self.ciphertext_size == 0
+            || self.ciphertext_size > crate::attachment::MAX_ATTACHMENT_CIPHERTEXT_SIZE
+            || self.blob.size != self.ciphertext_size
+        {
+            return Err(Error::Malformed("attachmentManifest ciphertextSize"));
+        }
+        let sha256 = self
+            .sha256
+            .array::<32>("attachmentManifest sha256 length")?;
+        let _ = super::ms_from_datetime(&self.created_at)?;
+        Ok((
+            self.blob.cid_link().to_owned(),
+            crate::attachment::AttachmentCiphertextMeta {
+                sha256,
+                ciphertext_size: self.ciphertext_size,
+                mime_type_hint: self.mime_type_hint.clone(),
+            },
+        ))
     }
 }

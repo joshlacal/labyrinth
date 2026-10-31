@@ -72,17 +72,23 @@ impl Labyrinth {
     /// owner copies, a redaction), with delete-for-me applied: an empty
     /// result means it is unknown, unsent ([`ThreadHistory::redacted`]) or
     /// deleted for me ([`ThreadHistory::deleted_for_me`]).
-    pub fn load_message(&mut self, thread_id: &str, message_id: &str) -> Result<ThreadHistory> {
+    pub async fn load_message(
+        &mut self,
+        thread_id: &str,
+        message_id: &str,
+    ) -> Result<ThreadHistory> {
         let mut h = ThreadHistory {
             space_readable: true,
             ..ThreadHistory::default()
         };
         let ids = [message_id];
-        let batches = self.readable(&mut h, self.b.threads.get_messages(thread_id, &ids))?;
+        let batches = self.readable(&mut h, self.b.threads.get_messages(thread_id, &ids).await)?;
         let keep = |id: &str, _| id == message_id;
-        self.open_batches(thread_id, batches, &keep, &mut h)?;
-        let owner = self.b.mailbox.get_owner_messages(thread_id, &ids)?;
-        let tombstones = self.open_owner_batches(thread_id, owner, &keep, &mut h)?;
+        self.open_batches(thread_id, batches, &keep, &mut h).await?;
+        let owner = self.b.mailbox.get_owner_messages(thread_id, &ids).await?;
+        let tombstones = self
+            .open_owner_batches(thread_id, owner, &keep, &mut h)
+            .await?;
         finish(&mut h, &tombstones);
         Ok(h)
     }
@@ -95,7 +101,7 @@ impl Labyrinth {
     /// as in [`load_thread`](Self::load_thread). A page can come back
     /// shorter than `limit` when delete-for-me tombstones hide some of its
     /// positions (tombstones carry their target's position).
-    pub fn load_thread_page(
+    pub async fn load_thread_page(
         &mut self,
         thread_id: &str,
         before: Option<&ThreadCursor>,
@@ -112,12 +118,14 @@ impl Labyrinth {
             &mut h,
             self.b
                 .threads
-                .list_batches_before(thread_id, before_ms, limit),
+                .list_batches_before(thread_id, before_ms, limit)
+                .await,
         )?;
         let owner = self
             .b
             .mailbox
-            .list_owner_batches_before(thread_id, before_ms, limit)?;
+            .list_owner_batches_before(thread_id, before_ms, limit)
+            .await?;
         let mut positions: BTreeSet<(u64, String)> = BTreeSet::new();
         let sender_items = batches
             .iter()
@@ -141,8 +149,10 @@ impl Labyrinth {
                 message_id: id.clone(),
             });
         let keep = |id: &str, ts: u64| selected.contains(&(ts, id.to_owned()));
-        self.open_batches(thread_id, batches, &keep, &mut h)?;
-        let tombstones = self.open_owner_batches(thread_id, owner, &keep, &mut h)?;
+        self.open_batches(thread_id, batches, &keep, &mut h).await?;
+        let tombstones = self
+            .open_owner_batches(thread_id, owner, &keep, &mut h)
+            .await?;
         finish(&mut h, &tombstones);
         h.messages.reverse();
         h.undecryptable.reverse();
@@ -157,8 +167,8 @@ impl Labyrinth {
     /// and with [`Error::Backend`] if a sequencer was unreachable (use
     /// [`list_threads_report`](Self::list_threads_report) for the partial
     /// list).
-    pub fn list_threads(&self) -> Result<Vec<ThreadSummary>> {
-        let list = self.list_threads_report()?;
+    pub async fn list_threads(&self) -> Result<Vec<ThreadSummary>> {
+        let list = self.list_threads_report().await?;
         if list.incomplete.is_empty() {
             Ok(list.threads)
         } else {
@@ -171,17 +181,17 @@ impl Labyrinth {
 
     /// [`list_threads`](Self::list_threads), returning a partial list with
     /// the unreachable sequencers named instead of failing.
-    pub fn list_threads_report(&self) -> Result<ThreadList> {
+    pub async fn list_threads_report(&self) -> Result<ThreadList> {
         let unsupported = |r: Result<Vec<String>>| match r {
             Err(Error::NotSupported(_)) => Ok(None),
             r => r.map(Some),
         };
-        let (sender, incomplete) = match self.b.threads.list_threads_report() {
+        let (sender, incomplete) = match self.b.threads.list_threads_report().await {
             Ok(l) => (Some(l.threads), l.incomplete),
             Err(Error::NotSupported(_)) => (None, Vec::new()),
             Err(e) => return Err(e),
         };
-        let owner = unsupported(self.b.mailbox.list_owner_threads())?;
+        let owner = unsupported(self.b.mailbox.list_owner_threads().await)?;
         if sender.is_none() && owner.is_none() {
             return Err(Error::NotSupported("listThreads"));
         }

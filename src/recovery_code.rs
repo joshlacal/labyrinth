@@ -299,6 +299,11 @@ impl RecoveryCode {
         core::str::from_utf8(&self.chars).expect("ASCII")
     }
 
+    /// Ten space-separated groups of four characters for user display.
+    pub fn format_grouped(&self) -> String {
+        format!("{self:#}")
+    }
+
     /// The 34 entropy characters as ASCII (the KDF input).
     pub fn entropy_chars(&self) -> &[u8] {
         &self.chars[2..2 + ENTROPY_LEN]

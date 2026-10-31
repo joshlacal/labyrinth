@@ -17,12 +17,15 @@ pub mod mailbox;
 pub mod thread;
 
 pub use defs::{
-    EpochPublicDef, MekRecipientDef, OwnerMessageDef, RedactionDef, SealedMessageDef,
-    TransportAttestationDef,
+    BlobRefDef, CidLinkDef, EpochPublicDef, MekRecipientDef, OwnerMessageDef, RedactionDef,
+    SealedMessageDef, SequencerReceiptDef, TransportAttestationDef,
 };
-pub use mailbox::{Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, VirtualDevice};
+pub use mailbox::{
+    Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch, VirtualDevice,
+};
 pub use thread::{
-    Batch, BatchEntry, LabyrinthSenderDef, MekDistribution, MekSenderDef, TransportSenderDef,
+    AttachmentManifest, Batch, BatchEntry, LabyrinthSenderDef, MekDistribution, MekSenderDef,
+    TransportSenderDef,
 };
 
 use base64::Engine as _;
@@ -38,9 +41,11 @@ pub mod nsid {
     pub const EPOCH_MEMBER: &str = "blue.catbird.labyrinth.epochMember";
     pub const VIRTUAL_DEVICE: &str = "blue.catbird.labyrinth.virtualDevice";
     pub const OWNER_BATCH: &str = "blue.catbird.labyrinth.ownerBatch";
+    pub const OTC_SESSION: &str = "blue.catbird.labyrinth.otcSession";
     pub const MAILBOX_KEYS: &str = "blue.catbird.labyrinth.mailboxKeys";
     pub const MEK: &str = "blue.catbird.labyrinth.mek";
     pub const BATCH: &str = "blue.catbird.labyrinth.batch";
+    pub const ATTACHMENT_MANIFEST: &str = "blue.catbird.labyrinth.attachmentManifest";
 }
 
 /// Most messages per `batch` / `ownerBatch` record ([CB-20]).

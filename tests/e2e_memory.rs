@@ -5,16 +5,20 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use futures::executor::block_on;
 use labyrinth::Error;
 use labyrinth::client::{Backends, Clock, Labyrinth, MessageSource};
 use labyrinth::mailbox::{EpochPublic, MailboxKeys};
 use labyrinth::records::{
-    Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, VirtualDevice,
+    Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch, VirtualDevice,
 };
 use labyrinth::recovery_code::ALPHABET;
 use labyrinth::sign::{Ed25519Transport, XVerifyingKey};
 use labyrinth::store::memory::{MemoryBackend, MemoryDirectory, MemoryMailbox};
-use labyrinth::store::{ChatDeviceKey, MailboxDirectory, MailboxStore, Stored, TimeRange};
+use labyrinth::store::{
+    AtomicEnrollBundle, ChatDeviceKey, MailboxDirectory, MailboxStore, MemberDeviceKey,
+    SequencerKey, SequencerReceiptKey, Stored, TimeRange,
+};
 use labyrinth::virtual_device::Mechanism;
 
 const ALICE: &str = "did:plc:alice";
@@ -81,14 +85,13 @@ impl World {
     fn with_stores(
         &self,
         did: &str,
-        mailbox: Box<dyn MailboxStore + Send>,
-        directory: Box<dyn MailboxDirectory + Send>,
+        mailbox: Box<dyn MailboxStore>,
+        directory: Box<dyn MailboxDirectory>,
     ) -> Backends {
         Backends {
             mailbox,
             threads: Box::new(self.net.threads(did)),
             directory,
-            orf: Box::new(self.net.orf(did)),
             publishers: vec![],
             clock: Box::new(self.clock.clone()),
         }
@@ -101,7 +104,12 @@ impl World {
     }
 
     fn init(&self, did: &str, seed: u8) -> Labyrinth {
-        Labyrinth::initialize(did, self.chat_device(did, seed), self.backends(did)).unwrap()
+        block_on(Labyrinth::initialize(
+            did,
+            self.chat_device(did, seed),
+            self.backends(did),
+        ))
+        .unwrap()
     }
 
     /// `lab` sends `id` to the MLS group `members`; returns whether a new
@@ -109,10 +117,8 @@ impl World {
     fn send(&mut self, lab: &mut Labyrinth, members: &[&str], id: &str) -> bool {
         self.ts += 10;
         let frame = format!("frame {id} from {}", lab.did()).into_bytes();
-        let roster = lab.resolve_roster(members).unwrap();
-        let out = lab
-            .archive_outgoing(THREAD, &roster, id, self.ts, &frame)
-            .unwrap();
+        let roster = block_on(lab.resolve_roster(members)).unwrap();
+        let out = block_on(lab.archive_outgoing(THREAD, &roster, id, self.ts, &frame)).unwrap();
         self.sent.push((id.to_owned(), lab.did().to_owned(), frame));
         out.mek_written.is_some()
     }
@@ -128,7 +134,7 @@ impl World {
 }
 
 fn read(lab: &mut Labyrinth) -> labyrinth::client::ThreadHistory {
-    lab.load_thread(THREAD, TimeRange::ALL).unwrap()
+    block_on(lab.load_thread(THREAD, TimeRange::ALL)).unwrap()
 }
 
 fn got(h: &labyrinth::client::ThreadHistory) -> Vec<(String, Option<String>, Vec<u8>)> {
@@ -166,42 +172,47 @@ struct BundleView {
     fail_member_key: Option<XVerifyingKey>,
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl MailboxStore for BundleView {
     fn owner(&self) -> &str {
         self.inner.owner()
     }
-    fn create_device(&self, d: &Device) -> labyrinth::Result<()> {
-        self.inner.create_device(d)
+    async fn create_device(&self, d: &Device) -> labyrinth::Result<()> {
+        self.inner.create_device(d).await
     }
-    fn set_device_revoked(&self, k: &XVerifyingKey, at: &str) -> labyrinth::Result<()> {
-        self.inner.set_device_revoked(k, at)
+    async fn set_device_revoked(&self, k: &XVerifyingKey, at: &str) -> labyrinth::Result<()> {
+        self.inner.set_device_revoked(k, at).await
     }
-    fn get_device(&self, k: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
-        self.inner.get_device(k)
+    async fn get_device(&self, k: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
+        self.inner.get_device(k).await
     }
-    fn list_devices(&self) -> labyrinth::Result<Vec<Device>> {
-        self.inner.list_devices()
+    async fn list_devices(&self) -> labyrinth::Result<Vec<Device>> {
+        self.inner.list_devices().await
     }
-    fn create_epoch(&self, e: &Epoch, m: &[EpochMember]) -> labyrinth::Result<String> {
-        self.inner.create_epoch(e, m)
+    async fn create_epoch(&self, e: &Epoch, m: &[EpochMember]) -> labyrinth::Result<String> {
+        self.inner.create_epoch(e, m).await
     }
-    fn get_epoch(&self, seq: u64) -> labyrinth::Result<Option<Stored<Epoch>>> {
+    async fn atomic_enroll(&self, bundle: &AtomicEnrollBundle) -> labyrinth::Result<String> {
+        self.inner.atomic_enroll(bundle).await
+    }
+    async fn get_epoch(&self, seq: u64) -> labyrinth::Result<Option<Stored<Epoch>>> {
         let call = self.epoch_calls.fetch_add(1, Ordering::Relaxed) + 1;
         if self.fail_epoch_call == Some(call) {
             return Err(Error::Backend("injected passkey preflight outage".into()));
         }
-        self.inner.get_epoch(seq)
+        self.inner.get_epoch(seq).await
     }
-    fn list_epochs(&self) -> labyrinth::Result<Vec<Stored<Epoch>>> {
-        self.inner.list_epochs()
+    async fn list_epochs(&self) -> labyrinth::Result<Vec<Stored<Epoch>>> {
+        self.inner.list_epochs().await
     }
-    fn create_epoch_member(&self, m: &EpochMember) -> labyrinth::Result<()> {
-        self.inner.create_epoch_member(m)
+    async fn create_epoch_member(&self, m: &EpochMember) -> labyrinth::Result<()> {
+        self.inner.create_epoch_member(m).await
     }
-    fn list_epoch_members(&self, seq: u64) -> labyrinth::Result<Vec<EpochMember>> {
-        self.inner.list_epoch_members(seq)
+    async fn list_epoch_members(&self, seq: u64) -> labyrinth::Result<Vec<EpochMember>> {
+        self.inner.list_epoch_members(seq).await
     }
-    fn get_epoch_member(
+    async fn get_epoch_member(
         &self,
         seq: u64,
         key: &XVerifyingKey,
@@ -209,92 +220,115 @@ impl MailboxStore for BundleView {
         if self.fail_member_key.as_ref() == Some(key) {
             return Err(Error::Backend("injected passkey membership outage".into()));
         }
-        self.inner.get_epoch_member(seq, key)
+        self.inner.get_epoch_member(seq, key).await
     }
-    fn create_virtual_device(&self, v: &VirtualDevice) -> labyrinth::Result<()> {
-        self.inner.create_virtual_device(v)
+    async fn create_virtual_device(&self, v: &VirtualDevice) -> labyrinth::Result<()> {
+        self.inner.create_virtual_device(v).await
     }
-    fn get_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<Option<VirtualDevice>> {
-        self.inner.get_virtual_device(id)
+    async fn get_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<Option<VirtualDevice>> {
+        self.inner.get_virtual_device(id).await
     }
-    fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
+    async fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
         Ok(self.bundles.clone())
     }
-    fn append_owner_batch(&self, b: &OwnerBatch) -> labyrinth::Result<String> {
-        self.inner.append_owner_batch(b)
+    async fn put_otc_session(&self, s: &OtcSession) -> labyrinth::Result<()> {
+        self.inner.put_otc_session(s).await
     }
-    fn list_owner_batches(
+    async fn get_otc_session(&self, id: &str) -> labyrinth::Result<Option<OtcSession>> {
+        self.inner.get_otc_session(id).await
+    }
+    async fn append_owner_batch(&self, b: &OwnerBatch) -> labyrinth::Result<String> {
+        self.inner.append_owner_batch(b).await
+    }
+    async fn list_owner_batches(
         &self,
         t: &str,
         r: TimeRange,
     ) -> labyrinth::Result<Vec<Stored<OwnerBatch>>> {
-        self.inner.list_owner_batches(t, r)
+        self.inner.list_owner_batches(t, r).await
     }
-    fn publish_mailbox_keys(&self, r: &MailboxKeysRecord) -> labyrinth::Result<()> {
-        self.inner.publish_mailbox_keys(r)
+    async fn publish_mailbox_keys(&self, r: &MailboxKeysRecord) -> labyrinth::Result<()> {
+        self.inner.publish_mailbox_keys(r).await
     }
-    fn touch_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<()> {
-        self.inner.touch_virtual_device(id)
+    async fn touch_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<()> {
+        self.inner.touch_virtual_device(id).await
+    }
+    async fn delete_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<()> {
+        self.inner.delete_virtual_device(id).await
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl MailboxStore for Truncating {
     fn owner(&self) -> &str {
         self.inner.owner()
     }
-    fn create_device(&self, d: &Device) -> labyrinth::Result<()> {
-        self.inner.create_device(d)
+    async fn create_device(&self, d: &Device) -> labyrinth::Result<()> {
+        self.inner.create_device(d).await
     }
-    fn set_device_revoked(&self, k: &XVerifyingKey, at: &str) -> labyrinth::Result<()> {
-        self.inner.set_device_revoked(k, at)
+    async fn set_device_revoked(&self, k: &XVerifyingKey, at: &str) -> labyrinth::Result<()> {
+        self.inner.set_device_revoked(k, at).await
     }
-    fn get_device(&self, k: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
-        self.inner.get_device(k)
+    async fn get_device(&self, k: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
+        self.inner.get_device(k).await
     }
-    fn list_devices(&self) -> labyrinth::Result<Vec<Device>> {
-        self.inner.list_devices()
+    async fn list_devices(&self) -> labyrinth::Result<Vec<Device>> {
+        self.inner.list_devices().await
     }
-    fn create_epoch(&self, e: &Epoch, m: &[EpochMember]) -> labyrinth::Result<String> {
-        self.inner.create_epoch(e, m)
+    async fn create_epoch(&self, e: &Epoch, m: &[EpochMember]) -> labyrinth::Result<String> {
+        self.inner.create_epoch(e, m).await
     }
-    fn get_epoch(&self, seq: u64) -> labyrinth::Result<Option<Stored<Epoch>>> {
+    async fn atomic_enroll(&self, bundle: &AtomicEnrollBundle) -> labyrinth::Result<String> {
+        self.inner.atomic_enroll(bundle).await
+    }
+    async fn get_epoch(&self, seq: u64) -> labyrinth::Result<Option<Stored<Epoch>>> {
         if seq > self.max_seq {
             return Ok(None);
         }
-        self.inner.get_epoch(seq)
+        self.inner.get_epoch(seq).await
     }
-    fn list_epochs(&self) -> labyrinth::Result<Vec<Stored<Epoch>>> {
-        let mut v = self.inner.list_epochs()?;
+    async fn list_epochs(&self) -> labyrinth::Result<Vec<Stored<Epoch>>> {
+        let mut v = self.inner.list_epochs().await?;
         v.retain(|e| e.value.seq() <= self.max_seq);
         Ok(v)
     }
-    fn create_epoch_member(&self, m: &EpochMember) -> labyrinth::Result<()> {
-        self.inner.create_epoch_member(m)
+    async fn create_epoch_member(&self, m: &EpochMember) -> labyrinth::Result<()> {
+        self.inner.create_epoch_member(m).await
     }
-    fn list_epoch_members(&self, seq: u64) -> labyrinth::Result<Vec<EpochMember>> {
-        self.inner.list_epoch_members(seq)
+    async fn list_epoch_members(&self, seq: u64) -> labyrinth::Result<Vec<EpochMember>> {
+        self.inner.list_epoch_members(seq).await
     }
-    fn create_virtual_device(&self, v: &VirtualDevice) -> labyrinth::Result<()> {
-        self.inner.create_virtual_device(v)
+    async fn create_virtual_device(&self, v: &VirtualDevice) -> labyrinth::Result<()> {
+        self.inner.create_virtual_device(v).await
     }
-    fn get_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<Option<VirtualDevice>> {
-        self.inner.get_virtual_device(id)
+    async fn get_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<Option<VirtualDevice>> {
+        self.inner.get_virtual_device(id).await
     }
-    fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
-        self.inner.list_virtual_devices()
+    async fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
+        self.inner.list_virtual_devices().await
     }
-    fn append_owner_batch(&self, b: &OwnerBatch) -> labyrinth::Result<String> {
-        self.inner.append_owner_batch(b)
+    async fn put_otc_session(&self, s: &OtcSession) -> labyrinth::Result<()> {
+        self.inner.put_otc_session(s).await
     }
-    fn list_owner_batches(
+    async fn get_otc_session(&self, id: &str) -> labyrinth::Result<Option<OtcSession>> {
+        self.inner.get_otc_session(id).await
+    }
+    async fn append_owner_batch(&self, b: &OwnerBatch) -> labyrinth::Result<String> {
+        self.inner.append_owner_batch(b).await
+    }
+    async fn list_owner_batches(
         &self,
         t: &str,
         r: TimeRange,
     ) -> labyrinth::Result<Vec<Stored<OwnerBatch>>> {
-        self.inner.list_owner_batches(t, r)
+        self.inner.list_owner_batches(t, r).await
     }
-    fn publish_mailbox_keys(&self, r: &MailboxKeysRecord) -> labyrinth::Result<()> {
-        self.inner.publish_mailbox_keys(r)
+    async fn publish_mailbox_keys(&self, r: &MailboxKeysRecord) -> labyrinth::Result<()> {
+        self.inner.publish_mailbox_keys(r).await
+    }
+    async fn touch_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<()> {
+        self.inner.touch_virtual_device(id).await
     }
 }
 
@@ -305,18 +339,42 @@ struct Substituting {
     fake: EpochPublic,
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl MailboxDirectory for Substituting {
-    fn latest(&self, did: &str) -> labyrinth::Result<Option<EpochPublic>> {
+    async fn latest(&self, did: &str) -> labyrinth::Result<Option<EpochPublic>> {
         if did == self.victim {
             return Ok(Some(self.fake.clone()));
         }
-        self.inner.latest(did)
+        self.inner.latest(did).await
     }
-    fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
-        self.inner.epoch(did, seq)
+    async fn epoch(&self, did: &str, seq: u64) -> labyrinth::Result<Option<EpochPublic>> {
+        self.inner.epoch(did, seq).await
     }
-    fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
-        self.inner.device_transport_keys(did)
+    async fn epoch_chain(
+        &self,
+        did: &str,
+    ) -> labyrinth::Result<Option<(Vec<labyrinth_protocol::EpochPublicHeader>, u64)>> {
+        self.inner.epoch_chain(did).await
+    }
+    async fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
+        self.inner.device_transport_keys(did).await
+    }
+    async fn member_device_keys(
+        &self,
+        thread_id: &str,
+        did: &str,
+    ) -> labyrinth::Result<Option<Vec<MemberDeviceKey>>> {
+        self.inner.member_device_keys(thread_id, did).await
+    }
+    async fn sequencer_key(&self, thread_id: &str) -> labyrinth::Result<Option<SequencerKey>> {
+        self.inner.sequencer_key(thread_id).await
+    }
+    async fn sequencer_receipt_key(
+        &self,
+        thread_id: &str,
+    ) -> labyrinth::Result<Option<SequencerReceiptKey>> {
+        self.inner.sequencer_receipt_key(thread_id).await
     }
 }
 
@@ -324,23 +382,23 @@ impl MailboxDirectory for Substituting {
 fn full_lifecycle() {
     let mut w = World::new();
 
-    // Alice: phone (genesis), laptop via one-time code, recovery code.
+    // Alice: phone (genesis = 0), laptop via one-time code (Gate 3 opens 1), recovery code.
     let mut phone = w.init(ALICE, 1);
     let mut responder = phone.otc_offer().unwrap();
     let typed = responder.code().as_str().to_owned();
     let (initiator, hello) = Labyrinth::otc_start(ALICE, &typed).unwrap();
-    let reply = phone.otc_respond(&mut responder, &hello).unwrap();
-    let (mut laptop, _) = Labyrinth::enroll_via_otc(
+    let reply = block_on(phone.otc_respond(&mut responder, &hello)).unwrap();
+    let (mut laptop, _) = block_on(Labyrinth::enroll_via_otc(
         ALICE,
         initiator,
         &reply.message,
         &reply.sealed_payload,
         w.chat_device(ALICE, 2),
         w.backends(ALICE),
-    )
+    ))
     .unwrap();
-    assert_eq!(laptop.latest_epoch(), 0);
-    let recovery = phone.create_recovery_code(Mechanism::Code).unwrap();
+    assert_eq!(laptop.latest_epoch(), 1);
+    let recovery = block_on(phone.create_recovery_code(Mechanism::Code)).unwrap();
     let code = recovery.code.as_str().to_owned();
 
     let mut bob = w.init(BOB, 3);
@@ -354,48 +412,58 @@ fn full_lifecycle() {
     assert!(w.send(&mut laptop, &group, "a2"));
     assert!(!w.send(&mut bob, &group, "b2"));
     for lab in [&mut phone, &mut laptop, &mut bob, &mut carol] {
-        lab.flush().unwrap();
+        block_on(lab.flush()).unwrap();
     }
     let before = ["a1", "b1", "c1", "a2", "b2"];
     assert_eq!(got(&read(&mut carol)), w.expected(&before));
 
-    // Alice's phone is lost: the laptop revokes it and rotates.
+    // Alice's phone is lost: the laptop revokes it and rotates (1 -> 2).
     w.net.remove_chat_device(ALICE, transport_pub(1), w.ts + 1);
     let phone_key = phone.device_public().device_key_pub;
-    let rot = laptop.revoke_device(&phone_key).unwrap();
-    assert_eq!(rot.new_epoch, 1);
-    assert_eq!(phone.sync_epochs().unwrap_err(), Error::NotEpochMember);
-    assert_eq!(w.net.directory().latest(ALICE).unwrap().unwrap().seq, 1);
+    let rot = block_on(laptop.revoke_device(&phone_key)).unwrap();
+    assert_eq!(rot.new_epoch, 2);
+    assert_eq!(
+        block_on(phone.sync_epochs()).unwrap_err(),
+        Error::NotEpochMember
+    );
+    assert_eq!(
+        block_on(w.net.directory().latest(ALICE))
+            .unwrap()
+            .unwrap()
+            .seq,
+        2
+    );
 
     // Alice's new epoch changes the roster: everyone mints a fresh MEK.
     assert!(w.send(&mut laptop, &group, "a3"));
     assert!(w.send(&mut bob, &group, "b3"));
     assert!(w.send(&mut carol, &group, "c2"));
     for lab in [&mut laptop, &mut bob, &mut carol] {
-        lab.flush().unwrap();
+        block_on(lab.flush()).unwrap();
     }
 
-    // A second bundle made in epoch 1: restoring from it needs backward
-    // chaining to read epoch-0 MEKs.
-    let keychain = laptop.create_recovery_code(Mechanism::Keychain).unwrap();
-    let (mut tablet, _) = Labyrinth::restore_with_recovery_code(
+    // A second bundle made in epoch 2: restoring from it needs backward
+    // chaining to read earlier-epoch MEKs, and Gate 3 opens epoch 3.
+    let keychain = block_on(laptop.create_recovery_code(Mechanism::Keychain)).unwrap();
+    let (mut tablet, _) = block_on(Labyrinth::restore_with_recovery_code(
         ALICE,
         keychain.code.as_str(),
         w.chat_device(ALICE, 8),
         w.backends(ALICE),
-    )
+    ))
     .unwrap();
+    assert_eq!(tablet.latest_epoch(), 3);
 
-    // A NEW Alice device restores from the recovery code with one typo and
-    // reads the whole thread, before and after the revocation.
-    let (mut alice, _) = Labyrinth::restore_with_recovery_code(
+    // A NEW Alice device restores from the recovery code with one typo,
+    // opens epoch 4 (Gate 3), and reads the whole thread before and after revocation.
+    let (mut alice, _) = block_on(Labyrinth::restore_with_recovery_code(
         ALICE,
         &one_typo(&code),
         w.chat_device(ALICE, 5),
         w.backends(ALICE),
-    )
+    ))
     .unwrap();
-    assert_eq!(alice.latest_epoch(), 1);
+    assert_eq!(alice.latest_epoch(), 4);
     let all = ["a1", "b1", "c1", "a2", "b2", "a3", "b3", "c2"];
     let h = read(&mut alice);
     assert_eq!(got(&h), w.expected(&all));
@@ -405,12 +473,12 @@ fn full_lifecycle() {
 
     // Carol re-archives, then MLS removes her and Bob talks without her.
     assert_eq!(
-        carol.rearchive_thread_before_leave(THREAD).unwrap(),
+        block_on(carol.rearchive_thread_before_leave(THREAD)).unwrap(),
         all.len()
     );
     let group = [ALICE, BOB];
     assert!(w.send(&mut bob, &group, "b4"));
-    bob.flush().unwrap();
+    block_on(bob.flush()).unwrap();
     // Space removal lags: Carol still sees the records but cannot open b4.
     let h = read(&mut carol);
     assert_eq!(ids(&h), all);
@@ -432,8 +500,8 @@ fn full_lifecycle() {
     let group = [ALICE, BOB, DAVE];
     assert!(w.send(&mut bob, &group, "b5"));
     assert!(w.send(&mut dave, &group, "d1"));
-    bob.flush().unwrap();
-    dave.flush().unwrap();
+    block_on(bob.flush()).unwrap();
+    block_on(dave.flush()).unwrap();
     let h = read(&mut dave);
     assert_eq!(got(&h), w.expected(&["b5", "d1"]));
     assert_eq!(h.undecryptable.len(), all.len() + 1);
@@ -447,34 +515,37 @@ fn full_lifecycle() {
     let everything = [&all[..], &["b4", "b5", "d1"]].concat();
     assert_eq!(got(&read(&mut alice)), w.expected(&everything));
     // Time ranges filter.
-    let h = alice
-        .load_thread(
-            THREAD,
-            TimeRange {
-                from_ms: Some(w.ts),
-                until_ms: None,
-            },
-        )
-        .unwrap();
+    let h = block_on(alice.load_thread(
+        THREAD,
+        TimeRange {
+            from_ms: Some(w.ts),
+            until_ms: None,
+        },
+    ))
+    .unwrap();
     assert_eq!(ids(&h), ["d1"]);
 
-    // A backend that hides epoch 1 from a restoring device is detected.
+    // A backend that hides epochs > 1 from a restoring device (bundle minted in epoch 1) is detected.
     let truncated = w.with_stores(
         ALICE,
         Box::new(Truncating {
             inner: w.net.mailbox(ALICE),
-            max_seq: 0,
+            max_seq: 1,
         }),
         Box::new(w.net.directory()),
     );
-    let err =
-        Labyrinth::restore_with_recovery_code(ALICE, &code, w.chat_device(ALICE, 7), truncated)
-            .unwrap_err();
+    let err = block_on(Labyrinth::restore_with_recovery_code(
+        ALICE,
+        &code,
+        w.chat_device(ALICE, 7),
+        truncated,
+    ))
+    .unwrap_err();
     assert_eq!(
         err,
         Error::EpochTruncated {
-            published: 1,
-            reached: 0
+            published: 4,
+            reached: 1
         }
     );
 }
@@ -488,7 +559,7 @@ fn substituted_mailbox_keys_are_rejected() {
     // A key set signed by a transport key that is not one of Bob's devices.
     let attacker = signer(66);
     let keys = MailboxKeys::derive(&[66u8; 32], 0);
-    let forged = EpochPublic::sign(BOB, 0, &keys, None, None, &attacker).unwrap();
+    let forged = EpochPublic::sign(BOB, 0, &keys, [0u8; 32], None, None, &attacker).unwrap();
     // Bob's real record with swapped keys (head no longer matches).
     let mut tampered = real.clone();
     tampered.keys = keys.public();
@@ -517,20 +588,18 @@ fn substituted_mailbox_keys_are_rejected() {
         };
         w.net.register_chat_device(erin_did, transport_pub(9));
         let b = w.with_stores(erin_did, Box::new(w.net.mailbox(erin_did)), Box::new(dir));
-        let mut erin = Labyrinth::initialize(erin_did, Box::new(signer(9)), b).unwrap();
-        assert_eq!(erin.resolve_roster(&[BOB]).unwrap_err(), want);
+        let mut erin = block_on(Labyrinth::initialize(erin_did, Box::new(signer(9)), b)).unwrap();
+        assert_eq!(block_on(erin.resolve_roster(&[BOB])).unwrap_err(), want);
         let roster = vec![(BOB.to_owned(), forged.clone())];
         assert_eq!(
-            erin.archive_outgoing(THREAD, &roster, "m", 1, b"x")
-                .unwrap_err(),
+            block_on(erin.archive_outgoing(THREAD, &roster, "m", 1, b"x")).unwrap_err(),
             supplied_want
         );
         // Supplying a genuine record directly must not bypass the live
         // directory check while that directory is serving a substitution.
         let roster = vec![(BOB.to_owned(), real.clone())];
         assert_eq!(
-            erin.archive_outgoing(THREAD, &roster, "m", 1, b"x")
-                .unwrap_err(),
+            block_on(erin.archive_outgoing(THREAD, &roster, "m", 1, b"x")).unwrap_err(),
             direct_want
         );
     }
@@ -543,8 +612,10 @@ fn passkey_creation_rejects_invalid_prf_without_storing_bundle() {
     for len in [0, 1, 31, 33, 64] {
         let prf_output = vec![7u8; len];
         let credential = format!("credential-{len}");
-        let result = phone.create_passkey_recovery(&prf_output, credential.as_bytes());
-        let stored = w.net.mailbox(ALICE).list_virtual_devices().unwrap().len();
+        let result = block_on(phone.create_passkey_recovery(&prf_output, credential.as_bytes()));
+        let stored = block_on(w.net.mailbox(ALICE).list_virtual_devices())
+            .unwrap()
+            .len();
         assert_eq!(
             (result.err(), stored),
             (
@@ -560,12 +631,9 @@ fn passkey_creation_rejects_invalid_prf_without_storing_bundle() {
 fn passkey_restore_skips_earlier_duplicate_with_invalid_wrap() {
     let w = World::new();
     let mut phone = w.init(ALICE, 1);
-    let setup = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
+    let setup = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
     let mailbox = w.net.mailbox(ALICE);
-    let mut poison = mailbox
-        .get_virtual_device(&setup.vdevice_id)
+    let mut poison = block_on(mailbox.get_virtual_device(&setup.vdevice_id))
         .unwrap()
         .unwrap();
     poison.vdevice_id.0 = earlier_vdevice_id(setup.vdevice_id).to_vec();
@@ -576,15 +644,15 @@ fn passkey_restore_skips_earlier_duplicate_with_invalid_wrap() {
         .0
         .last_mut()
         .unwrap() ^= 1;
-    mailbox.create_virtual_device(&poison).unwrap();
+    block_on(mailbox.create_virtual_device(&poison)).unwrap();
 
-    Labyrinth::restore_with_passkey(
+    block_on(Labyrinth::restore_with_passkey(
         ALICE,
         &[42u8; 32],
         b"credential-1",
         w.chat_device(ALICE, 2),
         w.backends(ALICE),
-    )
+    ))
     .unwrap();
 }
 
@@ -592,24 +660,21 @@ fn passkey_restore_skips_earlier_duplicate_with_invalid_wrap() {
 fn passkey_restore_uses_canonical_id_for_copied_wrap() {
     let w = World::new();
     let mut phone = w.init(ALICE, 1);
-    let setup = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
+    let setup = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
     let mailbox = w.net.mailbox(ALICE);
-    let mut poison = mailbox
-        .get_virtual_device(&setup.vdevice_id)
+    let mut poison = block_on(mailbox.get_virtual_device(&setup.vdevice_id))
         .unwrap()
         .unwrap();
     poison.vdevice_id.0 = earlier_vdevice_id(setup.vdevice_id).to_vec();
-    mailbox.create_virtual_device(&poison).unwrap();
+    block_on(mailbox.create_virtual_device(&poison)).unwrap();
 
-    Labyrinth::restore_with_passkey(
+    block_on(Labyrinth::restore_with_passkey(
         ALICE,
         &[42u8; 32],
         b"credential-1",
         w.chat_device(ALICE, 2),
         w.backends(ALICE),
-    )
+    ))
     .unwrap();
 }
 
@@ -617,19 +682,17 @@ fn passkey_restore_uses_canonical_id_for_copied_wrap() {
 fn passkey_restore_rejects_invalid_prf_length_before_credential_selection() {
     let w = World::new();
     let mut phone = w.init(ALICE, 1);
-    phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
+    block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
 
     for credential in [b"credential-1".as_slice(), b"unknown".as_slice()] {
         assert_eq!(
-            Labyrinth::restore_with_passkey(
+            block_on(Labyrinth::restore_with_passkey(
                 ALICE,
                 &[7u8; 31],
                 credential,
                 w.chat_device(ALICE, 2),
                 w.backends(ALICE),
-            )
+            ))
             .unwrap_err(),
             Error::Malformed("passkey PRF output must be 32 bytes")
         );
@@ -640,12 +703,9 @@ fn passkey_restore_rejects_invalid_prf_length_before_credential_selection() {
 fn wrong_passkey_prf_error_is_not_shadowed_by_malformed_candidates() {
     let w = World::new();
     let mut phone = w.init(ALICE, 1);
-    let setup = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
+    let setup = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
     let mailbox = w.net.mailbox(ALICE);
-    let original = mailbox
-        .get_virtual_device(&setup.vdevice_id)
+    let original = block_on(mailbox.get_virtual_device(&setup.vdevice_id))
         .unwrap()
         .unwrap();
     let mut missing_wrap = original.clone();
@@ -670,13 +730,13 @@ fn wrong_passkey_prf_error_is_not_shadowed_by_malformed_candidates() {
     );
 
     assert_eq!(
-        Labyrinth::restore_with_passkey(
+        block_on(Labyrinth::restore_with_passkey(
             ALICE,
             &[43u8; 32],
             b"credential-1",
             w.chat_device(ALICE, 2),
             b,
-        )
+        ))
         .unwrap_err(),
         Error::Decrypt
     );
@@ -686,22 +746,16 @@ fn wrong_passkey_prf_error_is_not_shadowed_by_malformed_candidates() {
 fn retained_revoked_passkey_bundle_does_not_shadow_active_replacement() {
     let w = World::new();
     let mut phone = w.init(ALICE, 1);
-    let old = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
+    let old = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
     let mailbox = w.net.mailbox(ALICE);
-    let old_bundle = mailbox
-        .get_virtual_device(&old.vdevice_id)
+    let old_bundle = block_on(mailbox.get_virtual_device(&old.vdevice_id))
         .unwrap()
         .unwrap();
     let old_key = old_bundle.to_bundle().unwrap().0.public.device_key_pub;
-    phone.revoke_device(&old_key).unwrap();
+    block_on(phone.revoke_device(&old_key)).unwrap();
 
-    let active = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
-    let active_bundle = mailbox
-        .get_virtual_device(&active.vdevice_id)
+    let active = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
+    let active_bundle = block_on(mailbox.get_virtual_device(&active.vdevice_id))
         .unwrap()
         .unwrap();
     let b = w.with_stores(
@@ -716,13 +770,13 @@ fn retained_revoked_passkey_bundle_does_not_shadow_active_replacement() {
         Box::new(w.net.directory()),
     );
 
-    Labyrinth::restore_with_passkey(
+    block_on(Labyrinth::restore_with_passkey(
         ALICE,
         &[42u8; 32],
         b"credential-1",
         w.chat_device(ALICE, 2),
         b,
-    )
+    ))
     .unwrap();
 }
 
@@ -730,18 +784,17 @@ fn retained_revoked_passkey_bundle_does_not_shadow_active_replacement() {
 fn multiple_active_passkey_bundles_are_ambiguous_and_write_nothing() {
     let w = World::new();
     let mut phone = w.init(ALICE, 1);
-    let one = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
-    let two = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
+    let one = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
+    let two = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
     let mailbox = w.net.mailbox(ALICE);
     let bundles = [one.vdevice_id, two.vdevice_id]
-        .map(|id| mailbox.get_virtual_device(&id).unwrap().unwrap())
+        .map(|id| block_on(mailbox.get_virtual_device(&id)).unwrap().unwrap())
         .to_vec();
-    let devices_before = mailbox.list_devices().unwrap().len();
-    let members_before = mailbox.list_epoch_members(0).unwrap().len();
+    let devices_before = block_on(mailbox.list_devices()).unwrap().len();
+    let epochs_before = block_on(mailbox.list_epochs()).unwrap().len();
+    let members_before = block_on(mailbox.list_epoch_members(phone.latest_epoch()))
+        .unwrap()
+        .len();
     let b = w.with_stores(
         ALICE,
         Box::new(BundleView {
@@ -755,18 +808,30 @@ fn multiple_active_passkey_bundles_are_ambiguous_and_write_nothing() {
     );
 
     assert_eq!(
-        Labyrinth::restore_with_passkey(
+        block_on(Labyrinth::restore_with_passkey(
             ALICE,
             &[42u8; 32],
             b"credential-1",
             w.chat_device(ALICE, 2),
             b,
-        )
+        ))
         .unwrap_err(),
         Error::Conflict
     );
-    assert_eq!(mailbox.list_devices().unwrap().len(), devices_before);
-    assert_eq!(mailbox.list_epoch_members(0).unwrap().len(), members_before);
+    assert_eq!(
+        block_on(mailbox.list_devices()).unwrap().len(),
+        devices_before
+    );
+    assert_eq!(
+        block_on(mailbox.list_epochs()).unwrap().len(),
+        epochs_before
+    );
+    assert_eq!(
+        block_on(mailbox.list_epoch_members(phone.latest_epoch()))
+            .unwrap()
+            .len(),
+        members_before
+    );
     assert!(bundles_last_used_are_none(&mailbox));
 }
 
@@ -775,12 +840,9 @@ fn duplicate_canonical_passkey_records_fail_closed_in_any_order() {
     for reverse in [false, true] {
         let w = World::new();
         let mut phone = w.init(ALICE, 1);
-        let setup = phone
-            .create_passkey_recovery(&[42u8; 32], b"credential-1")
-            .unwrap();
+        let setup = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
         let mailbox = w.net.mailbox(ALICE);
-        let original = mailbox
-            .get_virtual_device(&setup.vdevice_id)
+        let original = block_on(mailbox.get_virtual_device(&setup.vdevice_id))
             .unwrap()
             .unwrap();
         let mut altered = original.clone();
@@ -802,13 +864,13 @@ fn duplicate_canonical_passkey_records_fail_closed_in_any_order() {
             Box::new(w.net.directory()),
         );
         assert_eq!(
-            Labyrinth::restore_with_passkey(
+            block_on(Labyrinth::restore_with_passkey(
                 ALICE,
                 &[42u8; 32],
                 b"credential-1",
                 w.chat_device(ALICE, 2),
                 b,
-            )
+            ))
             .unwrap_err(),
             Error::Conflict
         );
@@ -819,18 +881,17 @@ fn duplicate_canonical_passkey_records_fail_closed_in_any_order() {
 fn passkey_preflight_uncertainty_is_not_hidden_by_an_active_candidate() {
     let w = World::new();
     let mut phone = w.init(ALICE, 1);
-    let one = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
-    let two = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
+    let one = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
+    let two = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
     let mailbox = w.net.mailbox(ALICE);
     let bundles = [one.vdevice_id, two.vdevice_id]
-        .map(|id| mailbox.get_virtual_device(&id).unwrap().unwrap())
+        .map(|id| block_on(mailbox.get_virtual_device(&id)).unwrap().unwrap())
         .to_vec();
-    let devices_before = mailbox.list_devices().unwrap().len();
-    let members_before = mailbox.list_epoch_members(0).unwrap().len();
+    let devices_before = block_on(mailbox.list_devices()).unwrap().len();
+    let epochs_before = block_on(mailbox.list_epochs()).unwrap().len();
+    let members_before = block_on(mailbox.list_epoch_members(phone.latest_epoch()))
+        .unwrap()
+        .len();
     let b = w.with_stores(
         ALICE,
         Box::new(BundleView {
@@ -844,18 +905,30 @@ fn passkey_preflight_uncertainty_is_not_hidden_by_an_active_candidate() {
     );
 
     assert_eq!(
-        Labyrinth::restore_with_passkey(
+        block_on(Labyrinth::restore_with_passkey(
             ALICE,
             &[42u8; 32],
             b"credential-1",
             w.chat_device(ALICE, 2),
             b,
-        )
+        ))
         .unwrap_err(),
         Error::Backend("injected passkey preflight outage".into())
     );
-    assert_eq!(mailbox.list_devices().unwrap().len(), devices_before);
-    assert_eq!(mailbox.list_epoch_members(0).unwrap().len(), members_before);
+    assert_eq!(
+        block_on(mailbox.list_devices()).unwrap().len(),
+        devices_before
+    );
+    assert_eq!(
+        block_on(mailbox.list_epochs()).unwrap().len(),
+        epochs_before
+    );
+    assert_eq!(
+        block_on(mailbox.list_epoch_members(phone.latest_epoch()))
+            .unwrap()
+            .len(),
+        members_before
+    );
     assert!(bundles_last_used_are_none(&mailbox));
 }
 
@@ -863,26 +936,23 @@ fn passkey_preflight_uncertainty_is_not_hidden_by_an_active_candidate() {
 fn passkey_membership_uncertainty_is_not_treated_as_revocation() {
     let w = World::new();
     let mut phone = w.init(ALICE, 1);
-    let old = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
+    let old = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
     let mailbox = w.net.mailbox(ALICE);
-    let old_bundle = mailbox
-        .get_virtual_device(&old.vdevice_id)
+    let old_bundle = block_on(mailbox.get_virtual_device(&old.vdevice_id))
         .unwrap()
         .unwrap();
     let old_key = old_bundle.to_bundle().unwrap().0.public.device_key_pub;
-    phone.revoke_device(&old_key).unwrap();
-    let active = phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
-    let active_bundle = mailbox
-        .get_virtual_device(&active.vdevice_id)
+    block_on(phone.revoke_device(&old_key)).unwrap();
+    let active = block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
+    let active_bundle = block_on(mailbox.get_virtual_device(&active.vdevice_id))
         .unwrap()
         .unwrap();
     let bundles = vec![old_bundle, active_bundle];
-    let devices_before = mailbox.list_devices().unwrap().len();
-    let members_before = mailbox.list_epoch_members(0).unwrap().len();
+    let devices_before = block_on(mailbox.list_devices()).unwrap().len();
+    let epochs_before = block_on(mailbox.list_epochs()).unwrap().len();
+    let members_before = block_on(mailbox.list_epoch_members(phone.latest_epoch()))
+        .unwrap()
+        .len();
     let b = w.with_stores(
         ALICE,
         Box::new(BundleView {
@@ -896,24 +966,35 @@ fn passkey_membership_uncertainty_is_not_treated_as_revocation() {
     );
 
     assert_eq!(
-        Labyrinth::restore_with_passkey(
+        block_on(Labyrinth::restore_with_passkey(
             ALICE,
             &[42u8; 32],
             b"credential-1",
             w.chat_device(ALICE, 2),
             b,
-        )
+        ))
         .unwrap_err(),
         Error::Backend("injected passkey membership outage".into())
     );
-    assert_eq!(mailbox.list_devices().unwrap().len(), devices_before);
-    assert_eq!(mailbox.list_epoch_members(0).unwrap().len(), members_before);
+    assert_eq!(
+        block_on(mailbox.list_devices()).unwrap().len(),
+        devices_before
+    );
+    assert_eq!(
+        block_on(mailbox.list_epochs()).unwrap().len(),
+        epochs_before
+    );
+    assert_eq!(
+        block_on(mailbox.list_epoch_members(phone.latest_epoch()))
+            .unwrap()
+            .len(),
+        members_before
+    );
     assert!(bundles_last_used_are_none(&mailbox));
 }
 
 fn bundles_last_used_are_none(mailbox: &MemoryMailbox) -> bool {
-    mailbox
-        .list_virtual_devices()
+    block_on(mailbox.list_virtual_devices())
         .unwrap()
         .iter()
         .all(|bundle| bundle.last_used_at.is_none())
@@ -923,27 +1004,25 @@ fn bundles_last_used_are_none(mailbox: &MemoryMailbox) -> bool {
 fn passkey_restore_and_batch_limits() {
     let mut w = World::new();
     let mut phone = w.init(ALICE, 1);
-    phone
-        .create_passkey_recovery(&[42u8; 32], b"credential-1")
-        .unwrap();
+    block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
     assert_eq!(
-        Labyrinth::restore_with_passkey(
+        block_on(Labyrinth::restore_with_passkey(
             ALICE,
             &[43u8; 32],
             b"credential-1",
             w.chat_device(ALICE, 2),
             w.backends(ALICE)
-        )
+        ))
         .unwrap_err(),
         Error::Decrypt
     );
-    let (mut tablet, _) = Labyrinth::restore_with_passkey(
+    let (mut tablet, _) = block_on(Labyrinth::restore_with_passkey(
         ALICE,
         &[42u8; 32],
         b"credential-1",
         w.chat_device(ALICE, 3),
         w.backends(ALICE),
-    )
+    ))
     .unwrap();
 
     // 300 messages: one batch flushes itself at 256, flush() writes 44.
@@ -952,24 +1031,23 @@ fn passkey_restore_and_batch_limits() {
     let mut auto = Vec::new();
     for i in 0..300 {
         w.ts += 1;
-        let roster = bob.resolve_roster(&group).unwrap();
-        let out = bob
-            .archive_outgoing(THREAD, &roster, &format!("m{i:03}"), w.ts, b"hi")
+        let roster = block_on(bob.resolve_roster(&group)).unwrap();
+        let out = block_on(bob.archive_outgoing(THREAD, &roster, &format!("m{i:03}"), w.ts, b"hi"))
             .unwrap();
         auto.extend(out.flushed);
     }
     assert_eq!(auto.len(), 1);
     assert_eq!(auto[0].count, 256);
     assert_eq!(bob.pending(THREAD), 44);
-    let rest = bob.flush().unwrap();
+    let rest = block_on(bob.flush()).unwrap();
     assert_eq!(rest.len(), 1);
     assert_eq!(rest[0].count, 44);
     let h = read(&mut tablet);
     assert_eq!(h.messages.len(), 300);
 
     // Owner archive round trip on the restored device.
-    tablet.archive_owner(THREAD, "own-1", 5, b"note").unwrap();
-    tablet.flush().unwrap();
+    block_on(tablet.archive_owner(THREAD, "own-1", 5, b"note")).unwrap();
+    block_on(tablet.flush()).unwrap();
     let h = read(&mut tablet);
     let own: Vec<_> = h
         .messages
@@ -980,7 +1058,12 @@ fn passkey_restore_and_batch_limits() {
     assert_eq!(own[0].frame, b"note");
     // Initializing an existing mailbox conflicts.
     assert_eq!(
-        Labyrinth::initialize(ALICE, w.chat_device(ALICE, 8), w.backends(ALICE)).unwrap_err(),
+        block_on(Labyrinth::initialize(
+            ALICE,
+            w.chat_device(ALICE, 8),
+            w.backends(ALICE)
+        ))
+        .unwrap_err(),
         Error::Conflict
     );
 }

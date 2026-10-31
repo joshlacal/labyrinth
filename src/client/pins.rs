@@ -63,7 +63,7 @@ impl Labyrinth {
 
     /// Checks `epoch` (already verified and attested for `did`) against the
     /// pin for `did` and advances the pin. See the module docs.
-    pub(super) fn pin_peer(&mut self, did: &str, epoch: &EpochPublic) -> Result<()> {
+    pub(super) async fn pin_peer(&mut self, did: &str, epoch: &EpochPublic) -> Result<()> {
         let Some(pin) = self.pins.get(did).cloned() else {
             self.pins.insert(did.to_owned(), PeerPin::of(epoch));
             return Ok(());
@@ -86,7 +86,8 @@ impl Labyrinth {
             let e = self
                 .b
                 .directory
-                .epoch(did, seq)?
+                .epoch(did, seq)
+                .await?
                 .ok_or(Error::NotFound("intermediate peer epoch"))?;
             if e.seq != seq {
                 return Err(Error::Malformed("directory epoch under the wrong number"));
@@ -122,11 +123,12 @@ impl Labyrinth {
     /// genesis (epoch 0): the genesis must be attested by a *current* chat
     /// device of `did` per the directory ([CB-18]), every link must verify,
     /// and the latest epoch must itself be attested by a current device.
-    fn verified_fresh_chain(&self, did: &str) -> Result<EpochPublic> {
+    async fn verified_fresh_chain(&self, did: &str) -> Result<EpochPublic> {
         let latest = self
             .b
             .directory
-            .latest(did)?
+            .latest(did)
+            .await?
             .ok_or(Error::NotFound("peer epoch"))?;
         if latest.seq > MAX_PIN_ADVANCE {
             return Err(Error::Malformed("peer epoch chain gap too long"));
@@ -134,12 +136,13 @@ impl Labyrinth {
         let genesis = self
             .b
             .directory
-            .epoch(did, 0)?
+            .epoch(did, 0)
+            .await?
             .ok_or(Error::NotFound("peer genesis epoch"))?;
         if genesis.seq != 0 {
             return Err(Error::Malformed("directory epoch under the wrong number"));
         }
-        self.check_attested(did, &genesis, VouchAt::Current)?;
+        self.check_attested(did, &genesis, VouchAt::Current).await?;
         let mut prev = PeerPin::of(&genesis);
         for seq in 1..=latest.seq {
             let e = if seq == latest.seq {
@@ -147,7 +150,8 @@ impl Labyrinth {
             } else {
                 self.b
                     .directory
-                    .epoch(did, seq)?
+                    .epoch(did, seq)
+                    .await?
                     .ok_or(Error::NotFound("intermediate peer epoch"))?
             };
             if e.seq != seq {
@@ -162,16 +166,16 @@ impl Labyrinth {
                 "peer chain does not end at its latest epoch",
             ));
         }
-        self.check_attested(did, &latest, VouchAt::Current)?;
+        self.check_attested(did, &latest, VouchAt::Current).await?;
         Ok(latest)
     }
 
     /// Verifies `did`'s current chain from its genesis (see
     /// [`repin_peer`](Self::repin_peer)) and returns the safety-number
     /// change to show the user. Syncs own epochs first; mutates no peer pins.
-    pub fn propose_repin(&mut self, did: &str) -> Result<RepinProposal> {
-        let me = self.own_latest_checked()?.head;
-        let latest = self.verified_fresh_chain(did)?;
+    pub async fn propose_repin(&mut self, did: &str) -> Result<RepinProposal> {
+        let me = self.own_latest_checked().await?.head;
+        let latest = self.verified_fresh_chain(did).await?;
         let pin = self.pins.get(did);
         Ok(RepinProposal {
             did: did.to_owned(),
@@ -192,9 +196,9 @@ impl Labyrinth {
     /// replaces the pin, but only if its latest head is still
     /// `confirmed_head` (the one whose safety number the user accepted);
     /// otherwise [`Error::Conflict`] and nothing changes.
-    pub fn repin_peer(&mut self, did: &str, confirmed_head: &[u8; 32]) -> Result<PeerPin> {
-        self.own_latest_checked()?;
-        let latest = self.verified_fresh_chain(did)?;
+    pub async fn repin_peer(&mut self, did: &str, confirmed_head: &[u8; 32]) -> Result<PeerPin> {
+        self.own_latest_checked().await?;
+        let latest = self.verified_fresh_chain(did).await?;
         if latest.head != *confirmed_head {
             return Err(Error::Conflict);
         }

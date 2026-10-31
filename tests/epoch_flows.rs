@@ -8,7 +8,7 @@ use labyrinth::epoch::{
     add_device_mac, backward_chain, forward_chain, open_genesis, open_next, space_epoch_id,
     verify_member, verify_public,
 };
-use labyrinth::hpke::labyrinth::X25519Secret;
+use labyrinth::hpke::hawk::HawkEncSecret;
 use labyrinth::otc::{Initiator, Responder};
 use labyrinth::recovery_code::{ALPHABET, RecoveryCode};
 use labyrinth::sign::Ed25519Transport;
@@ -67,7 +67,7 @@ impl Backend {
             record: &self.records[seq as usize],
             my_member,
             opener,
-            opener_prev_member: self.member(seq - 1, opener).expect("opener was a member"),
+            opener_prev_member: Some(self.member(seq - 1, opener).expect("opener was a member")),
         }
     }
 
@@ -76,7 +76,7 @@ impl Backend {
         &self,
         prev: &EpochSecret,
         d: &DevicePublic,
-        storage: &X25519Secret,
+        storage: &HawkEncSecret,
     ) -> labyrinth::Result<EpochSecret> {
         let seq = prev.seq + 1;
         let mine = self.member(seq, d).ok_or(Error::NotEpochMember)?;
@@ -86,6 +86,7 @@ impl Backend {
             &self.records[prev.seq as usize].public,
             &self.opened(seq, mine),
             storage,
+            d.is_virtual,
         )
     }
 
@@ -122,7 +123,7 @@ fn genesis(b: &mut Backend, a: &DeviceSecrets) -> EpochSecret {
 fn add_mid_epoch(b: &mut Backend, e: &EpochSecret, d: &DevicePublic) {
     b.register(d);
     let rec = add_device_mac(e, d).unwrap();
-    verify_member(e, &rec).unwrap();
+    verify_member(e, &rec, d.is_virtual).unwrap();
     b.members[e.seq as usize].push(rec);
 }
 
@@ -160,7 +161,8 @@ fn genesis_add_device_revoke() {
                 &e0,
                 &b.records[0].public,
                 &b.opened(1, rec),
-                &cdev.storage
+                &cdev.storage,
+                false,
             )
             .is_err()
         );
@@ -184,7 +186,7 @@ fn virtual_devices_cannot_open_epochs() {
     let mut b = Backend::default();
     let a = DeviceSecrets::generate().unwrap();
     let e0 = genesis(&mut b, &a);
-    let v = DeviceSecrets::generate_virtual(a.orf.clone()).unwrap();
+    let v = DeviceSecrets::generate_virtual().unwrap();
     assert!(open_genesis(DID, &v, &transport()).is_err());
     add_mid_epoch(&mut b, &e0, v.public());
     assert!(
@@ -263,7 +265,7 @@ fn recovery_from_virtual_device_with_typos() {
 
     // Create the virtual device at epoch 2.
     let code = RecoveryCode::generate().unwrap();
-    let (vrec, _token, vmember) =
+    let (vrec, vmember) =
         virtual_device::create(DID, &code, &a, &epochs[2], &salt, Mechanism::Code).unwrap();
     b.register(&vrec.public);
     b.members[2].push(vmember);
@@ -303,11 +305,10 @@ fn recovery_from_virtual_device_with_typos() {
     assert_eq!(cur.seq, 4);
 
     // Enroll the new physical device into epoch 4.
-    let (newdev, newpub, _tok, member) =
-        virtual_device::enroll_from_virtual(&restored, &cur).unwrap();
+    let (newdev, newpub, member) = virtual_device::enroll_from_virtual(&restored, &cur).unwrap();
     assert!(!newdev.is_virtual());
     newpub.verify().unwrap();
-    verify_member(&cur, &member).unwrap();
+    verify_member(&cur, &member, false).unwrap();
 
     // Backward-chain from the bundle's epoch to genesis.
     let mut back = start;
@@ -333,22 +334,18 @@ fn otc_payload_round_trip_and_wrong_key() {
     let e1 = b.open_next(&e0, &[], &a);
 
     let mut responder = Responder::generate(DID).unwrap();
-    let (init, m1) = Initiator::start(responder.code(), DID, b"").unwrap();
-    let (m2, isk_existing) = responder.respond(&m1, b"").unwrap();
+    let (init, m1) = Initiator::start(responder.code(), DID).unwrap();
+    let (m2, isk_existing) = responder.respond(&m1).unwrap();
     let isk_new = init.finish(&m2).unwrap();
     assert_eq!(isk_new, isk_existing);
 
-    let (payload, _token) = OtcPayload::create(&a, &e1, &[7u8; 32]).unwrap();
+    let payload = OtcPayload::create(&e1, &[7u8; 32]);
     let ct = payload.seal(&isk_existing).unwrap();
     let got = OtcPayload::open(&isk_new, &ct).unwrap();
     assert_eq!(got.epoch.root(), e1.root());
     assert_eq!(got.epoch.epoch_id, e1.epoch_id);
     assert_eq!(got.epoch.seq, 1);
     assert_eq!(got.mailbox_root_salt, [7u8; 32]);
-    assert_eq!(
-        got.temp_orf_state.to_bytes(),
-        payload.temp_orf_state.to_bytes()
-    );
 
     // A session with the wrong code yields a different ISK.
     let mut responder2 = Responder::generate(DID).unwrap();
@@ -358,8 +355,8 @@ fn otc_payload_round_trip_and_wrong_key() {
         "000000"
     })
     .unwrap();
-    let (init2, m1) = Initiator::start(&wrong, DID, b"").unwrap();
-    let (m2, _) = responder2.respond(&m1, b"").unwrap();
+    let (init2, m1) = Initiator::start(&wrong, DID).unwrap();
+    let (m2, _) = responder2.respond(&m1).unwrap();
     let isk_wrong = init2.finish(&m2).unwrap();
     assert_eq!(
         OtcPayload::open(&isk_wrong, &ct).err(),
@@ -370,8 +367,8 @@ fn otc_payload_round_trip_and_wrong_key() {
     assert!(OtcPayload::open(&isk_new, &bad).is_err());
 
     // The new device enrolls into the transferred epoch.
-    let (newdev, _, _, member) = got.enroll().unwrap();
-    verify_member(&e1, &member).unwrap();
+    let (newdev, _, member) = got.enroll().unwrap();
+    verify_member(&e1, &member, false).unwrap();
     assert!(!newdev.is_virtual());
 }
 
@@ -402,9 +399,10 @@ fn tampering_is_rejected() {
                     record: rec,
                     my_member: m,
                     opener: op,
-                    opener_prev_member: opm,
+                    opener_prev_member: Some(opm),
                 },
                 &d.storage,
+                false,
             )
         };
     assert!(try_chain(&record, &mine, &opener, &opener_prev).is_ok());
@@ -424,7 +422,7 @@ fn tampering_is_rejected() {
     }
     // Opener record: signatures, auth key, identity.
     let mut op = opener.clone();
-    op.sig_0x30[5] ^= 1;
+    op.sig_storage[5] ^= 1;
     assert!(try_chain(&record, &mine, &op, &opener_prev).is_err());
     let mut op = opener.clone();
     op.sig_0x31.as_mut().unwrap()[5] ^= 1;
@@ -460,7 +458,8 @@ fn tampering_is_rejected() {
             &wrong_prev,
             &prev_public,
             &b.opened(1, &mine),
-            &d.storage
+            &d.storage,
+            false,
         )
         .is_err()
     );
@@ -471,14 +470,15 @@ fn tampering_is_rejected() {
             &e0,
             &prev_public,
             &b.opened(1, &mine),
-            &d.storage
+            &d.storage,
+            false,
         )
         .is_err()
     );
 
     // open_next refuses tampered continuing devices or prev MACs.
     let mut dp = d.public().clone();
-    dp.sig_0x30[1] ^= 1;
+    dp.sig_storage[1] ^= 1;
     assert!(
         open_next(
             DID,
@@ -537,8 +537,20 @@ proptest! {
         }
         prop_assert_eq!(cx.root(), cy.root());
         prop_assert_eq!(cx.root(), cur.root());
-        let hx = labyrinth::mailbox::epoch_head(cx.seq, &cx.mailbox_keys().public(), b.records[n].public.prev_head.as_ref(), DID);
-        let hy = labyrinth::mailbox::epoch_head(cy.seq, &cy.mailbox_keys().public(), b.records[n].public.prev_head.as_ref(), DID);
+        let hx = labyrinth::mailbox::epoch_head(
+            cx.seq,
+            &cx.mailbox_keys().public(),
+            &b.records[n].public.members_hash,
+            b.records[n].public.prev_head.as_ref(),
+            DID,
+        );
+        let hy = labyrinth::mailbox::epoch_head(
+            cy.seq,
+            &cy.mailbox_keys().public(),
+            &b.records[n].public.members_hash,
+            b.records[n].public.prev_head.as_ref(),
+            DID,
+        );
         prop_assert_eq!(hx, hy);
         prop_assert_eq!(hx, b.records[n].public.head);
     }

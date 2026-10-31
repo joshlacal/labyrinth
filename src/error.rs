@@ -72,6 +72,10 @@ pub enum Error {
     /// endpoint whose lexicon is not wired into the XRPC stores.
     #[error("operation not supported by this backend: {0}")]
     NotSupported(&'static str),
+    /// [Gate 1 / I13] Archived item `(frame_nonce, payload_bytes)` or sequencer
+    /// receipt does not match `receipt.payload.archive_commitment`.
+    #[error("archived item commitment does not match sequencer receipt")]
+    ReceiptCommitmentMismatch,
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

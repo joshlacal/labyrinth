@@ -1,52 +1,46 @@
-//! A memory-backed reference PDS for the `com.atproto.space` record
-//! endpoints the Space store calls, for tests and as an executable
-//! statement of the semantics it relies on (reference implementation
-//! `packages/pds/src/api/com/atproto/space/*` and
-//! `actor-store/space/{reader,transactor}.ts`, branch `permissioned-data`
-//! at `5b95b2f2`, 2026-10-01).
-//!
-//! What it enforces:
-//!
-//! - writes only into the caller's own repo (`repo == auth.did`, else 403);
-//! - `applyWrites`: at most [`super::MAX_WRITES`] ops, all-or-nothing;
-//!   `#create` on an existing rkey is `RecordAlreadyExists`, `#update` or
-//!   `#delete` of a missing one `RecordNotFound`; `#create` without an
-//!   rkey gets a TID; JSON bodies over 1,000,000 bytes are refused (413);
-//! - `deleteRecord` succeeds whether or not the record exists;
-//! - reads are `read_self` only: another account's repo answers
-//!   `RepoNotFound`; the caller's own repo with no writes lists as empty;
-//! - no Space has to be created first: a member's PDS accepts writes to a
-//!   Space no authority governs, and reads them back (checked against the
-//!   live dev PDS, `tests/live_space_pds.rs`);
-//! - `listRecords` orders by record URI, descending unless `reverse`,
-//!   with the last URI as the cursor only when the page is full.
-//!
-//! It does not model space credentials, notifyWrite, rate limits, record
-//! CIDs for mailbox records (a digest stands in), or lexicon validation.
-//! Conversation batches use canonical DRISL CIDs.
+//! Memory-backed reference PDS / Space host for `com.atproto.space.*` and
+//! Space-scoped encrypted attachment blobs (`atproto#5187`, Gates 1, 3, and 5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{MAX_WRITES, SpaceRef, endpoint};
-use crate::store::xrpc::{XrpcError, XrpcTransport};
+use super::{CONVERSATION_SPACE_TYPE, MAX_WRITES, SpaceError, SpaceRef, SpaceRpc, endpoint};
+use crate::{Error, Result};
 
 /// Largest JSON request body (reference `jsonLimit`).
 pub const JSON_LIMIT: usize = 1_000_000;
 
-type Reply = core::result::Result<Vec<u8>, XrpcError>;
+type Reply = core::result::Result<Vec<u8>, SpaceError>;
 
 /// Records of one repo in one Space, by record URI.
 type Repo = BTreeMap<String, (String, String, Value)>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BlobVisibility {
+    Staged,
+    SpaceScoped(BTreeSet<String>),
+}
+
+#[derive(Clone, Debug)]
+struct StoredBlob {
+    bytes: Vec<u8>,
+    visibility: BlobVisibility,
+}
 
 #[derive(Default)]
 struct State {
     /// `(space ref, author DID)` → records.
     repos: BTreeMap<(String, String), Repo>,
+    /// Explicit member allowlists configured via [`MemorySpaceHost::grant_space_member`].
+    members: HashMap<String, BTreeSet<String>>,
+    /// Explicit revocations configured via [`MemorySpaceHost::revoke_space_member`].
+    revoked_members: BTreeSet<(String, String)>,
+    /// `(author DID, cid)` → blob + visibility.
+    blobs: HashMap<(String, String), StoredBlob>,
     tid: u64,
 }
 
@@ -54,7 +48,6 @@ impl State {
     fn next_tid(&mut self) -> String {
         const S32: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
         self.tid += 1;
-        // A fixed high timestamp keeps the leading character in TID range.
         let v = (1u64 << 62) | self.tid;
         (0..13)
             .rev()
@@ -63,8 +56,34 @@ impl State {
     }
 }
 
-/// The reference host. Cheap to clone; [`MemorySpaceHost::client`] gives a
-/// transport authenticated as one account.
+/// Collects every `{"$type": "blob", "ref": {"$link": cid}}` CID referenced in `v`.
+fn collect_blob_cids(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            if map.get("$type").and_then(Value::as_str) == Some("blob")
+                && let Some(cid) = map
+                    .get("ref")
+                    .and_then(Value::as_object)
+                    .and_then(|r| r.get("$link"))
+                    .and_then(Value::as_str)
+            {
+                out.push(cid.to_owned());
+            }
+            for child in map.values() {
+                collect_blob_cids(child, out);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr {
+                collect_blob_cids(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The reference Space host. Cheap to clone; [`MemorySpaceHost::client`] gives
+/// a transport authenticated as one account.
 #[derive(Clone, Default)]
 pub struct MemorySpaceHost {
     s: Arc<Mutex<State>>,
@@ -75,11 +94,44 @@ impl MemorySpaceHost {
         Self::default()
     }
 
-    /// A transport whose OAuth session is `did`.
+    /// A transport whose session is `did`.
     pub fn client(&self, did: &str) -> SpaceClient {
         SpaceClient {
             host: self.clone(),
             did: did.to_owned(),
+        }
+    }
+
+    /// Grants `did` membership read access on `space`.
+    pub fn grant_space_member(&self, space: &SpaceRef, did: &str) {
+        let mut s = self.s.lock().unwrap();
+        let key = space.to_string();
+        s.revoked_members.remove(&(key.clone(), did.to_owned()));
+        s.members.entry(key).or_default().insert(did.to_owned());
+    }
+
+    /// Revokes `did`'s membership read/write access on `space`.
+    pub fn revoke_space_member(&self, space: &SpaceRef, did: &str) {
+        let mut s = self.s.lock().unwrap();
+        let key = space.to_string();
+        if let Some(m) = s.members.get_mut(&key) {
+            m.remove(did);
+        }
+        s.revoked_members.insert((key, did.to_owned()));
+    }
+
+    /// Public unauthenticated `com.atproto.sync.getBlob` probe (`Gate 5`).
+    /// Staged and Space-scoped blobs MUST NOT be served here (404).
+    pub fn public_sync_get_blob(&self, did: &str, cid: &str) -> Result<Vec<u8>> {
+        let _ = (did, cid);
+        Err(Error::NotFound("blob"))
+    }
+
+    /// Fault-injection helper corrupting stored blob bytes in-place (`Gate 5`).
+    pub fn tamper_blob(&self, did: &str, cid: &str, new_bytes: &[u8]) {
+        let mut s = self.s.lock().unwrap();
+        if let Some(blob) = s.blobs.get_mut(&(did.to_owned(), cid.to_owned())) {
+            blob.bytes = new_bytes.to_vec();
         }
     }
 
@@ -96,7 +148,7 @@ impl MemorySpaceHost {
             .unwrap_or(0)
     }
 
-    /// The raw JSON value of one record, for tamper tests.
+    /// The raw JSON value of one record, for tamper/inspection tests.
     pub fn record(
         &self,
         space: &SpaceRef,
@@ -111,7 +163,7 @@ impl MemorySpaceHost {
             .map(|(.., v)| v.clone())
     }
 
-    /// Deletes one record, bypassing every check (a PDS hiding data).
+    /// Deletes one record, bypassing every check.
     pub fn remove(
         &self,
         space: &SpaceRef,
@@ -127,8 +179,7 @@ impl MemorySpaceHost {
             .map(|(.., v)| v)
     }
 
-    /// Overwrites one record's value, bypassing every check (a malicious
-    /// PDS).
+    /// Overwrites one record's value, bypassing every check.
     pub fn tamper(&self, space: &SpaceRef, did: &str, collection: &str, rkey: &str, value: Value) {
         let mut s = self.s.lock().unwrap();
         let uri = record_uri(&space.to_string(), did, collection, rkey);
@@ -144,12 +195,11 @@ fn record_uri(space: &str, did: &str, collection: &str, rkey: &str) -> String {
 }
 
 fn cid(v: &Value) -> String {
-    if v["$type"] == crate::records::nsid::BATCH {
-        if let Ok(batch) = serde_json::from_value::<crate::records::Batch>(v.clone()) {
-            if let Ok(cid) = super::thread::batch_cid(&batch) {
-                return cid;
-            }
-        }
+    if v["$type"] == crate::records::nsid::BATCH
+        && let Ok(batch) = serde_json::from_value::<crate::records::Batch>(v.clone())
+        && let Ok(cid) = super::thread::batch_cid(&batch)
+    {
+        return cid;
     }
     format!(
         "bafyrei{}",
@@ -157,8 +207,8 @@ fn cid(v: &Value) -> String {
     )
 }
 
-fn err(status: u16, name: &str, msg: impl Into<String>) -> XrpcError {
-    XrpcError::named(status, name, msg)
+fn err(status: u16, name: &str, msg: impl Into<String>) -> SpaceError {
+    SpaceError::named(status, name, msg)
 }
 
 fn ok(v: Value) -> Reply {
@@ -169,7 +219,7 @@ fn param<'a>(p: &'a [(&str, String)], k: &str) -> Option<&'a str> {
     p.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str())
 }
 
-fn required<'a>(p: &'a [(&str, String)], k: &str) -> core::result::Result<&'a str, XrpcError> {
+fn required<'a>(p: &'a [(&str, String)], k: &str) -> core::result::Result<&'a str, SpaceError> {
     param(p, k).ok_or_else(|| err(400, "InvalidRequest", format!("missing {k}")))
 }
 
@@ -196,7 +246,46 @@ pub struct SpaceClient {
     did: String,
 }
 
+impl From<SpaceClient> for Arc<dyn SpaceRpc> {
+    fn from(c: SpaceClient) -> Self {
+        Arc::new(c)
+    }
+}
+
 impl SpaceClient {
+    fn check_space_access(
+        &self,
+        s: &State,
+        space: &str,
+        repo: Option<&str>,
+    ) -> core::result::Result<(), SpaceError> {
+        if s.revoked_members
+            .contains(&(space.to_owned(), self.did.clone()))
+        {
+            return Err(err(403, "Forbidden", "member revoked from Space"));
+        }
+        let parsed = SpaceRef::parse(space).ok();
+        let is_convo = parsed
+            .as_ref()
+            .is_some_and(|sr| sr.space_type == CONVERSATION_SPACE_TYPE);
+        if is_convo {
+            if let Some(allowed) = s.members.get(space)
+                && !allowed.contains(&self.did)
+            {
+                return Err(err(403, "Forbidden", "caller is not a Space member"));
+            }
+            Ok(())
+        } else {
+            // Personal mailbox Space (`read_self` only).
+            if let Some(r) = repo
+                && r != self.did
+            {
+                return Err(err(400, "RepoNotFound", r));
+            }
+            Ok(())
+        }
+    }
+
     fn list_spaces(&self, p: &[(&str, String)]) -> Reply {
         let state = self.host.s.lock().unwrap();
         let cursor = param(p, "cursor");
@@ -225,16 +314,27 @@ impl SpaceClient {
             json!({"spaces": matching.iter().map(|uri| json!({"uri": uri})).collect::<Vec<_>>(), "cursor": cursor}),
         )
     }
+
+    fn list_repos(&self, p: &[(&str, String)]) -> Reply {
+        let space = required(p, "space")?;
+        let s = self.host.s.lock().unwrap();
+        self.check_space_access(&s, space, None)?;
+        let repos: Vec<Value> = s
+            .repos
+            .iter()
+            .filter(|((sp, _), r)| sp == space && !r.is_empty())
+            .map(|((_, did), _)| json!({ "did": did }))
+            .collect();
+        ok(json!({ "repos": repos }))
+    }
+
     fn read_repo(
         &self,
         s: &State,
         space: &str,
         repo: &str,
-    ) -> core::result::Result<Repo, XrpcError> {
-        // read_self only: no space credentials are modeled.
-        if repo != self.did {
-            return Err(err(400, "RepoNotFound", repo));
-        }
+    ) -> core::result::Result<Repo, SpaceError> {
+        self.check_space_access(s, space, Some(repo))?;
         Ok(s.repos
             .get(&(space.to_owned(), repo.to_owned()))
             .cloned()
@@ -260,7 +360,7 @@ impl SpaceClient {
             Some(l) => l
                 .parse()
                 .ok()
-                .filter(|l| (1..=1000).contains(l))
+                .filter(|l| (1..=100).contains(l))
                 .ok_or_else(|| err(400, "InvalidRequest", "limit"))?,
         };
         let reverse = param(p, "reverse") == Some("true");
@@ -316,9 +416,11 @@ impl SpaceClient {
             ));
         }
         let mut s = self.host.s.lock().unwrap();
+        self.check_space_access(&s, &input.space, Some(&self.did))?;
         let key = (input.space.clone(), self.did.clone());
         let mut repo = s.repos.get(&key).cloned().unwrap_or_default();
         let mut results = Vec::new();
+        let mut promoted_cids = Vec::new();
         for w in &input.writes {
             let kind = w["$type"].as_str().unwrap_or("");
             let collection = w["collection"]
@@ -337,6 +439,7 @@ impl SpaceClient {
                         return Err(err(400, "RecordAlreadyExists", &uri));
                     }
                     let v = w["value"].clone();
+                    collect_blob_cids(&v, &mut promoted_cids);
                     results.push(json!({
                         "$type": "com.atproto.space.applyWrites#createResult",
                         "uri": uri, "cid": cid(&v),
@@ -348,6 +451,7 @@ impl SpaceClient {
                         return Err(err(400, "RecordNotFound", &uri));
                     }
                     let v = w["value"].clone();
+                    collect_blob_cids(&v, &mut promoted_cids);
                     results.push(json!({
                         "$type": "com.atproto.space.applyWrites#updateResult",
                         "uri": uri, "cid": cid(&v),
@@ -368,6 +472,21 @@ impl SpaceClient {
                         "InvalidRequest",
                         format!("Action not supported: {other}"),
                     ));
+                }
+            }
+        }
+        // Promote any staged blobs referenced in the committed batch to `.space`!
+        for blob_cid in promoted_cids {
+            if let Some(blob) = s.blobs.get_mut(&(self.did.clone(), blob_cid)) {
+                match &mut blob.visibility {
+                    BlobVisibility::Staged => {
+                        let mut set = BTreeSet::new();
+                        set.insert(input.space.clone());
+                        blob.visibility = BlobVisibility::SpaceScoped(set);
+                    }
+                    BlobVisibility::SpaceScoped(spaces) => {
+                        spaces.insert(input.space.clone());
+                    }
                 }
             }
         }
@@ -392,22 +511,20 @@ impl SpaceClient {
     }
 }
 
-impl XrpcTransport for SpaceClient {
-    fn query_with_headers(
-        &self,
-        nsid: &str,
-        params: &[(&str, String)],
-        _headers: &[(String, String)],
-    ) -> Reply {
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl SpaceRpc for SpaceClient {
+    async fn query(&self, nsid: &str, params: &[(&str, String)]) -> Reply {
         match nsid {
             endpoint::GET_RECORD => self.get_record(params),
             endpoint::LIST_RECORDS => self.list_records(params),
+            endpoint::LIST_REPOS => self.list_repos(params),
             endpoint::LIST_SPACES => self.list_spaces(params),
             _ => Err(err(404, "MethodNotImplemented", nsid)),
         }
     }
 
-    fn procedure(&self, nsid: &str, payload: &[u8], _operation_id: [u8; 16]) -> Reply {
+    async fn procedure(&self, nsid: &str, payload: &[u8]) -> Reply {
         if payload.len() > JSON_LIMIT {
             return Err(err(413, "PayloadTooLarge", "request entity too large"));
         }
@@ -415,6 +532,45 @@ impl XrpcTransport for SpaceClient {
             endpoint::APPLY_WRITES => self.apply_writes(payload),
             endpoint::DELETE_RECORD => self.delete_record(payload),
             _ => Err(err(404, "MethodNotImplemented", nsid)),
+        }
+    }
+
+    async fn upload_blob(
+        &self,
+        bytes: &[u8],
+        _mime_type: &str,
+    ) -> core::result::Result<String, SpaceError> {
+        let mut s = self.host.s.lock().unwrap();
+        let n = s.next_tid();
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.update(n.as_bytes());
+        let cid = format!("bafkrei{}", hex::encode(&h.finalize()[..20]));
+        s.blobs.insert(
+            (self.did.clone(), cid.clone()),
+            StoredBlob {
+                bytes: bytes.to_vec(),
+                visibility: BlobVisibility::Staged,
+            },
+        );
+        Ok(cid)
+    }
+
+    async fn get_blob(
+        &self,
+        space: &str,
+        did: &str,
+        cid: &str,
+    ) -> core::result::Result<Vec<u8>, SpaceError> {
+        let s = self.host.s.lock().unwrap();
+        self.check_space_access(&s, space, Some(did))?;
+        let blob = s
+            .blobs
+            .get(&(did.to_owned(), cid.to_owned()))
+            .ok_or_else(|| err(404, "BlobNotFound", cid))?;
+        match &blob.visibility {
+            BlobVisibility::SpaceScoped(spaces) if spaces.contains(space) => Ok(blob.bytes.clone()),
+            _ => Err(err(404, "BlobNotFound", cid)),
         }
     }
 }

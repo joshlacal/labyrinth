@@ -196,6 +196,17 @@ pub fn verify_sequencer_receipt(
         .map_err(|_| ProtocolError::BadReceiptSignature)
 }
 
+/// Verify a `SignedSequencerReceipt` using a SEC1-encoded P-256 public key.
+pub fn verify_sequencer_receipt_sec1(
+    public_key_sec1: &[u8],
+    expected_sequencer_did: &str,
+    receipt: &SignedSequencerReceipt,
+) -> Result<()> {
+    let pk = VerifyingKey::from_sec1_bytes(public_key_sec1)
+        .map_err(|_| ProtocolError::BadReceiptSignature)?;
+    verify_sequencer_receipt(&pk, expected_sequencer_did, receipt)
+}
+
 /// Verify that a decrypted `(frame_nonce, canonical_payload_bytes)` pair matches
 /// `receipt.payload.archive_commitment` in constant time (`Gate 1` / `I13`).
 pub fn verify_archived_item_commitment(

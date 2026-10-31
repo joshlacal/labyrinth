@@ -1,21 +1,24 @@
 //! Adding devices: recovery codes, passkey-wrapped codes and one-time
 //! codes (SPEC §6).
 
-use std::cell::RefCell;
+use std::collections::BTreeSet;
 
 use super::epochs::{chain_forward, check_candidate_integrity, epoch_record, verified_own};
+use super::members::audit_epoch_stores;
 use super::{Backends, Labyrinth};
-use crate::device::ChatBinding;
-use crate::epoch::{EpochKeys as _, EpochSecret, PendingEpoch, verify_public};
+use crate::device::{ChatBinding, DevicePublic};
+use crate::epoch::{
+    EpochKeys as _, EpochMemberRecord, EpochSecret, PendingEpoch, open_next_enrolling,
+    verify_public,
+};
 use crate::mailbox::EpochPublic;
 use crate::otc::{Initiator, InitiatorMessage, OneTimeCode, Responder, ResponderMessage};
 use crate::records::mailbox::PasskeyWrap;
-use crate::records::{Device, EpochMember, VirtualDevice, datetime_from_ms};
+use crate::records::{Device, Epoch, EpochMember, VirtualDevice, datetime_from_ms};
 use crate::recovery_code::RecoveryCode;
 use crate::sign::{TransportSigner, XVerifyingKey};
-use crate::virtual_device::{
-    self, Mechanism, OtcPayload, RestoredState, VirtualDeviceRecord, passkey,
-};
+use crate::store::{AtomicEnrollBundle, EnrollCleanup};
+use crate::virtual_device::{self, Mechanism, OtcPayload, RestoredState, passkey};
 use crate::{Error, Result};
 
 /// A new recovery bundle. Show `code` to the user (or store it in the
@@ -149,7 +152,7 @@ fn select_passkey_bundles<'a>(
 }
 
 struct PreparedRestore {
-    record: VirtualDeviceRecord,
+    vdev: VirtualDevice,
     restored: RestoredState,
     reached: Vec<EpochSecret>,
     latest_public: EpochPublic,
@@ -158,28 +161,29 @@ struct PreparedRestore {
 impl Labyrinth {
     /// Create a recovery bundle in the current epoch (SPEC §6.2). The
     /// bundle's virtual device is carried over by later rotations.
-    pub fn create_recovery_code(&mut self, mechanism: Mechanism) -> Result<RecoverySetup> {
-        self.create_bundle(mechanism, None)
+    pub async fn create_recovery_code(&mut self, mechanism: Mechanism) -> Result<RecoverySetup> {
+        self.create_bundle(mechanism, None).await
     }
 
     /// Create a recovery bundle whose code is also stored wrapped under a
     /// WebAuthn PRF output ([CB-13]), so [`Labyrinth::restore_with_passkey`]
     /// can recover without the user typing it.
-    pub fn create_passkey_recovery(
+    pub async fn create_passkey_recovery(
         &mut self,
         prf_output: &[u8],
         credential_id: &[u8],
     ) -> Result<RecoverySetup> {
         self.create_bundle(Mechanism::Passkey, Some((prf_output, credential_id)))
+            .await
     }
 
-    fn create_bundle(
+    async fn create_bundle(
         &mut self,
         mechanism: Mechanism,
         passkey: Option<(&[u8], &[u8])>,
     ) -> Result<RecoverySetup> {
-        self.sync_epochs()?;
-        let current = self.epoch_secret(self.latest)?;
+        self.sync_epochs().await?;
+        let current = self.epoch_secret(self.latest).await?;
         let code = RecoveryCode::generate()?;
         let (rec, member) = virtual_device::create(
             &self.did,
@@ -199,13 +203,16 @@ impl Labyrinth {
             .transpose()?;
         let now = self.now();
         let mb = self.b.mailbox.as_ref();
-        mb.create_device(&Device::from_public(&rec.public, now.clone()))?;
+        mb.create_device(&Device::from_public(&rec.public, now.clone()))
+            .await?;
         mb.create_virtual_device(&VirtualDevice::from_bundle(
             &rec,
             wrap.as_ref(),
             now.clone(),
-        ))?;
-        mb.create_epoch_member(&EpochMember::from_record(&member, now))?;
+        ))
+        .await?;
+        mb.create_epoch_member(&EpochMember::from_record(&member, now))
+            .await?;
         Ok(RecoverySetup {
             code,
             vdevice_id: rec.vdevice_id,
@@ -214,46 +221,42 @@ impl Labyrinth {
 
     /// Enroll a new device from a recovery code, correcting up to three
     /// typos (SPEC §6.1, §6.3). Forward-chains with the bundle's virtual
-    /// device to the newest epoch it can reach, checks that against the
-    /// published latest epoch (SPEC §10), then enrolls there.
-    pub fn restore_with_recovery_code(
+    /// device to the newest epoch `E` it can reach, checks `E` against the
+    /// published latest epoch (SPEC §10), then atomically rotates `E -> E+1`
+    /// (`Gate 3`).
+    pub async fn restore_with_recovery_code(
         did: &str,
         code_input: &str,
-        transport: Box<dyn TransportSigner + Send>,
+        transport: Box<dyn TransportSigner>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
-        let lookup_err = RefCell::new(None);
-        let found = virtual_device::find_code(code_input, did, |id| {
-            match b.mailbox.get_virtual_device(id) {
-                Ok(v) => v.is_some(),
-                Err(e) => {
-                    lookup_err.borrow_mut().get_or_insert(e);
-                    false
-                }
-            }
-        });
-        if let Some(e) = lookup_err.into_inner() {
-            return Err(e);
-        }
-        let code = found?;
+        let known_ids: BTreeSet<[u8; 16]> = b
+            .mailbox
+            .list_virtual_devices()
+            .await?
+            .into_iter()
+            .filter_map(|v| <[u8; 16]>::try_from(v.vdevice_id.0.as_slice()).ok())
+            .collect();
+        let code = virtual_device::find_code(code_input, did, |id| known_ids.contains(id))?;
         let bundle = b
             .mailbox
-            .get_virtual_device(&code.derive(did).0)?
+            .get_virtual_device(&code.derive(did).0)
+            .await?
             .ok_or(Error::BadRecoveryCode)?;
-        Self::restore_from_bundle(did, &bundle, &code, transport, b)
+        Self::restore_from_bundle(did, &bundle, &code, transport, b).await
     }
 
     /// Enroll a new device from the passkey-wrapped code stored with the
     /// bundle for `credential_id`.
-    pub fn restore_with_passkey(
+    pub async fn restore_with_passkey(
         did: &str,
         prf_output: &[u8],
         credential_id: &[u8],
-        transport: Box<dyn TransportSigner + Send>,
+        transport: Box<dyn TransportSigner>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
         passkey::validate_prf_output(prf_output)?;
-        let bundles = b.mailbox.list_virtual_devices()?;
+        let bundles = b.mailbox.list_virtual_devices().await?;
         let candidates = select_passkey_bundles(did, prf_output, credential_id, &bundles)?;
         let mut prepared = None;
         let mut first_error = None;
@@ -263,7 +266,7 @@ impl Labyrinth {
                 prefer_passkey_error(&mut first_error, Error::Expired);
                 continue;
             }
-            match Self::prepare_restore_from_bundle(did, bundle, &code, &b) {
+            match Self::prepare_restore_from_bundle(did, bundle, &code, &b).await {
                 Ok(_) if prepared.is_some() => return Err(Error::Conflict),
                 Ok(candidate) => prepared = Some(candidate),
                 Err(Error::NotEpochMember) => {
@@ -277,21 +280,21 @@ impl Labyrinth {
         }
         let prepared = prepared
             .ok_or_else(|| first_error.unwrap_or(Error::NotFound("active passkey bundle")))?;
-        Self::finish_prepared_restore(did, prepared, transport, b)
+        Self::finish_prepared_restore(did, prepared, transport, b).await
     }
 
-    fn restore_from_bundle(
+    async fn restore_from_bundle(
         did: &str,
         bundle: &VirtualDevice,
         code: &RecoveryCode,
-        transport: Box<dyn TransportSigner + Send>,
+        transport: Box<dyn TransportSigner>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
-        let prepared = Self::prepare_restore_from_bundle(did, bundle, code, &b)?;
-        Self::finish_prepared_restore(did, prepared, transport, b)
+        let prepared = Self::prepare_restore_from_bundle(did, bundle, code, &b).await?;
+        Self::finish_prepared_restore(did, prepared, transport, b).await
     }
 
-    fn prepare_restore_from_bundle(
+    async fn prepare_restore_from_bundle(
         did: &str,
         bundle: &VirtualDevice,
         code: &RecoveryCode,
@@ -300,7 +303,8 @@ impl Labyrinth {
         let (record, _) = bundle.to_bundle()?;
         let vdev = b
             .mailbox
-            .get_virtual_device(&record.vdevice_id)?
+            .get_virtual_device(&record.vdevice_id)
+            .await?
             .ok_or(Error::NotFound("virtual device"))?;
         let now = b.clock.now_ms();
         if vdevice_expiry_ms(record.mechanism, bundle)?.is_some_and(|exp| now >= exp)
@@ -314,7 +318,7 @@ impl Labyrinth {
         }
         let restored = virtual_device::open(&record, code, did)?;
         let seq = restored.epoch.seq();
-        let (id, start_record) = epoch_record(b.mailbox.as_ref(), seq)?;
+        let (id, start_record) = epoch_record(b.mailbox.as_ref(), seq).await?;
         let start = PendingEpoch::new(seq, *restored.epoch.root()).assign_id(id);
         verify_public(&start, &start_record.public)?;
         start_record.public.verify(did, None)?;
@@ -325,48 +329,82 @@ impl Labyrinth {
             restored.device.public(),
             &restored.device.storage,
             &Default::default(),
-        )?;
+        )
+        .await?;
         let latest = reached.last().expect("non-empty");
-        let latest_public = verified_own(b.mailbox.as_ref(), b.directory.as_ref(), did, latest)?;
+        let latest_public =
+            verified_own(b.mailbox.as_ref(), b.directory.as_ref(), did, latest).await?;
         check_candidate_integrity(
             b.mailbox.as_ref(),
             b.directory.as_ref(),
             did,
             latest.seq,
             &latest_public.head,
-        )?;
+        )
+        .await?;
         Ok(PreparedRestore {
-            record,
+            vdev,
             restored,
             reached,
             latest_public,
         })
     }
 
-    fn finish_prepared_restore(
+    async fn finish_prepared_restore(
         did: &str,
         prepared: PreparedRestore,
-        transport: Box<dyn TransportSigner + Send>,
+        transport: Box<dyn TransportSigner>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
         let PreparedRestore {
-            record,
+            mut vdev,
             restored,
-            reached,
+            mut reached,
             latest_public,
         } = prepared;
-        let latest = reached.last().expect("non-empty");
-        let (device, public, member) = virtual_device::enroll_from_virtual(&restored, latest)?;
-        let now = datetime_from_ms(b.clock.now_ms());
-        let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());
-        b.mailbox
-            .create_device(&Device::bound(&public, &binding, now.clone()))?;
-        b.mailbox
-            .create_epoch_member(&EpochMember::from_record(&member, now))?;
-        match b.mailbox.touch_virtual_device(&record.vdevice_id) {
-            Ok(()) | Err(Error::NotSupported(_)) => {}
-            Err(e) => return Err(e),
+        let mine = transport.transport_public_key();
+        let current = b.directory.device_transport_keys(did).await?;
+        if !current.iter().any(|k| k.is_current() && k.key == mine) {
+            return Err(Error::Unattested);
         }
+        let latest = reached.last().expect("non-empty");
+        let (device, public, _) = virtual_device::enroll_from_virtual(&restored, latest)?;
+        let audit =
+            audit_epoch_stores(b.mailbox.as_ref(), b.directory.as_ref(), did, latest).await?;
+        let continuing: Vec<DevicePublic> = audit
+            .valid
+            .iter()
+            .filter(|v| !v.revoked)
+            .map(|v| v.public.clone())
+            .collect();
+        let prev_members: Vec<EpochMemberRecord> =
+            audit.valid.iter().map(|v| v.record.clone()).collect();
+        let (pending_next, new_next) = open_next_enrolling(
+            did,
+            latest,
+            &latest_public,
+            &prev_members,
+            &continuing,
+            &device,
+            transport.as_ref(),
+        )?;
+        let now = datetime_from_ms(b.clock.now_ms());
+        vdev.last_used_at = Some(now.clone());
+        let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());
+        let bundle = AtomicEnrollBundle {
+            cleanup: Some(EnrollCleanup::TouchVirtualDevice { updated: vdev }),
+            device: Device::bound(&public, &binding, now.clone()),
+            epoch: Epoch::from_record(&new_next.record, now.clone()),
+            members: new_next
+                .members
+                .iter()
+                .map(|m| EpochMember::from_record(m, now.clone()))
+                .collect(),
+        };
+        let next_id = b.mailbox.atomic_enroll(&bundle).await?;
+        let next_secret = pending_next.assign_id(next_id);
+        let next_seq = next_secret.seq;
+        reached.push(next_secret);
         let mut me = Self::assemble(
             did,
             device,
@@ -375,7 +413,12 @@ impl Labyrinth {
             restored.mailbox_root_salt,
             reached,
         )?;
-        me.adopted(latest_public);
+        me.adopted(new_next.record.public.clone());
+        me.remember_verified(
+            next_seq,
+            new_next.members.iter().map(|m| m.device_key_pub.0),
+        );
+        me.publish_keys(&new_next.record.public).await?;
         Ok((
             me,
             Enrollment {
@@ -392,14 +435,14 @@ impl Labyrinth {
 
     /// Existing device: answer the new device's hybrid PQ CPace + ML-KEM-768 message
     /// and send it the sealed enrollment payload for the current epoch (SPEC §6.5).
-    pub fn otc_respond(
+    pub async fn otc_respond(
         &mut self,
         responder: &mut Responder,
         msg: &InitiatorMessage,
     ) -> Result<OtcResponse> {
-        self.sync_epochs()?;
+        self.sync_epochs().await?;
         let (message, session_key) = responder.respond(msg)?;
-        let epoch = self.epoch_secret(self.latest)?;
+        let epoch = self.epoch_secret(self.latest).await?;
         let payload = OtcPayload::create(&epoch, &self.mailbox_root_salt);
         Ok(OtcResponse {
             message,
@@ -412,43 +455,99 @@ impl Labyrinth {
         Initiator::start(&OneTimeCode::parse(code_input)?, did)
     }
 
-    /// New device: finish the session, open the payload and enroll into
-    /// the transferred epoch (after checking it against the store).
-    pub fn enroll_via_otc(
+    /// New device: finish the session, open the payload, verify the transferred
+    /// epoch `E` against the store, and atomically rotate `E -> E+1` (`Gate 3`).
+    pub async fn enroll_via_otc(
         did: &str,
         initiator: Initiator,
         response: &ResponderMessage,
         sealed_payload: &[u8],
-        transport: Box<dyn TransportSigner + Send>,
+        transport: Box<dyn TransportSigner>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
+        Self::enroll_via_otc_session(did, initiator, response, sealed_payload, None, transport, b)
+            .await
+    }
+
+    /// [`enroll_via_otc`](Self::enroll_via_otc) with an optional `otcSession`
+    /// `rkey` consumed atomically in the same `space.applyWrites` transaction (`Gate 3`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enroll_via_otc_session(
+        did: &str,
+        initiator: Initiator,
+        response: &ResponderMessage,
+        sealed_payload: &[u8],
+        otc_session_rkey: Option<String>,
+        transport: Box<dyn TransportSigner>,
+        b: Backends,
+    ) -> Result<(Self, Enrollment)> {
+        let mine = transport.transport_public_key();
+        let current = b.directory.device_transport_keys(did).await?;
+        if !current.iter().any(|k| k.is_current() && k.key == mine) {
+            return Err(Error::Unattested);
+        }
         let session_key = initiator.finish(response)?;
         let payload = OtcPayload::open(&session_key, sealed_payload)?;
         let epoch: &EpochSecret = &payload.epoch;
-        let epoch_public = verified_own(b.mailbox.as_ref(), b.directory.as_ref(), did, epoch)?;
+        let epoch_public =
+            verified_own(b.mailbox.as_ref(), b.directory.as_ref(), did, epoch).await?;
         check_candidate_integrity(
             b.mailbox.as_ref(),
             b.directory.as_ref(),
             did,
             epoch.seq,
             &epoch_public.head,
+        )
+        .await?;
+        let (device, public, _) = payload.enroll()?;
+        let audit =
+            audit_epoch_stores(b.mailbox.as_ref(), b.directory.as_ref(), did, epoch).await?;
+        let continuing: Vec<DevicePublic> = audit
+            .valid
+            .iter()
+            .filter(|v| !v.revoked)
+            .map(|v| v.public.clone())
+            .collect();
+        let prev_members: Vec<EpochMemberRecord> =
+            audit.valid.iter().map(|v| v.record.clone()).collect();
+        let (pending_next, new_next) = open_next_enrolling(
+            did,
+            epoch,
+            &epoch_public,
+            &prev_members,
+            &continuing,
+            &device,
+            transport.as_ref(),
         )?;
-        let (device, public, member) = payload.enroll()?;
         let now = datetime_from_ms(b.clock.now_ms());
         let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());
-        b.mailbox
-            .create_device(&Device::bound(&public, &binding, now.clone()))?;
-        b.mailbox
-            .create_epoch_member(&EpochMember::from_record(&member, now))?;
+        let bundle = AtomicEnrollBundle {
+            cleanup: otc_session_rkey.map(|rkey| EnrollCleanup::ConsumeOtcSession { rkey }),
+            device: Device::bound(&public, &binding, now.clone()),
+            epoch: Epoch::from_record(&new_next.record, now.clone()),
+            members: new_next
+                .members
+                .iter()
+                .map(|m| EpochMember::from_record(m, now.clone()))
+                .collect(),
+        };
+        let next_id = b.mailbox.atomic_enroll(&bundle).await?;
+        let next_secret = pending_next.assign_id(next_id);
+        let next_seq = next_secret.seq;
         let mut me = Self::assemble(
             did,
             device,
             transport,
             b,
             payload.mailbox_root_salt,
-            [payload.epoch.clone()],
+            [payload.epoch.clone(), next_secret],
         )?;
-        me.adopted(epoch_public);
+        me.adopted(new_next.record.public.clone());
+        me.remember_verified(
+            next_seq,
+            new_next.members.iter().map(|m| m.device_key_pub.0),
+        );
+        me.publish_keys(&new_next.record.public).await?;
         Ok((
             me,
             Enrollment {

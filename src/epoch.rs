@@ -4,7 +4,7 @@ pub mod chain;
 pub mod open;
 
 pub use chain::{OpenedEpoch, backward_chain, forward_chain};
-pub use open::{NewEpoch, open_genesis, open_next};
+pub use open::{NewEpoch, open_genesis, open_next, open_next_enrolling};
 
 use subtle::ConstantTimeEq as _;
 use zeroize::Zeroizing;

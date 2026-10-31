@@ -52,9 +52,7 @@ fn check<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
 #[test]
 fn lexicons_are_well_formed() {
     let lex = lexicons();
-    // 9 record lexicons, `defs`, and 41 XRPC queries and procedures
-    // (including the server-to-server `labyrinthRelay`).
-    assert_eq!(lex.docs().count(), 51);
+    assert_eq!(lex.docs().count(), 56);
     for (id, doc) in lex.docs() {
         let main = &doc["defs"]["main"];
         if let Some(t @ ("query" | "procedure")) = main["type"].as_str() {
@@ -138,7 +136,7 @@ fn mailbox_records_round_trip() {
 
     // Virtual devices, with and without the passkey wrap.
     let code = RecoveryCode::generate().unwrap();
-    let (vrec, _, _) =
+    let (vrec, _) =
         virtual_device::create(DID, &code, &a, &e0, &[9u8; 32], Mechanism::Passkey).unwrap();
     let wrap = PasskeyWrap {
         wrapped_code: passkey::wrap_code(&[4u8; 32], &code).unwrap(),
@@ -155,6 +153,31 @@ fn mailbox_records_round_trip() {
     let vdev = Device::from_public(&vrec.public, ts.clone());
     check(&lex, nsid::DEVICE, &vdev);
     assert_eq!(vdev.to_public().unwrap(), vrec.public);
+
+    // Hybrid PQ OTC session record (`I16`, Gate 3).
+    let otc = labyrinth::records::OtcSession {
+        type_: nsid::OTC_SESSION.to_owned(),
+        session_id: "otc-test-1".to_owned(),
+        initiator_device_key_pubkey: labyrinth::records::Bytes::from_slice(&[0x11; 32]),
+        ya: labyrinth::records::Bytes::from_slice(&[0x22; 32]),
+        ek_otc: labyrinth::records::Bytes(vec![0x33; 1184]),
+        yb: Some(labyrinth::records::Bytes::from_slice(&[0x44; 32])),
+        kem_ct: Some(labyrinth::records::Bytes(vec![0x55; 1088])),
+        sealed_payload: Some(labyrinth::records::Bytes(vec![0x66; 128])),
+        expires_at: ts.clone(),
+        created_at: ts.clone(),
+    };
+    check(&lex, nsid::OTC_SESSION, &otc);
+
+    // Ciphertext-only Space attachment manifest (`Gate 5`).
+    let meta = labyrinth::attachment::AttachmentCiphertextMeta::from_ciphertext(
+        b"encrypted-blob-bytes",
+        Some("image/png".into()),
+    )
+    .unwrap();
+    let manifest =
+        labyrinth::records::AttachmentManifest::from_meta("bafkreitestcid", &meta, ts.clone());
+    check(&lex, nsid::ATTACHMENT_MANIFEST, &manifest);
 
     // Owner batch of 256 messages.
     let msgs: Vec<_> = (0..256u64)
@@ -179,7 +202,7 @@ struct M {
 fn member(name: &str, n: u8) -> M {
     let did = format!("did:plc:{name}");
     let keys = labyrinth::mailbox::MailboxKeys::derive(&[n; 32], 0);
-    let epoch = EpochPublic::sign(&did, 0, &keys, None, None, &transport(n)).unwrap();
+    let epoch = EpochPublic::sign(&did, 0, &keys, [n; 32], None, None, &transport(n)).unwrap();
     M { did, keys, epoch }
 }
 
@@ -410,7 +433,7 @@ fn gap_fields_validate() {
     let (p0, _) = open_genesis(DID, &a, &transport(1)).unwrap();
     let e0 = p0.assign_id(space_epoch_id(0));
     let code = RecoveryCode::generate().unwrap();
-    let (vrec, _, _) =
+    let (vrec, _) =
         virtual_device::create(DID, &code, &a, &e0, &[9u8; 32], Mechanism::Keychain).unwrap();
     let mut vd = VirtualDevice::from_bundle(&vrec, None, ts.clone());
     vd.last_used_at = Some(datetime_from_ms(10));

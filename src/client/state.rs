@@ -13,18 +13,20 @@
 //! It does **not** hold unflushed batches: call [`Labyrinth::flush`]
 //! first.
 //!
-//! Encoding (version 2), all integers big-endian, strings and lists
+//! Encoding (version 3), all integers big-endian, strings and lists
 //! length-prefixed, no trailing bytes:
 //!
 //! ```text
-//! "LBYS" 0x02            (0x01 = the same without `verified`)
+//! "LBYS" 0x03            (PQ clean-slate state; 0x01/0x02 rejected)
 //! did                      str16
 //! transportPub             32
-//! deviceKey storage        32 32
+//! deviceKey                32
+//! storage                  96   (Hawk HPKE EncSecret)
 //! storageAuth              opt(32)
-//! orfClientState           32
-//! public: deviceKeyPub storagePub sig0x30   32 32 64
-//!         authPub sig0x31 isVirtual         opt(32) opt(64) u8
+//! public: deviceKeyPub     32
+//!         storagePub       1216 (Hawk HPKE EncPublic)
+//!         sigStorage       64   (0x30 physical / 0x34 virtual)
+//!         authPub sig0x31 isVirtual  opt(32) opt(64) u8
 //! mailboxRootSalt          32
 //! latest                   u64
 //! epochs   u32 × (seq u64, epochID str16, root 32)
@@ -258,10 +260,10 @@ impl Labyrinth {
     /// the device secrets must match their public record, and the newest
     /// epoch must match the record in `b.mailbox`. Call
     /// [`sync_epochs`](Self::sync_epochs) afterwards to catch up.
-    pub fn from_state(
+    pub async fn from_state(
         bytes: &[u8],
         did: &str,
-        transport: Box<dyn TransportSigner + Send>,
+        transport: Box<dyn TransportSigner>,
         b: Backends,
     ) -> Result<Self> {
         let mut r = R(bytes);
@@ -357,16 +359,21 @@ impl Labyrinth {
         // The attester lookup may wait for the directory: a restart must
         // work offline, and nothing is addressed to this epoch until a
         // sync or roster resolution finishes the check.
-        let newest = me.epoch_secret(latest)?;
+        let newest = me.epoch_secret(latest).await?;
         let public =
-            super::epochs::verified_own_signatures(me.b.mailbox.as_ref(), &me.did, &newest)?;
+            super::epochs::verified_own_signatures(me.b.mailbox.as_ref(), &me.did, &newest).await?;
         me.own_latest = Some(public.clone());
-        me.own_attester_checked =
-            match super::epochs::check_own_attester(me.b.directory.as_ref(), &me.did, &public) {
-                Ok(()) => true,
-                Err(Error::Unattested) => return Err(Error::Unattested),
-                Err(_) => false,
-            };
+        me.own_attester_checked = match super::epochs::check_own_attester(
+            me.b.directory.as_ref(),
+            &me.did,
+            &public,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(Error::Unattested) => return Err(Error::Unattested),
+            Err(_) => false,
+        };
         me.revoked = revoked;
         me.verified = verified;
         me.pins = pins;

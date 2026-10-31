@@ -26,12 +26,36 @@ pub const OWNER_VERSION: u8 = 5;
 const KIND_FRAME: u8 = 0x00;
 /// v5 content kind: a delete-for-me tombstone ([CB-38]).
 const KIND_TOMBSTONE: u8 = 0x01;
+/// v5 content kind: an `I13` receipt-committed frame (`[frame_nonce: 32B || frame]`).
+const KIND_COMMITTED_FRAME: u8 = 0x02;
+
+/// Sequencer receipt carried alongside a sealed or owner-archived item (`I13`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchivedReceipt {
+    pub signed: labyrinth_protocol::receipt::SignedSequencerReceipt,
+    pub generation: u64,
+}
+
+impl ArchivedReceipt {
+    pub fn new(signed: labyrinth_protocol::receipt::SignedSequencerReceipt) -> Self {
+        Self {
+            signed,
+            generation: 0,
+        }
+    }
+}
 
 /// What an owner record holds once opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnerContent {
     /// An archived message frame.
     Frame(Vec<u8>),
+    /// An `I13` receipt-committed message frame with its 32-byte `frame_nonce`
+    /// kept strictly inside ciphertext.
+    CommittedFrame {
+        frame_nonce: [u8; 32],
+        frame: Vec<u8>,
+    },
     /// A delete-for-me tombstone ([CB-38], v5 only): hide the message with
     /// this record's `messageId` on every device of the account; only the
     /// copies from `author` when it is set.
@@ -48,14 +72,16 @@ pub enum OwnerContent {
 pub struct OwnerMessage {
     pub thread_id: String,
     pub message_id: String,
+    pub seq: Option<u64>,
     pub timestamp: u64,
     pub epoch_seq: u64,
     pub version: u8,
     pub encrypted: Vec<u8>,
+    pub sequencer_receipt: Option<ArchivedReceipt>,
 }
 
 /// Owner message key for cipher `version` (p.37–38, p.51–52). Version 1 and
-/// anything above 4 are rejected.
+/// anything above 5 are rejected.
 pub fn owner_message_key_versioned(
     version: u8,
     root: &[u8; 32],
@@ -106,14 +132,17 @@ fn owner_aad(version: u8, thread_id: &str, message_id: &str, timestamp: u64) -> 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seal_owner_kind(
     epoch_root: &[u8; 32],
     epoch_seq: u64,
     thread_id: &str,
     message_id: &str,
+    seq: Option<u64>,
     timestamp: u64,
     kind: u8,
     body: &[u8],
+    sequencer_receipt: Option<ArchivedReceipt>,
 ) -> Result<OwnerMessage> {
     let key = owner_message_key_versioned(OWNER_VERSION, epoch_root, epoch_seq, thread_id)?;
     let aad = owner_aad(OWNER_VERSION, thread_id, message_id, timestamp);
@@ -121,10 +150,12 @@ fn seal_owner_kind(
     Ok(OwnerMessage {
         thread_id: thread_id.to_owned(),
         message_id: message_id.to_owned(),
+        seq,
         timestamp,
         epoch_seq,
         version: OWNER_VERSION,
         encrypted: aead::seal(&key, &aad, &Zeroizing::new(pad(&content)))?,
+        sequencer_receipt,
     })
 }
 
@@ -139,7 +170,34 @@ pub fn seal_owner(
     data: &[u8],
 ) -> Result<OwnerMessage> {
     seal_owner_kind(
-        epoch_root, epoch_seq, thread_id, message_id, timestamp, KIND_FRAME, data,
+        epoch_root, epoch_seq, thread_id, message_id, None, timestamp, KIND_FRAME, data, None,
+    )
+}
+
+/// Encrypt an `I13` receipt-committed frame (`[frame_nonce || payload_bytes]`)
+/// as an owner message in epoch `epoch_seq`.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_owner_committed(
+    epoch_root: &[u8; 32],
+    epoch_seq: u64,
+    thread_id: &str,
+    message_id: &str,
+    timestamp: u64,
+    frame_nonce: &[u8; 32],
+    payload_bytes: &[u8],
+    receipt: &ArchivedReceipt,
+) -> Result<OwnerMessage> {
+    let body = Zeroizing::new([frame_nonce.as_slice(), payload_bytes].concat());
+    seal_owner_kind(
+        epoch_root,
+        epoch_seq,
+        thread_id,
+        message_id,
+        Some(receipt.signed.payload.seq),
+        timestamp,
+        KIND_COMMITTED_FRAME,
+        &body,
+        Some(receipt.clone()),
     )
 }
 
@@ -161,9 +219,11 @@ pub fn seal_owner_tombstone(
         epoch_seq,
         thread_id,
         message_id,
+        None,
         timestamp,
         KIND_TOMBSTONE,
         body,
+        None,
     )
 }
 
@@ -181,6 +241,15 @@ pub fn open_owner_content(epoch_root: &[u8; 32], msg: &OwnerMessage) -> Result<O
         .ok_or(Error::Malformed("owner v5 content is empty"))?;
     match *kind {
         KIND_FRAME => Ok(OwnerContent::Frame(body.to_vec())),
+        KIND_COMMITTED_FRAME => {
+            let (nonce, frame) = body
+                .split_first_chunk::<32>()
+                .ok_or(Error::ReceiptCommitmentMismatch)?;
+            Ok(OwnerContent::CommittedFrame {
+                frame_nonce: *nonce,
+                frame: frame.to_vec(),
+            })
+        }
         KIND_TOMBSTONE => {
             let author = String::from_utf8(body.to_vec())
                 .map_err(|_| Error::Malformed("tombstone author is not UTF-8"))?;
@@ -196,7 +265,23 @@ pub fn open_owner_content(epoch_root: &[u8; 32], msg: &OwnerMessage) -> Result<O
 /// [`Error::Malformed`] (use [`open_owner_content`] to read those).
 pub fn open_owner(epoch_root: &[u8; 32], msg: &OwnerMessage) -> Result<Vec<u8>> {
     match open_owner_content(epoch_root, msg)? {
-        OwnerContent::Frame(f) => Ok(f),
+        OwnerContent::Frame(f) => {
+            if msg.sequencer_receipt.is_some() {
+                return Err(Error::ReceiptCommitmentMismatch);
+            }
+            Ok(f)
+        }
+        OwnerContent::CommittedFrame { frame_nonce, frame } => {
+            if let Some(r) = &msg.sequencer_receipt {
+                labyrinth_protocol::verify_archived_item_commitment(
+                    &r.signed,
+                    &frame_nonce,
+                    &frame,
+                )
+                .map_err(|_| Error::ReceiptCommitmentMismatch)?;
+            }
+            Ok(frame)
+        }
         OwnerContent::Tombstone { .. } => Err(Error::Malformed("owner record is a tombstone")),
     }
 }
@@ -206,11 +291,13 @@ pub fn open_owner(epoch_root: &[u8; 32], msg: &OwnerMessage) -> Result<Vec<u8>> 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedMessage {
     pub message_id: String,
+    pub seq: Option<u64>,
     pub timestamp: u64,
     pub mek_id: [u8; 12],
     pub sender_transport_pub: [u8; 32],
     /// `Ed25519 sig(64) || suite-tagged AEAD ciphertext`.
     pub signed_enc_message: Vec<u8>,
+    pub sequencer_receipt: Option<ArchivedReceipt>,
 }
 
 const MESSAGE_SIG_PREFIX: &[u8] = b"minos.unstructured_signature.message:";
@@ -262,11 +349,33 @@ pub fn seal_sender(
     let sig = transport.sign_transport(&[MESSAGE_SIG_PREFIX, &ct].concat());
     Ok(SealedMessage {
         message_id: message_id.to_owned(),
+        seq: None,
         timestamp,
         mek_id: *mek.id(),
         sender_transport_pub: sender_pk,
         signed_enc_message: [sig.as_slice(), &ct].concat(),
+        sequencer_receipt: None,
     })
+}
+
+/// Encrypt and sign `[frame_nonce: 32B || payload_bytes]` under `mek` with an
+/// `I13` sequencer receipt attached (`frame_nonce` never leaves AEAD plaintext).
+#[allow(clippy::too_many_arguments)]
+pub fn seal_sender_committed(
+    mek: &Mek,
+    thread_id: &str,
+    message_id: &str,
+    timestamp: u64,
+    frame_nonce: &[u8; 32],
+    payload_bytes: &[u8],
+    receipt: &ArchivedReceipt,
+    transport: &dyn TransportSigner,
+) -> Result<SealedMessage> {
+    let combined = Zeroizing::new([frame_nonce.as_slice(), payload_bytes].concat());
+    let mut sealed = seal_sender(mek, thread_id, message_id, timestamp, &combined, transport)?;
+    sealed.seq = Some(receipt.signed.payload.seq);
+    sealed.sequencer_receipt = Some(receipt.clone());
+    Ok(sealed)
 }
 
 /// Verify and decrypt a sender message (p.41). The caller must also check
@@ -294,6 +403,19 @@ pub fn open_sender(sealed: &SealedMessage, thread_id: &str, mek: &Mek) -> Result
     );
     let padded = Zeroizing::new(aead::decrypt_suite(Suite::DndkGcm, &key, &aad, ct)?);
     unpad(&padded)
+}
+
+/// Verify and decrypt a committed sender message, splitting `(frame_nonce, payload_bytes)`.
+pub fn open_sender_committed(
+    sealed: &SealedMessage,
+    thread_id: &str,
+    mek: &Mek,
+) -> Result<([u8; 32], Vec<u8>)> {
+    let raw = open_sender(sealed, thread_id, mek)?;
+    let (nonce, payload) = raw
+        .split_first_chunk::<32>()
+        .ok_or(Error::ReceiptCommitmentMismatch)?;
+    Ok((*nonce, payload.to_vec()))
 }
 
 /// Checks the sender's transport key is one of `allowed` — the caller's list
@@ -355,10 +477,12 @@ mod tests {
             let msg = OwnerMessage {
                 thread_id: "th".into(),
                 message_id: "m".into(),
+                seq: None,
                 timestamp: 1,
                 epoch_seq: 2,
                 version: v,
                 encrypted: aead::seal(&key, b"message_thread_th", &pad(b"old")).unwrap(),
+                sequencer_receipt: None,
             };
             assert_eq!(open_owner(&root, &msg).unwrap(), b"old");
             let mut v1 = msg.clone();
@@ -432,6 +556,7 @@ mod tests {
         let m = OwnerMessage {
             thread_id: "th".into(),
             message_id: "m".into(),
+            seq: None,
             timestamp: 1,
             epoch_seq: 2,
             version: 3,
@@ -442,6 +567,7 @@ mod tests {
                 &pad(b"old"),
             )
             .unwrap(),
+            sequencer_receipt: None,
         };
         assert_eq!(open_owner(&root, &m).unwrap(), b"old");
     }

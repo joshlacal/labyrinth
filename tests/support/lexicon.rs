@@ -271,6 +271,37 @@ impl Lexicons {
                 self.validate_record(t, v)
                     .map_err(|e| format!("{path}: {e}"))
             }
+            "blob" => {
+                let o = v
+                    .as_object()
+                    .ok_or(format!("{path}: expected blob object"))?;
+                if o.get("$type").and_then(Value::as_str) != Some("blob") {
+                    return Err(format!("{path}: blob $type must be \"blob\""));
+                }
+                if !o.get("mimeType").is_some_and(Value::is_string) {
+                    return Err(format!("{path}: blob missing mimeType"));
+                }
+                let size = o
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .ok_or(format!("{path}: blob missing size"))?;
+                if def
+                    .get("maxSize")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|m| size > m)
+                {
+                    return Err(format!("{path}: blob size {size} > maxSize"));
+                }
+                if !o
+                    .get("ref")
+                    .and_then(Value::as_object)
+                    .and_then(|r| r.get("$link"))
+                    .is_some_and(Value::is_string)
+                {
+                    return Err(format!("{path}: blob missing ref.$link"));
+                }
+                Ok(())
+            }
             "union" => {
                 let t = v
                     .get("$type")

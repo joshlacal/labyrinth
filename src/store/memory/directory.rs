@@ -3,7 +3,9 @@
 use super::MemoryBackend;
 use crate::Result;
 use crate::mailbox::EpochPublic;
-use crate::store::{ChatDeviceKey, MailboxDirectory, MemberDeviceKey, SequencerKey};
+use crate::store::{
+    ChatDeviceKey, MailboxDirectory, MemberDeviceKey, SequencerKey, SequencerReceiptKey,
+};
 
 /// [`MailboxDirectory`] over the backend's public `mailboxKeys` records
 /// (the PDS view) and its MLS device view.
@@ -15,15 +17,22 @@ impl MemoryDirectory {
     pub(super) fn new(backend: MemoryBackend) -> Self {
         Self { backend }
     }
+
+    /// Synchronous helper for test harnesses setting up chat device keys.
+    pub fn device_transport_keys_sync(&self, did: &str) -> Vec<ChatDeviceKey> {
+        self.backend.chat_keys(did)
+    }
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl MailboxDirectory for MemoryDirectory {
-    fn latest(&self, did: &str) -> Result<Option<EpochPublic>> {
+    async fn latest(&self, did: &str) -> Result<Option<EpochPublic>> {
         let s = self.backend.lock();
         s.public_keys.get(did).map(|r| r.to_public()).transpose()
     }
 
-    fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>> {
+    async fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>> {
         let s = self.backend.lock();
         s.public_history
             .get(did)
@@ -32,11 +41,11 @@ impl MailboxDirectory for MemoryDirectory {
             .transpose()
     }
 
-    fn device_transport_keys(&self, did: &str) -> Result<Vec<ChatDeviceKey>> {
+    async fn device_transport_keys(&self, did: &str) -> Result<Vec<ChatDeviceKey>> {
         Ok(self.backend.chat_keys(did))
     }
 
-    fn member_device_keys(
+    async fn member_device_keys(
         &self,
         thread_id: &str,
         did: &str,
@@ -44,7 +53,11 @@ impl MailboxDirectory for MemoryDirectory {
         Ok(self.backend.member_keys(thread_id, did))
     }
 
-    fn sequencer_key(&self, _thread_id: &str) -> Result<Option<SequencerKey>> {
+    async fn sequencer_key(&self, _thread_id: &str) -> Result<Option<SequencerKey>> {
         Ok(self.backend.sequencer_key())
+    }
+
+    async fn sequencer_receipt_key(&self, thread_id: &str) -> Result<Option<SequencerReceiptKey>> {
+        Ok(self.backend.receipt_key(thread_id))
     }
 }

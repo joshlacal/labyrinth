@@ -1,14 +1,17 @@
-//! The mls-ds epoch-head directory and the two head publishers (design
-//! `docs/MLSDS_BACKEND.md` §1a): an append-only chain of every enrolled
-//! DID's epoch heads, independent of the PDS `mailboxKeys` record.
+//! The `mls-ds` epoch-head directory and the two head publishers (`Gate 6`):
+//! an append-only chain of every enrolled DID's `EpochPublicHeader`s with `floor_seq`,
+//! independent of the PDS `mailboxKeys` record.
 
 use super::MemoryBackend;
 use crate::mailbox::EpochPublic;
 use crate::records::MailboxKeysRecord;
-use crate::store::{ChatDeviceKey, KeyPublisher, MailboxDirectory, MemberDeviceKey, SequencerKey};
+use crate::store::{
+    ChatDeviceKey, KeyPublisher, MailboxDirectory, MemberDeviceKey, SequencerKey,
+    SequencerReceiptKey,
+};
 use crate::{Error, Result};
 
-/// [`MailboxDirectory`] over the mls-ds head chain and the MLS device view.
+/// [`MailboxDirectory`] over the `mls-ds` head chain and the MLS device view.
 pub struct MemoryDsDirectory {
     backend: MemoryBackend,
 }
@@ -19,8 +22,10 @@ impl MemoryDsDirectory {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl MailboxDirectory for MemoryDsDirectory {
-    fn latest(&self, did: &str) -> Result<Option<EpochPublic>> {
+    async fn latest(&self, did: &str) -> Result<Option<EpochPublic>> {
         let s = self.backend.lock();
         Ok(s.ds_heads
             .get(did)
@@ -28,16 +33,40 @@ impl MailboxDirectory for MemoryDsDirectory {
             .cloned())
     }
 
-    fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>> {
+    async fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>> {
         let s = self.backend.lock();
         Ok(s.ds_heads.get(did).and_then(|h| h.get(&seq)).cloned())
     }
 
-    fn device_transport_keys(&self, did: &str) -> Result<Vec<ChatDeviceKey>> {
+    async fn epoch_chain(
+        &self,
+        did: &str,
+    ) -> Result<Option<(Vec<labyrinth_protocol::EpochPublicHeader>, u64)>> {
+        let s = self.backend.lock();
+        let Some(chain) = s.ds_heads.get(did) else {
+            return Ok(None);
+        };
+        if chain.is_empty() && !s.ds_floor_overrides.contains_key(did) {
+            return Ok(None);
+        }
+        let headers = chain
+            .values()
+            .map(EpochPublic::to_protocol_header)
+            .collect::<Vec<_>>();
+        let floor_seq = s
+            .ds_floor_overrides
+            .get(did)
+            .copied()
+            .or_else(|| s.ds_floors.get(did).copied())
+            .unwrap_or(0);
+        Ok(Some((headers, floor_seq)))
+    }
+
+    async fn device_transport_keys(&self, did: &str) -> Result<Vec<ChatDeviceKey>> {
         Ok(self.backend.chat_keys(did))
     }
 
-    fn member_device_keys(
+    async fn member_device_keys(
         &self,
         thread_id: &str,
         did: &str,
@@ -45,8 +74,12 @@ impl MailboxDirectory for MemoryDsDirectory {
         Ok(self.backend.member_keys(thread_id, did))
     }
 
-    fn sequencer_key(&self, _thread_id: &str) -> Result<Option<SequencerKey>> {
+    async fn sequencer_key(&self, _thread_id: &str) -> Result<Option<SequencerKey>> {
         Ok(self.backend.sequencer_key())
+    }
+
+    async fn sequencer_receipt_key(&self, thread_id: &str) -> Result<Option<SequencerReceiptKey>> {
+        Ok(self.backend.receipt_key(thread_id))
     }
 }
 
@@ -66,11 +99,7 @@ impl MemoryDsPublisher {
 }
 
 impl MemoryBackend {
-    /// Records `epoch` as `did`'s next head with mls-ds's checks: the head
-    /// verifies, a current chat device of `did` attested it, the number is
-    /// 0 or the latest + 1 and its previous head is the stored one.
-    /// Identical bytes for a recorded number succeed; different bytes fail
-    /// with [`Error::Conflict`] (`EpochHeadConflict`).
+    /// Records `epoch` as `did`'s next head with `mls-ds`'s checks.
     pub(crate) fn record_ds_head(&self, did: &str, epoch: &EpochPublic) -> Result<()> {
         epoch.verify(did, None)?;
         let current = self
@@ -107,13 +136,18 @@ impl MemoryBackend {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl KeyPublisher for MemoryDsPublisher {
-    fn publish(&self, record: &MailboxKeysRecord) -> Result<()> {
+    async fn publish(&self, record: &MailboxKeysRecord) -> Result<()> {
         self.backend.record_ds_head(&self.did, &record.to_public()?)
     }
 
-    fn retract(&self) -> Result<()> {
-        self.backend.lock().ds_heads.remove(&self.did);
+    async fn retract(&self) -> Result<()> {
+        let mut s = self.backend.lock();
+        s.ds_heads.remove(&self.did);
+        s.ds_floors.remove(&self.did);
+        s.ds_floor_overrides.remove(&self.did);
         Ok(())
     }
 }
@@ -133,12 +167,14 @@ impl MemoryPdsPublisher {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl KeyPublisher for MemoryPdsPublisher {
-    fn publish(&self, record: &MailboxKeysRecord) -> Result<()> {
+    async fn publish(&self, record: &MailboxKeysRecord) -> Result<()> {
         self.backend.lock().publish_pds(&self.did, record)
     }
 
-    fn retract(&self) -> Result<()> {
+    async fn retract(&self) -> Result<()> {
         let mut s = self.backend.lock();
         s.public_keys.remove(&self.did);
         s.public_history.remove(&self.did);

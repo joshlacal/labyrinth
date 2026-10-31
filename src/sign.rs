@@ -190,7 +190,7 @@ impl XVerifyingKey {
 }
 
 /// The sending chat device's transport key ([CB-3]): Ed25519.
-pub trait TransportSigner {
+pub trait TransportSigner: crate::store::MaybeSend + crate::store::MaybeSync {
     fn transport_public_key(&self) -> [u8; 32];
     fn sign_transport(&self, msg: &[u8]) -> [u8; 64];
 }

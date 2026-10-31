@@ -1,8 +1,9 @@
 //! [`ThreadStore`] over the in-memory conversation spaces.
 
 use super::{MemoryBackend, ThreadSpace, create};
+use crate::attachment::{AttachmentCiphertextMeta, verify_attachment_ciphertext};
 use crate::deletion::Redaction;
-use crate::records::{Batch, MekDistribution};
+use crate::records::{AttachmentManifest, Batch, MekDistribution};
 use crate::store::{Stored, ThreadStore, TimeRange};
 use crate::{Error, Result};
 
@@ -34,12 +35,14 @@ impl MemoryThreads {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl ThreadStore for MemoryThreads {
     fn author(&self) -> &str {
         &self.did
     }
 
-    fn create_mek(&self, mek: &MekDistribution) -> Result<()> {
+    async fn create_mek(&self, mek: &MekDistribution) -> Result<()> {
         let mut s = self.backend.lock();
         if s.threads
             .get(&mek.thread_id)
@@ -61,7 +64,7 @@ impl ThreadStore for MemoryThreads {
         create(&mut repo.meks, mek.rkey(), &(mek.clone(), order))
     }
 
-    fn find_meks(
+    async fn find_meks(
         &self,
         thread_id: &str,
         mek_id: &[u8; 12],
@@ -82,7 +85,7 @@ impl ThreadStore for MemoryThreads {
         })
     }
 
-    fn append_batch(&self, batch: &Batch) -> Result<String> {
+    async fn append_batch(&self, batch: &Batch) -> Result<String> {
         let mut s = self.backend.lock();
         if s.threads
             .get(&batch.thread_id)
@@ -91,14 +94,18 @@ impl ThreadStore for MemoryThreads {
             return Err(Error::Forbidden);
         }
         let tid = s.next_tid();
+        let rkey = match batch.items.first().and_then(|i| i.seq) {
+            Some(first_seq) => format!("{first_seq:016x}-{tid}"),
+            None => tid,
+        };
         let order = s.stamp_thread(&batch.thread_id);
         let t = s.threads.entry(batch.thread_id.clone()).or_default();
         let repo = t.repos.entry(self.did.clone()).or_default();
-        create(&mut repo.batches, tid.clone(), &(batch.clone(), order))?;
-        Ok(tid)
+        create(&mut repo.batches, rkey.clone(), &(batch.clone(), order))?;
+        Ok(rkey)
     }
 
-    fn list_batches(
+    async fn list_batches(
         &self,
         thread_id: &str,
         sender: Option<&str>,
@@ -123,7 +130,7 @@ impl ThreadStore for MemoryThreads {
         })
     }
 
-    fn list_batches_before(
+    async fn list_batches_before(
         &self,
         thread_id: &str,
         before_ms: Option<u64>,
@@ -182,11 +189,11 @@ impl ThreadStore for MemoryThreads {
         })
     }
 
-    fn list_threads(&self) -> Result<Vec<String>> {
+    async fn list_threads(&self) -> Result<Vec<String>> {
         Ok(self.backend.lock().threads_of(&self.did))
     }
 
-    fn redact_item(
+    async fn redact_item(
         &self,
         thread_id: &str,
         message_id: &str,
@@ -195,5 +202,97 @@ impl ThreadStore for MemoryThreads {
         self.backend
             .lock()
             .redact(&self.did, thread_id, message_id, redaction)
+    }
+
+    async fn upload_and_commit_attachment(
+        &self,
+        thread_id: &str,
+        ciphertext: &[u8],
+        meta: &AttachmentCiphertextMeta,
+        created_at: &str,
+    ) -> Result<String> {
+        verify_attachment_ciphertext(ciphertext, meta)?;
+        let mut s = self.backend.lock();
+        if s.threads
+            .get(thread_id)
+            .is_some_and(|t| t.no_read.contains(&self.did))
+        {
+            return Err(Error::Forbidden);
+        }
+        let rkey = s.next_tid();
+        let cid = s.store_blob(&self.did, ciphertext);
+        let manifest = AttachmentManifest::from_meta(&cid, meta, created_at.to_owned());
+        let t = s.threads.entry(thread_id.to_owned()).or_default();
+        let repo = t.repos.entry(self.did.clone()).or_default();
+        repo.attachments.insert(rkey.clone(), manifest);
+        Ok(rkey)
+    }
+
+    async fn get_attachment_manifest(
+        &self,
+        thread_id: &str,
+        author_did: &str,
+        rkey: &str,
+    ) -> Result<Option<AttachmentManifest>> {
+        self.space(thread_id, |t| {
+            Ok(t.repos
+                .get(author_did)
+                .and_then(|r| r.attachments.get(rkey))
+                .cloned())
+        })
+    }
+
+    async fn get_attachment_verified(
+        &self,
+        thread_id: &str,
+        author_did: &str,
+        rkey: &str,
+    ) -> Result<Vec<u8>> {
+        let s = self.backend.lock();
+        let t = s.threads.get(thread_id).ok_or(Error::NotFound("thread"))?;
+        if t.no_read.contains(&self.did) {
+            return Err(Error::Forbidden);
+        }
+        let manifest = t
+            .repos
+            .get(author_did)
+            .and_then(|r| r.attachments.get(rkey))
+            .ok_or(Error::NotFound("attachmentManifest"))?;
+        let (cid, meta) = manifest.to_meta()?;
+        let bytes = s
+            .blobs
+            .get(&(author_did.to_owned(), cid))
+            .ok_or(Error::NotFound("attachment blob"))?
+            .clone();
+        verify_attachment_ciphertext(&bytes, &meta)?;
+        Ok(bytes)
+    }
+
+    async fn list_own_attachment_manifests(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<(String, AttachmentManifest)>> {
+        self.space(thread_id, |t| {
+            Ok(t.repos
+                .get(&self.did)
+                .map(|r| {
+                    r.attachments
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default())
+        })
+    }
+
+    async fn clear_records(&self, thread_id: &str) -> Result<()> {
+        let mut s = self.backend.lock();
+        if let Some(t) = s.threads.get_mut(thread_id) {
+            if t.no_read.contains(&self.did) {
+                return Err(Error::Forbidden);
+            }
+            t.repos.remove(&self.did);
+        }
+        Ok(())
     }
 }
