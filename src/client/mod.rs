@@ -294,15 +294,28 @@ impl Labyrinth {
         at: VouchAt,
     ) -> Result<Vec<[u8; 32]>> {
         let keys = self.b.directory.device_transport_keys(did).await?;
-        let (leaves, at) = match (thread, at) {
-            (Some(t), at) => (self.b.directory.member_device_keys(t, did).await?, at),
+        match (thread, at) {
+            (Some(t), VouchAt::Server(o)) => {
+                let leaves = self.b.directory.member_device_keys(t, did).await?;
+                Ok(keys_valid_for(&keys, leaves.as_deref(), VouchAt::Server(o)))
+            }
+            (Some(t), other) => {
+                let leaves = self.b.directory.member_device_keys(t, did).await?;
+                let filtered: Vec<_> = match leaves {
+                    Some(ref l) => keys
+                        .into_iter()
+                        .filter(|k| l.iter().any(|m| m.key == k.key))
+                        .collect(),
+                    None => keys,
+                };
+                Ok(keys_valid_for(&filtered, None, other))
+            }
             (None, VouchAt::Server(mut o)) => {
                 o.chat_seq = None;
-                (None, VouchAt::Server(o))
+                Ok(keys_valid_for(&keys, None, VouchAt::Server(o)))
             }
-            (None, at) => (None, at),
-        };
-        Ok(keys_valid_for(&keys, leaves.as_deref(), at))
+            (None, other) => Ok(keys_valid_for(&keys, None, other)),
+        }
     }
 
     /// [`check_attested`](Self::check_attested) against the DID's
