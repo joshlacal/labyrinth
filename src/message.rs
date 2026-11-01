@@ -28,6 +28,9 @@ const KIND_FRAME: u8 = 0x00;
 const KIND_TOMBSTONE: u8 = 0x01;
 /// v5 content kind: an `I13` receipt-committed frame (`[frame_nonce: 32B || frame]`).
 const KIND_COMMITTED_FRAME: u8 = 0x02;
+/// v5 content kind: an attributed frame (`[u16 sender_len || sender_did || frame]`)
+/// preserving authenticated sender attribution across `[CB-22]` leave and kick fallbacks.
+const KIND_ATTRIBUTED_FRAME: u8 = 0x03;
 
 /// Sequencer receipt carried alongside a sealed or owner-archived item (`I13`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +53,9 @@ impl ArchivedReceipt {
 pub enum OwnerContent {
     /// An archived message frame.
     Frame(Vec<u8>),
+    /// An archived message frame with authenticated sender DID preserved inside
+    /// `epoch_root`-bound v5 ciphertext (`[CB-22]`, `[CB-37]`).
+    AttributedFrame { sender_did: String, frame: Vec<u8> },
     /// An `I13` receipt-committed message frame with its 32-byte `frame_nonce`
     /// kept strictly inside ciphertext.
     CommittedFrame {
@@ -174,6 +180,40 @@ pub fn seal_owner(
     )
 }
 
+/// Encrypt `data` as an owner message with authenticated `sender_did` preserved
+/// inside `v5` ciphertext (`[CB-22]`, `[CB-37]`).
+pub fn seal_owner_attributed(
+    epoch_root: &[u8; 32],
+    epoch_seq: u64,
+    thread_id: &str,
+    message_id: &str,
+    timestamp: u64,
+    sender_did: &str,
+    data: &[u8],
+) -> Result<OwnerMessage> {
+    let trimmed = sender_did.trim();
+    if trimmed.is_empty() || !trimmed.starts_with("did:") || trimmed.len() > 2048 {
+        return Err(Error::Malformed("owner attributed sender_did invalid"));
+    }
+    let sender_len = u16::try_from(trimmed.len())
+        .map_err(|_| Error::Malformed("owner attributed sender_did too long"))?;
+    let mut body = Zeroizing::new(Vec::with_capacity(2 + trimmed.len() + data.len()));
+    body.extend_from_slice(&sender_len.to_be_bytes());
+    body.extend_from_slice(trimmed.as_bytes());
+    body.extend_from_slice(data);
+    seal_owner_kind(
+        epoch_root,
+        epoch_seq,
+        thread_id,
+        message_id,
+        None,
+        timestamp,
+        KIND_ATTRIBUTED_FRAME,
+        &body,
+        None,
+    )
+}
+
 /// Encrypt an `I13` receipt-committed frame (`[frame_nonce || payload_bytes]`)
 /// as an owner message in epoch `epoch_seq`.
 #[allow(clippy::too_many_arguments)]
@@ -241,6 +281,29 @@ pub fn open_owner_content(epoch_root: &[u8; 32], msg: &OwnerMessage) -> Result<O
         .ok_or(Error::Malformed("owner v5 content is empty"))?;
     match *kind {
         KIND_FRAME => Ok(OwnerContent::Frame(body.to_vec())),
+        KIND_ATTRIBUTED_FRAME => {
+            let (len_bytes, rest) = body
+                .split_first_chunk::<2>()
+                .ok_or(Error::Malformed("owner attributed frame truncated"))?;
+            let sender_len = u16::from_be_bytes(*len_bytes) as usize;
+            if sender_len == 0 || sender_len > 2048 || rest.len() < sender_len {
+                return Err(Error::Malformed(
+                    "owner attributed sender_did length invalid",
+                ));
+            }
+            let (did_bytes, frame) = rest.split_at(sender_len);
+            let sender_did = core::str::from_utf8(did_bytes)
+                .map_err(|_| Error::Malformed("owner attributed sender_did is not UTF-8"))?;
+            if !sender_did.starts_with("did:") {
+                return Err(Error::Malformed(
+                    "owner attributed sender_did must start with did:",
+                ));
+            }
+            Ok(OwnerContent::AttributedFrame {
+                sender_did: sender_did.to_owned(),
+                frame: frame.to_vec(),
+            })
+        }
         KIND_COMMITTED_FRAME => {
             let (nonce, frame) = body
                 .split_first_chunk::<32>()
@@ -265,7 +328,7 @@ pub fn open_owner_content(epoch_root: &[u8; 32], msg: &OwnerMessage) -> Result<O
 /// [`Error::Malformed`] (use [`open_owner_content`] to read those).
 pub fn open_owner(epoch_root: &[u8; 32], msg: &OwnerMessage) -> Result<Vec<u8>> {
     match open_owner_content(epoch_root, msg)? {
-        OwnerContent::Frame(f) => {
+        OwnerContent::Frame(f) | OwnerContent::AttributedFrame { frame: f, .. } => {
             if msg.sequencer_receipt.is_some() {
                 return Err(Error::ReceiptCommitmentMismatch);
             }

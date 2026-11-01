@@ -3,7 +3,10 @@
 
 use std::collections::BTreeSet;
 
-use super::epochs::{chain_forward, check_candidate_integrity, epoch_record, verified_own};
+use super::epochs::{
+    chain_forward_healing_squats, check_candidate_integrity, clear_unanchored_invalid_successor,
+    epoch_record, verified_own,
+};
 use super::members::audit_epoch_stores;
 use super::{Backends, Labyrinth};
 use crate::device::{ChatBinding, DevicePublic};
@@ -322,8 +325,9 @@ impl Labyrinth {
         let start = PendingEpoch::new(seq, *restored.epoch.root()).assign_id(id);
         verify_public(&start, &start_record.public)?;
         start_record.public.verify(did, None)?;
-        let reached = chain_forward(
+        let reached = chain_forward_healing_squats(
             b.mailbox.as_ref(),
+            b.directory.as_ref(),
             did,
             start,
             restored.device.public(),
@@ -531,6 +535,13 @@ impl Labyrinth {
                 .map(|m| EpochMember::from_record(m, now.clone()))
                 .collect(),
         };
+        clear_unanchored_invalid_successor(
+            b.mailbox.as_ref(),
+            b.directory.as_ref(),
+            did,
+            &epoch_public,
+        )
+        .await?;
         let next_id = b.mailbox.atomic_enroll(&bundle).await?;
         let next_secret = pending_next.assign_id(next_id);
         let next_seq = next_secret.seq;

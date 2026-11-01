@@ -105,6 +105,7 @@ impl Labyrinth {
             }
         }
         out.roster.push((self.did.clone(), own));
+        self.checkpoint_state()?;
         Ok(out)
     }
 
@@ -126,6 +127,7 @@ impl Labyrinth {
             }
         }
         roster.push((self.did.clone(), own));
+        self.checkpoint_state()?;
         Ok(roster)
     }
 
@@ -245,11 +247,13 @@ impl Labyrinth {
                 .ok_or(Error::NotFound("recipient mailbox keys"))?;
             self.accept_for_addressing(did, &current).await?;
             if current.seq != epoch.seq || current.head != epoch.head {
+                let _ = self.checkpoint_state();
                 return Err(Error::Malformed("roster epoch is not the directory head"));
             }
             self.accept_for_addressing(did, epoch).await?;
             full.push((did.clone(), epoch.clone()));
         }
+        self.checkpoint_state()?;
         full.push((self.did.clone(), me_public.clone()));
         let heads: Vec<[u8; 32]> = full.iter().map(|(_, e)| e.head).collect();
         let mut pending_roster: Vec<(String, [u8; 32])> = full
@@ -291,6 +295,9 @@ impl Labyrinth {
                     .entry(thread_id.to_owned())
                     .or_default()
                     .push(m.clone());
+                // [CB-30] Persist exported state immediately after publishing a new MEK,
+                // before `flush_sender` / `flush` can fail or the app can be killed.
+                self.checkpoint_state()?;
                 out.mek_written = Some(rec);
                 m
             }
@@ -454,7 +461,7 @@ impl Labyrinth {
     }
 
     /// Writes the owner buffer of one thread; on error the buffer is kept.
-    pub(super) async fn flush_owner(&mut self, thread_id: &str) -> Result<Option<FlushedBatch>> {
+    pub async fn flush_owner(&mut self, thread_id: &str) -> Result<Option<FlushedBatch>> {
         if self.owner_outbox.get(thread_id).is_none_or(Vec::is_empty) {
             return Ok(None);
         }

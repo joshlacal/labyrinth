@@ -185,6 +185,81 @@ async fn member(
         .transpose()
 }
 
+enum StepOutcome {
+    Absent,
+    Valid(Box<EpochSecret>),
+    Squatted { seq: u64, reason: &'static str },
+}
+
+async fn step_forward(
+    mb: &dyn MailboxStore,
+    did: &str,
+    prev: &EpochSecret,
+    me: &DevicePublic,
+    storage: &HawkEncSecret,
+    revoked: &BTreeSet<[u8; 32]>,
+) -> Result<StepOutcome> {
+    let seq = prev
+        .seq
+        .checked_add(1)
+        .ok_or(Error::Malformed("epoch sequence overflow"))?;
+    let squat = |reason| StepOutcome::Squatted { seq, reason };
+    let next = match mb.get_epoch(seq).await {
+        Ok(Some(next)) => next,
+        Ok(None) => return Ok(StepOutcome::Absent),
+        Err(Error::Malformed("space record")) => {
+            return Ok(squat("the epoch record does not parse"));
+        }
+        Err(e) => return Err(e),
+    };
+    let Some(record) = next.value.to_record().ok().filter(|r| r.public.seq == seq) else {
+        return Ok(squat("the epoch record does not parse"));
+    };
+    let prev_public = epoch_record(mb, prev.seq).await?.1.public;
+    if record.public.verify(did, Some(&prev_public)).is_err() {
+        return Ok(squat(
+            "it is not signed by the previous epoch's mailbox key",
+        ));
+    }
+    let opener_raw = match mb.get_device(&record.opened_by).await {
+        Ok(opt) => opt,
+        Err(Error::Malformed("space record")) => None,
+        Err(e) => return Err(e),
+    };
+    let Some(opener) = opener_raw
+        .and_then(|d| d.to_public().ok())
+        .filter(|p| p.verify().is_ok() && !p.is_virtual && p.device_key_pub == record.opened_by)
+    else {
+        return Ok(squat("its opener has no valid physical device record"));
+    };
+    if revoked.contains(&record.opened_by.0) {
+        return Ok(squat("it was opened by a device this client revoked"));
+    }
+    // In Gate 3 atomic enrollment (`open_next_enrolling`), a newly enrolled
+    // physical device opens `E+1` directly using `E`'s mailbox signing key;
+    // it was not yet a member of `E`, whereas normal rotations have `opener_prev`.
+    let opener_prev = member(mb, prev.seq, &opener.device_key_pub).await?;
+    if let Some(ref op_prev) = opener_prev
+        && verify_member(prev, op_prev, opener.is_virtual).is_err()
+    {
+        return Ok(squat("its opener's previous epoch membership failed MAC"));
+    }
+    let mine = member(mb, seq, &me.device_key_pub)
+        .await?
+        .ok_or(Error::NotEpochMember)?;
+    let opened = OpenedEpoch {
+        epoch_id: &next.rkey,
+        record: &record,
+        my_member: &mine,
+        opener: &opener,
+        opener_prev_member: opener_prev.as_ref(),
+    };
+    match forward_chain(did, prev, &prev_public, &opened, storage, me.is_virtual) {
+        Ok(e) => Ok(StepOutcome::Valid(Box::new(e))),
+        Err(_) => Ok(squat("the entropy addressed to this device does not open")),
+    }
+}
+
 /// Forward-chains from `start` as long as the store has a next epoch.
 /// Returns every epoch reached, `start` first.
 pub(super) async fn chain_forward(
@@ -198,56 +273,115 @@ pub(super) async fn chain_forward(
     let mut out = vec![start];
     loop {
         let prev = out.last().expect("non-empty");
-        let seq = prev
-            .seq
-            .checked_add(1)
-            .ok_or(Error::Malformed("epoch sequence overflow"))?;
-        let Some(next) = mb.get_epoch(seq).await? else {
-            return Ok(out);
-        };
-        let squat = |reason| Error::EpochSquatted { seq, reason };
-        let record = next
+        match step_forward(mb, did, prev, me, storage, revoked).await? {
+            StepOutcome::Absent => return Ok(out),
+            StepOutcome::Valid(e) => out.push(*e),
+            StepOutcome::Squatted { seq, reason } => {
+                return Err(Error::EpochSquatted { seq, reason });
+            }
+        }
+    }
+}
+
+/// Forward-chains from `start` during recovery enrollment, healing at most 8
+/// unanchored `[CB-40]` squatted successor records while refusing to touch any
+/// directory-anchored epoch or valid sibling rotation.
+pub(super) async fn chain_forward_healing_squats(
+    mb: &dyn MailboxStore,
+    dir: &dyn MailboxDirectory,
+    did: &str,
+    start: EpochSecret,
+    me: &DevicePublic,
+    storage: &HawkEncSecret,
+    revoked: &BTreeSet<[u8; 32]>,
+) -> Result<Vec<EpochSecret>> {
+    let mut out = vec![start];
+    let mut heals = 0usize;
+    loop {
+        let prev = out.last().expect("non-empty").clone();
+        match step_forward(mb, did, &prev, me, storage, revoked).await? {
+            StepOutcome::Absent => return Ok(out),
+            StepOutcome::Valid(e) => out.push(*e),
+            StepOutcome::Squatted { seq, reason } => {
+                if heals >= 8 {
+                    return Err(Error::EpochSquatted { seq, reason });
+                }
+                if let Some(published) = dir.latest(did).await?
+                    && published.seq >= seq
+                {
+                    return Err(Error::EpochTruncated {
+                        published: published.seq,
+                        reached: prev.seq,
+                    });
+                }
+                if dir.epoch(did, seq).await?.is_some() {
+                    return Err(Error::EpochTruncated {
+                        published: seq,
+                        reached: prev.seq,
+                    });
+                }
+                match step_forward(mb, did, &prev, me, storage, revoked).await? {
+                    StepOutcome::Absent => return Ok(out),
+                    StepOutcome::Valid(e) => out.push(*e),
+                    StepOutcome::Squatted { .. } => {
+                        mb.delete_squatted_epoch(seq).await?;
+                        heals += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Clears an unanchored, cryptographically invalid successor record at
+/// `prev_public.seq + 1` before OTC `atomic_enroll` opens `E + 1`.
+pub(super) async fn clear_unanchored_invalid_successor(
+    mb: &dyn MailboxStore,
+    dir: &dyn MailboxDirectory,
+    did: &str,
+    prev_public: &EpochPublic,
+) -> Result<()> {
+    let next_seq = prev_public
+        .seq
+        .checked_add(1)
+        .ok_or(Error::Malformed("epoch sequence overflow"))?;
+    let is_invalid_squat = match mb.get_epoch(next_seq).await {
+        Ok(None) => return Ok(()),
+        Ok(Some(existing)) => existing
             .value
             .to_record()
             .ok()
-            .filter(|r| r.public.seq == seq)
-            .ok_or(squat("the epoch record does not parse"))?;
-        let prev_public = epoch_record(mb, prev.seq).await?.1.public;
-        record
-            .public
-            .verify(did, Some(&prev_public))
-            .map_err(|_| squat("it is not signed by the previous epoch's mailbox key"))?;
-        let opener = mb
-            .get_device(&record.opened_by)
-            .await?
-            .and_then(|d| d.to_public().ok())
-            .filter(|p| p.verify().is_ok() && !p.is_virtual && p.device_key_pub == record.opened_by)
-            .ok_or(squat("its opener has no valid physical device record"))?;
-        if revoked.contains(&record.opened_by.0) {
-            return Err(squat("it was opened by a device this client revoked"));
-        }
-        // In Gate 3 atomic enrollment (`open_next_enrolling`), a newly enrolled
-        // physical device opens `E+1` directly using `E`'s mailbox signing key;
-        // it was not yet a member of `E`, whereas normal rotations have `opener_prev`.
-        let opener_prev = member(mb, prev.seq, &opener.device_key_pub).await?;
-        if let Some(ref op_prev) = opener_prev {
-            verify_member(prev, op_prev, opener.is_virtual)
-                .map_err(|_| squat("its opener's previous epoch membership failed MAC"))?;
-        }
-        let mine = member(mb, seq, &me.device_key_pub)
-            .await?
-            .ok_or(Error::NotEpochMember)?;
-        let opened = OpenedEpoch {
-            epoch_id: &next.rkey,
-            record: &record,
-            my_member: &mine,
-            opener: &opener,
-            opener_prev_member: opener_prev.as_ref(),
-        };
-        let e = forward_chain(did, prev, &prev_public, &opened, storage, me.is_virtual)
-            .map_err(|_| squat("the entropy addressed to this device does not open"))?;
-        out.push(e);
+            .filter(|r| r.public.seq == next_seq)
+            .is_none_or(|r| r.public.verify(did, Some(prev_public)).is_err()),
+        Err(Error::Malformed("space record")) => true,
+        Err(e) => return Err(e),
+    };
+    if !is_invalid_squat {
+        return Ok(());
     }
+    if let Some(published) = dir.latest(did).await?
+        && published.seq >= next_seq
+    {
+        return Ok(());
+    }
+    if dir.epoch(did, next_seq).await?.is_some() {
+        return Ok(());
+    }
+    let still_invalid = match mb.get_epoch(next_seq).await {
+        Ok(None) => false,
+        Ok(Some(recheck)) => recheck
+            .value
+            .to_record()
+            .ok()
+            .filter(|r| r.public.seq == next_seq)
+            .is_none_or(|r| r.public.verify(did, Some(prev_public)).is_err()),
+        Err(Error::Malformed("space record")) => true,
+        Err(e) => return Err(e),
+    };
+    if still_invalid {
+        mb.delete_squatted_epoch(next_seq).await?;
+    }
+    Ok(())
 }
 
 /// SPEC §10 epoch-integrity check ([CB-28]): the account's published latest epoch
@@ -568,12 +702,216 @@ impl Labyrinth {
         self.latest = to;
         self.adopted(latest_public);
         self.remember_verified(to, audit.valid.iter().map(|v| v.record.device_key_pub.0));
+        if to != from {
+            self.checkpoint_state()?;
+        }
         Ok(SyncReport {
             from,
             to,
             readmitted,
             invalid_members: audit.excluded,
         })
+    }
+
+    /// Safely clear an unanchored, unverified squatted epoch record at
+    /// `seq == self.latest + 1` from the personal mailbox Space (`[CB-40]`).
+    ///
+    /// Returns `Ok(true)` if the squatted `epoch/<seq>` (and any planted
+    /// `epochMember/<seq>-*` records) were deleted from the mailbox store,
+    /// `Ok(false)` if `epoch/<seq>` was already absent or is now a valid
+    /// sibling rotation (so no deletion was performed), or `Err(...)` if:
+    /// - `seq <= self.latest` (local-revocation quarantine on an already-reached
+    ///   epoch is never cleared),
+    /// - this device's chat transport key is not currently active in the
+    ///   directory (`Error::Unattested`),
+    /// - `epoch/<seq>` validly chains from `self.latest` and omits this device
+    ///   (`Error::NotEpochMember` — either this device was revoked or a
+    ///   multi-chunk rotation is in flight), or
+    /// - `self.b.directory` (`CompositeDirectory` over PDS `mailboxKeys` and
+    ///   `mls-ds` `epoch_chain`) already anchors an epoch at or above `seq`
+    ///   (deleting from the Space would fork against the directory).
+    pub async fn clear_squatted_epoch(&mut self, seq: u64) -> Result<bool> {
+        if seq <= self.latest {
+            return Err(Error::EpochSquatted {
+                seq,
+                reason: "cannot clear an epoch at or below the locally reached head",
+            });
+        }
+
+        // Caller must hold a currently active chat device key in the directory.
+        let mine = self.transport.transport_public_key();
+        let current_keys = self.b.directory.device_transport_keys(&self.did).await?;
+        if !current_keys.iter().any(|k| k.is_current() && k.key == mine) {
+            return Err(Error::Unattested);
+        }
+
+        // Step through any valid, clean intermediate epochs `self.latest + 1 .. seq`
+        // so an offline device that missed a valid sibling rotation before a squat
+        // can catch up to `seq - 1` without failing all-or-nothing in `sync_epochs`.
+        while self.latest.saturating_add(1) < seq {
+            let prev = self
+                .epochs
+                .get(&self.latest)
+                .cloned()
+                .ok_or(Error::NotFound("epoch"))?;
+            match step_forward(
+                self.b.mailbox.as_ref(),
+                &self.did,
+                &prev,
+                self.device.public(),
+                &self.device.storage,
+                &self.revoked,
+            )
+            .await?
+            {
+                StepOutcome::Absent => return Ok(false),
+                StepOutcome::Squatted {
+                    seq: first_squat,
+                    reason,
+                } => {
+                    return Err(Error::EpochSquatted {
+                        seq: first_squat,
+                        reason,
+                    });
+                }
+                StepOutcome::Valid(next_epoch) => {
+                    let audit = self.audit_epoch(&next_epoch).await?;
+                    let served_revoked = confirmed_epoch_member_keys(&audit)
+                        .map(|m| m.0)
+                        .chain(
+                            audit
+                                .excluded
+                                .iter()
+                                .filter_map(|m| m.device_key.map(|k| k.0)),
+                        )
+                        .any(|k| self.revoked.contains(&k));
+                    if served_revoked {
+                        return Err(Error::EpochSquatted {
+                            seq: next_epoch.seq,
+                            reason: "it re-admits a device this client revoked",
+                        });
+                    }
+                    self.check_not_tampered(next_epoch.seq, &audit)?;
+                    let (_, rec) = epoch_record(self.b.mailbox.as_ref(), next_epoch.seq).await?;
+                    let reached_seq = next_epoch.seq;
+                    self.epochs.insert(reached_seq, *next_epoch);
+                    self.latest = reached_seq;
+                    self.adopted(rec.public);
+                    self.remember_verified(
+                        reached_seq,
+                        audit.valid.iter().map(|v| v.record.device_key_pub.0),
+                    );
+                    self.checkpoint_state()?;
+                }
+            }
+        }
+
+        let expected_next = self
+            .latest
+            .checked_add(1)
+            .ok_or(Error::Malformed("epoch sequence overflow"))?;
+        if seq != expected_next {
+            return Err(Error::EpochSquatted {
+                seq,
+                reason: "squatted epoch is not the immediate successor of latest",
+            });
+        }
+
+        let prev = self
+            .epochs
+            .get(&self.latest)
+            .cloned()
+            .ok_or(Error::NotFound("epoch"))?;
+        match step_forward(
+            self.b.mailbox.as_ref(),
+            &self.did,
+            &prev,
+            self.device.public(),
+            &self.device.storage,
+            &self.revoked,
+        )
+        .await?
+        {
+            StepOutcome::Absent => return Ok(false),
+            StepOutcome::Valid(next_epoch) => {
+                let audit = self.audit_epoch(&next_epoch).await?;
+                let served_revoked = confirmed_epoch_member_keys(&audit)
+                    .map(|m| m.0)
+                    .chain(
+                        audit
+                            .excluded
+                            .iter()
+                            .filter_map(|m| m.device_key.map(|k| k.0)),
+                    )
+                    .any(|k| self.revoked.contains(&k));
+                if !served_revoked {
+                    self.sync_epochs().await?;
+                    return Ok(false);
+                }
+                // `next_epoch` re-admits a locally-revoked device -> treat as squatted
+                // and fall through to the directory anchoring check!
+            }
+            StepOutcome::Squatted { .. } => {}
+        }
+
+        // Cross-check the directory (`CompositeDirectory` = PDS + `mls-ds`) BEFORE
+        // deleting from the mailbox Space: if either directory source already anchors
+        // `seq` (or is incomplete/divergent), never delete `epoch/<seq>`.
+        match self.b.directory.latest(&self.did).await {
+            Ok(Some(published)) if published.seq >= seq => {
+                return Err(Error::EpochTruncated {
+                    published: published.seq,
+                    reached: self.latest,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+        match self.b.directory.epoch(&self.did, seq).await {
+            Ok(Some(_)) => {
+                return Err(Error::EpochTruncated {
+                    published: seq,
+                    reached: self.latest,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Re-verify one final time right before deletion so a sibling rotation
+        // that landed while querying the directory is never clobbered.
+        match step_forward(
+            self.b.mailbox.as_ref(),
+            &self.did,
+            &prev,
+            self.device.public(),
+            &self.device.storage,
+            &self.revoked,
+        )
+        .await?
+        {
+            StepOutcome::Absent => return Ok(false),
+            StepOutcome::Valid(next_epoch) => {
+                let audit = self.audit_epoch(&next_epoch).await?;
+                let served_revoked = confirmed_epoch_member_keys(&audit)
+                    .map(|m| m.0)
+                    .chain(
+                        audit
+                            .excluded
+                            .iter()
+                            .filter_map(|m| m.device_key.map(|k| k.0)),
+                    )
+                    .any(|k| self.revoked.contains(&k));
+                if !served_revoked {
+                    self.sync_epochs().await?;
+                    return Ok(false);
+                }
+            }
+            StepOutcome::Squatted { .. } => {}
+        }
+
+        self.b.mailbox.delete_squatted_epoch(seq).await?;
+        Ok(true)
     }
 
     /// SPEC §10 mitigation for a backend that hides newer epochs: fails with
@@ -613,6 +951,7 @@ impl Labyrinth {
             .next()
             .map(|(_, e)| e.clone())
             .ok_or(Error::NotFound("epoch"))?;
+        let mut inserted = false;
         while cur.seq > seq {
             let (_, record) = self.epoch_record(cur.seq).await?;
             let prev_seq = cur
@@ -623,7 +962,11 @@ impl Labyrinth {
             let prev = backward_chain(&cur, &record, &prev_id)?;
             verify_public(&prev, &prev_record.public)?;
             self.epochs.insert(prev.seq, prev.clone());
+            inserted = true;
             cur = prev;
+        }
+        if inserted {
+            self.checkpoint_state()?;
         }
         Ok(cur)
     }
@@ -641,7 +984,9 @@ impl Labyrinth {
         {
             return Err(Error::PendingWrites);
         }
-        self.revoked.insert(target.0);
+        if self.revoked.insert(target.0) {
+            self.checkpoint_state()?;
+        }
         self.sync_epochs_allowing(&BTreeSet::from([target.0]))
             .await?;
         self.b
@@ -732,6 +1077,7 @@ impl Labyrinth {
         // Made here, so it needs no checking.
         self.adopted(new.record.public.clone());
         self.remember_verified(self.latest, new.members.iter().map(|m| m.device_key_pub.0));
+        self.checkpoint_state()?;
         self.publish_keys(&new.record.public).await?;
         let excluded = audit
             .excluded

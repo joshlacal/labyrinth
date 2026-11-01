@@ -261,6 +261,14 @@ pub trait MailboxStore: MaybeSend + MaybeSync {
         Err(Error::NotSupported("deleteVirtualDevice"))
     }
 
+    /// Delete an unattested squatted `epoch/<seq>` record and any `epochMember/<seq>-*`
+    /// rows in this mailbox (`[CB-40]`). Callers MUST verify via [`MailboxDirectory`]
+    /// that `seq` is not anchored by an active account device before invoking.
+    async fn delete_squatted_epoch(&self, seq: u64) -> Result<()> {
+        let _ = seq;
+        Err(Error::NotSupported("deleteSquattedEpoch"))
+    }
+
     /// Erase this mailbox ([CB-38], account deletion).
     async fn purge_mailbox(&self) -> Result<()> {
         Err(Error::NotSupported("purgeMailbox"))

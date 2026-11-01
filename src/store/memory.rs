@@ -756,6 +756,16 @@ impl MailboxStore for MemoryMailbox {
         self.backend.lock().delete_vdevice(&self.did, vdevice_id)
     }
 
+    async fn delete_squatted_epoch(&self, seq: u64) -> Result<()> {
+        let epoch_rkey = space_epoch_id(seq);
+        let prefix = format!("{seq:012}-");
+        self.with(|m| {
+            m.members.retain(|k, _| !k.starts_with(&prefix));
+            m.epochs.remove(&epoch_rkey);
+            Ok(())
+        })
+    }
+
     async fn purge_mailbox(&self) -> Result<()> {
         self.backend.lock().purge(&self.did);
         Ok(())

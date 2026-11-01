@@ -143,7 +143,7 @@ impl Labyrinth {
     ) -> Result<Vec<Stored<Batch>>> {
         match r {
             Ok(b) => Ok(b),
-            Err(Error::Forbidden) => {
+            Err(Error::Forbidden | Error::NotFound("space" | "conversation")) => {
                 h.space_readable = false;
                 Ok(Vec::new())
             }
@@ -326,12 +326,39 @@ impl Labyrinth {
                             });
                         }
                     }
+                    Ok(OwnerContent::AttributedFrame { sender_did, frame }) => {
+                        if m.sequencer_receipt.is_some() {
+                            h.undecryptable.push(Undecryptable {
+                                message_id: m.message_id,
+                                timestamp: m.timestamp,
+                                sender: Some(sender_did),
+                                error: Error::ReceiptCommitmentMismatch,
+                            });
+                        } else {
+                            h.messages.push(LoadedMessage {
+                                thread_id: thread_id.to_owned(),
+                                message_id: m.message_id,
+                                timestamp: m.timestamp,
+                                sender: Some(sender_did),
+                                frame,
+                                source: MessageSource::Owner,
+                                conflict: false,
+                            });
+                        }
+                    }
                     Ok(OwnerContent::CommittedFrame { frame_nonce, frame }) => {
-                        let verified = (|| -> Result<()> {
+                        let verified = (|| -> Result<String> {
                             let archived = m
                                 .sequencer_receipt
                                 .as_ref()
                                 .ok_or(Error::ReceiptCommitmentMismatch)?;
+                            if archived.signed.payload.conversation_id != thread_id {
+                                return Err(Error::Malformed("receipt conversation_id mismatch"));
+                            }
+                            let (sender_did, _) =
+                                archived.signed.payload.split_sender_device().map_err(|_| {
+                                    Error::Malformed("invalid senderDevice in receipt")
+                                })?;
                             if let Some(ref rk) = receipt_key {
                                 labyrinth_protocol::verify_sequencer_receipt_sec1(
                                     &rk.public_key_sec1,
@@ -346,14 +373,14 @@ impl Labyrinth {
                                 &frame,
                             )
                             .map_err(|_| Error::ReceiptCommitmentMismatch)?;
-                            Ok(())
+                            Ok(sender_did.to_owned())
                         })();
                         match verified {
-                            Ok(()) => h.messages.push(LoadedMessage {
+                            Ok(sender_did) => h.messages.push(LoadedMessage {
                                 thread_id: thread_id.to_owned(),
                                 message_id: m.message_id,
                                 timestamp: m.timestamp,
-                                sender: None,
+                                sender: Some(sender_did),
                                 frame,
                                 source: MessageSource::Owner,
                                 conflict: false,
@@ -473,6 +500,7 @@ impl Labyrinth {
                         .entry(thread_id.to_owned())
                         .or_default()
                         .push(m.clone());
+                    self.checkpoint_state()?;
                     return Ok(m);
                 }
                 Err(e) => err = e,
@@ -535,27 +563,23 @@ impl Labyrinth {
 
 /// Applies delete-for-me tombstones, merges copies and sorts.
 pub(super) fn finish(h: &mut ThreadHistory, tombstones: &[Tombstone]) {
-    let hidden = |id: &str, sender: Option<&String>, owner: bool| {
-        tombstones
-            .iter()
-            .any(|(t, author)| t == id && (owner || author.is_none() || author.as_ref() == sender))
+    let hidden = |id: &str, sender: Option<&String>| {
+        tombstones.iter().any(|(t, author)| {
+            t == id && (sender.is_none() || author.is_none() || author.as_ref() == sender)
+        })
     };
     let mut deleted: Vec<String> = Vec::new();
     h.messages.retain(|m| {
-        let hide = hidden(
-            &m.message_id,
-            m.sender.as_ref(),
-            m.source == MessageSource::Owner,
-        );
+        let hide = hidden(&m.message_id, m.sender.as_ref());
         if hide {
             deleted.push(m.message_id.clone());
         }
         !hide
     });
     h.undecryptable
-        .retain(|u| !hidden(&u.message_id, u.sender.as_ref(), u.sender.is_none()));
+        .retain(|u| !hidden(&u.message_id, u.sender.as_ref()));
     h.redacted
-        .retain(|r| !hidden(&r.message_id, Some(&r.sender), false));
+        .retain(|r| !hidden(&r.message_id, Some(&r.sender)));
     deleted.sort();
     deleted.dedup();
     h.deleted_for_me = deleted;
@@ -569,16 +593,17 @@ pub(super) fn finish(h: &mut ThreadHistory, tombstones: &[Tombstone]) {
 }
 
 /// Merge provably identical copies and flag the rest (see
-/// [`Labyrinth::load_thread`]). Sender copies are considered first.
+/// [`Labyrinth::load_thread`]). Sender copies are considered first, followed
+/// by attributed owner copies, then unattributed legacy owner copies.
 fn dedupe(h: &mut ThreadHistory) {
     let mut all = core::mem::take(&mut h.messages);
-    all.sort_by_key(|m| m.source != MessageSource::Sender);
+    all.sort_by_key(|m| (m.source != MessageSource::Sender, m.sender.is_none()));
     let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
     for m in all {
         let same = by_id.get(&m.message_id).is_some_and(|ix| {
             ix.iter().any(|&i| {
                 let k = &h.messages[i];
-                k.frame == m.frame && (m.source == MessageSource::Owner || k.sender == m.sender)
+                k.frame == m.frame && (m.sender.is_none() || k.sender == m.sender)
             })
         });
         if !same {

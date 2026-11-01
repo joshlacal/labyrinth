@@ -70,6 +70,13 @@ pub trait Clock: MaybeSend + MaybeSync {
     fn now_ms(&self) -> u64;
 }
 
+/// Durable callback invoked synchronously whenever [`Labyrinth`]'s exportable
+/// state (`epochs`, `revoked`, `pins`, `meks`) mutates, closing the crash window
+/// between state/key mutation and caller-side `export_state()` persistence (`[CB-30]`).
+pub trait StateSink: MaybeSend + MaybeSync {
+    fn save_state(&self, exported_state: &[u8]) -> Result<()>;
+}
+
 /// [`Clock`] backed by [`web_time::SystemTime`] (native + `wasm32`-compatible).
 pub struct SystemClock;
 
@@ -103,6 +110,7 @@ pub struct Labyrinth {
     device: DeviceSecrets,
     transport: Box<dyn TransportSigner>,
     b: Backends,
+    state_sink: Option<Box<dyn StateSink>>,
     mailbox_root_salt: [u8; 32],
     /// Epoch secrets this device holds, by sequence number.
     epochs: BTreeMap<u64, EpochSecret>,
@@ -171,6 +179,7 @@ impl Labyrinth {
             device,
             transport,
             b,
+            state_sink: None,
             mailbox_root_salt,
             epochs,
             latest,
@@ -185,6 +194,26 @@ impl Labyrinth {
             outbox_rosters: BTreeMap::new(),
             owner_outbox: BTreeMap::new(),
         })
+    }
+
+    /// Attach a durable [`StateSink`] so `export_state()` is persisted immediately
+    /// whenever `MEK`s, `[CB-29]` peer pins, `epochs`, or `revoked` mutate (`[CB-30]`).
+    pub fn set_state_sink(&mut self, sink: Box<dyn StateSink>) {
+        self.state_sink = Some(sink);
+    }
+
+    /// Builder variant of [`set_state_sink`](Self::set_state_sink).
+    pub fn with_state_sink(mut self, sink: Box<dyn StateSink>) -> Self {
+        self.state_sink = Some(sink);
+        self
+    }
+
+    pub(super) fn checkpoint_state(&self) -> Result<()> {
+        if let Some(ref sink) = self.state_sink {
+            let exported = self.export_state()?;
+            sink.save_state(&exported)?;
+        }
+        Ok(())
     }
 
     /// The account DID.

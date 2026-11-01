@@ -214,4 +214,7 @@ impl MailboxStore for Faulty {
     async fn publish_mailbox_keys(&self, r: &MailboxKeysRecord) -> labyrinth::Result<()> {
         self.inner.publish_mailbox_keys(r).await
     }
+    async fn delete_squatted_epoch(&self, seq: u64) -> labyrinth::Result<()> {
+        self.inner.delete_squatted_epoch(seq).await
+    }
 }

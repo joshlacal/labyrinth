@@ -884,6 +884,31 @@ impl MailboxStore for SpaceMailboxStore {
         Ok(())
     }
 
+    async fn delete_squatted_epoch(&self, seq: u64) -> Result<()> {
+        let epoch_rkey = space_epoch_id(seq);
+        let member_prefix = format!("{seq:012}-");
+        let mut writes: Vec<WriteOp> = self
+            .list_raw(nsid::EPOCH_MEMBER, false)
+            .await?
+            .into_iter()
+            .filter(|(rkey, _)| rkey.starts_with(&member_prefix))
+            .map(|(rkey, _)| WriteOp::Delete {
+                collection: nsid::EPOCH_MEMBER,
+                rkey,
+            })
+            .collect();
+        if self.get::<Value>(nsid::EPOCH, &epoch_rkey).await?.is_some() {
+            writes.push(WriteOp::Delete {
+                collection: nsid::EPOCH,
+                rkey: epoch_rkey,
+            });
+        }
+        for chunk in writes.chunks(MAX_WRITES) {
+            self.apply(chunk).await?;
+        }
+        Ok(())
+    }
+
     async fn purge_mailbox(&self) -> Result<()> {
         for collection in MAILBOX_COLLECTIONS {
             let rkeys: Vec<String> = self

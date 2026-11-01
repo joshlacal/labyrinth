@@ -204,6 +204,7 @@ impl Labyrinth {
         }
         let pin = PeerPin::of(&latest);
         self.pins.insert(did.to_owned(), pin.clone());
+        self.checkpoint_state()?;
         Ok(pin)
     }
 }
