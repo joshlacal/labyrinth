@@ -283,6 +283,76 @@ pub(super) async fn chain_forward(
     }
 }
 
+async fn ensure_seq_unanchored_in_directory(
+    dir: &dyn MailboxDirectory,
+    did: &str,
+    seq: u64,
+    reached: u64,
+) -> Result<()> {
+    if let Some(published) = dir.latest(did).await?
+        && published.seq >= seq
+    {
+        published.verify(did, None)?;
+        let attester = published.attestation.transport_public_key;
+        if !dir
+            .device_transport_keys(did)
+            .await?
+            .iter()
+            .any(|key| key.is_current() && key.key == attester)
+        {
+            return Err(Error::Unattested);
+        }
+        return Err(Error::EpochTruncated {
+            published: published.seq,
+            reached,
+        });
+    }
+    if let Some(anchored) = dir.epoch(did, seq).await? {
+        anchored.verify(did, None)?;
+        return Err(Error::EpochTruncated {
+            published: seq,
+            reached,
+        });
+    }
+    Ok(())
+}
+
+async fn is_epoch_header_or_opener_invalid(
+    mb: &dyn MailboxStore,
+    did: &str,
+    prev_public: &EpochPublic,
+    next_seq: u64,
+) -> Result<Option<bool>> {
+    let existing = match mb.get_epoch(next_seq).await {
+        Ok(None) => return Ok(None),
+        Ok(Some(existing)) => existing,
+        Err(Error::Malformed("space record")) => return Ok(Some(true)),
+        Err(e) => return Err(e),
+    };
+    let Some(record) = existing
+        .value
+        .to_record()
+        .ok()
+        .filter(|r| r.public.seq == next_seq)
+    else {
+        return Ok(Some(true));
+    };
+    if record.public.verify(did, Some(prev_public)).is_err() {
+        return Ok(Some(true));
+    }
+    let opener_raw = match mb.get_device(&record.opened_by).await {
+        Ok(opt) => opt,
+        Err(Error::Malformed("space record")) => None,
+        Err(e) => return Err(e),
+    };
+    let valid_physical_opener = opener_raw
+        .and_then(|d| d.to_public().ok())
+        .is_some_and(|p| {
+            p.verify().is_ok() && !p.is_virtual && p.device_key_pub == record.opened_by
+        });
+    Ok(Some(!valid_physical_opener))
+}
+
 /// Forward-chains from `start` during recovery enrollment, healing at most 8
 /// unanchored `[CB-40]` squatted successor records while refusing to touch any
 /// directory-anchored epoch or valid sibling rotation.
@@ -306,20 +376,7 @@ pub(super) async fn chain_forward_healing_squats(
                 if heals >= 8 {
                     return Err(Error::EpochSquatted { seq, reason });
                 }
-                if let Some(published) = dir.latest(did).await?
-                    && published.seq >= seq
-                {
-                    return Err(Error::EpochTruncated {
-                        published: published.seq,
-                        reached: prev.seq,
-                    });
-                }
-                if dir.epoch(did, seq).await?.is_some() {
-                    return Err(Error::EpochTruncated {
-                        published: seq,
-                        reached: prev.seq,
-                    });
-                }
+                ensure_seq_unanchored_in_directory(dir, did, seq, prev.seq).await?;
                 match step_forward(mb, did, &prev, me, storage, revoked).await? {
                     StepOutcome::Absent => return Ok(out),
                     StepOutcome::Valid(e) => out.push(*e),
@@ -345,40 +402,15 @@ pub(super) async fn clear_unanchored_invalid_successor(
         .seq
         .checked_add(1)
         .ok_or(Error::Malformed("epoch sequence overflow"))?;
-    let is_invalid_squat = match mb.get_epoch(next_seq).await {
-        Ok(None) => return Ok(()),
-        Ok(Some(existing)) => existing
-            .value
-            .to_record()
-            .ok()
-            .filter(|r| r.public.seq == next_seq)
-            .is_none_or(|r| r.public.verify(did, Some(prev_public)).is_err()),
-        Err(Error::Malformed("space record")) => true,
-        Err(e) => return Err(e),
-    };
-    if !is_invalid_squat {
-        return Ok(());
+    match is_epoch_header_or_opener_invalid(mb, did, prev_public, next_seq).await? {
+        None | Some(false) => return Ok(()),
+        Some(true) => {}
     }
-    if let Some(published) = dir.latest(did).await?
-        && published.seq >= next_seq
-    {
-        return Ok(());
-    }
-    if dir.epoch(did, next_seq).await?.is_some() {
-        return Ok(());
-    }
-    let still_invalid = match mb.get_epoch(next_seq).await {
-        Ok(None) => false,
-        Ok(Some(recheck)) => recheck
-            .value
-            .to_record()
-            .ok()
-            .filter(|r| r.public.seq == next_seq)
-            .is_none_or(|r| r.public.verify(did, Some(prev_public)).is_err()),
-        Err(Error::Malformed("space record")) => true,
-        Err(e) => return Err(e),
-    };
-    if still_invalid {
+    ensure_seq_unanchored_in_directory(dir, did, next_seq, prev_public.seq).await?;
+    if matches!(
+        is_epoch_header_or_opener_invalid(mb, did, prev_public, next_seq).await?,
+        Some(true)
+    ) {
         mb.delete_squatted_epoch(next_seq).await?;
     }
     Ok(())
@@ -854,29 +886,22 @@ impl Labyrinth {
             StepOutcome::Squatted { .. } => {}
         }
 
+        // Refuse deletion if this device's own record is already marked revoked in the mailbox.
+        if let Ok(Some(my_dev)) = self
+            .b
+            .mailbox
+            .get_device(&self.device.public().device_key_pub)
+            .await
+            && my_dev.revoked_at.is_some()
+        {
+            return Err(Error::NotEpochMember);
+        }
+
         // Cross-check the directory (`CompositeDirectory` = PDS + `mls-ds`) BEFORE
         // deleting from the mailbox Space: if either directory source already anchors
         // `seq` (or is incomplete/divergent), never delete `epoch/<seq>`.
-        match self.b.directory.latest(&self.did).await {
-            Ok(Some(published)) if published.seq >= seq => {
-                return Err(Error::EpochTruncated {
-                    published: published.seq,
-                    reached: self.latest,
-                });
-            }
-            Ok(_) => {}
-            Err(e) => return Err(e),
-        }
-        match self.b.directory.epoch(&self.did, seq).await {
-            Ok(Some(_)) => {
-                return Err(Error::EpochTruncated {
-                    published: seq,
-                    reached: self.latest,
-                });
-            }
-            Ok(None) => {}
-            Err(e) => return Err(e),
-        }
+        ensure_seq_unanchored_in_directory(self.b.directory.as_ref(), &self.did, seq, self.latest)
+            .await?;
 
         // Re-verify one final time right before deletion so a sibling rotation
         // that landed while querying the directory is never clobbered.

@@ -450,6 +450,26 @@ impl SpaceMailboxStore {
         }
     }
 
+    async fn delete_record_idempotent(&self, collection: &'static str, rkey: &str) -> Result<()> {
+        let input = DeleteRecordIn {
+            space: self.space.to_string(),
+            repo: &self.did,
+            collection,
+            rkey: rkey.to_owned(),
+        };
+        let payload =
+            serde_json::to_vec(&input).map_err(|e| Error::Backend(format!("encode: {e}")))?;
+        match self
+            .t
+            .procedure(endpoint::DELETE_RECORD, &payload)
+            .await
+            .map_err(map_space_error)
+        {
+            Ok(_) | Err(Error::NotFound("record" | "repo")) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Every `(rkey, value)` of `collection`, ascending by `rkey`.
     async fn list_raw(&self, collection: &str, values: bool) -> Result<Vec<(String, Value)>> {
         let mut out = Vec::new();
@@ -869,19 +889,8 @@ impl MailboxStore for SpaceMailboxStore {
     }
 
     async fn delete_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<()> {
-        let input = DeleteRecordIn {
-            space: self.space.to_string(),
-            repo: &self.did,
-            collection: nsid::VIRTUAL_DEVICE,
-            rkey: hex::encode(vdevice_id),
-        };
-        let payload =
-            serde_json::to_vec(&input).map_err(|e| Error::Backend(format!("encode: {e}")))?;
-        self.t
-            .procedure(endpoint::DELETE_RECORD, &payload)
+        self.delete_record_idempotent(nsid::VIRTUAL_DEVICE, &hex::encode(vdevice_id))
             .await
-            .map_err(map_space_error)?;
-        Ok(())
     }
 
     async fn delete_squatted_epoch(&self, seq: u64) -> Result<()> {
@@ -904,7 +913,17 @@ impl MailboxStore for SpaceMailboxStore {
             });
         }
         for chunk in writes.chunks(MAX_WRITES) {
-            self.apply(chunk).await?;
+            match self.apply(chunk).await {
+                Ok(_) => {}
+                Err(Error::NotFound("record")) => {
+                    for op in chunk {
+                        if let WriteOp::Delete { collection, rkey } = op {
+                            self.delete_record_idempotent(collection, rkey).await?;
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }

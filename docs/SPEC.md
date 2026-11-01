@@ -7,7 +7,7 @@ Primary sources:
 - Labyrinth v1.1 (Apr 2026): <https://engineering.fb.com/wp-content/uploads/2026/05/Minos-Updates-2026-Encrypted-Backups-White-Paper.pdf>
 - AES-256-DNDK-GCM: <https://datatracker.ietf.org/doc/draft-gueron-cfrg-dndkgcm/>
 - XEdDSA: <https://signal.org/docs/specifications/xeddsa/>
-- ORF: <https://eprint.iacr.org/2022/1044>
+- ORF: <https://eprint.iacr.org/2022/1044> *(historical paper reference; retired in Catbird clean-slate profile `2A`, §3.6)*
 
 Whitepaper page numbers below refer to the v1.1 paper, e.g. "(p.27)". Every place we choose something the paper leaves open is tagged **[CB-n]**. `docs/DECISIONS.md` lists the tags and why we chose each one.
 
@@ -25,7 +25,7 @@ Whitepaper page numbers below refer to the v1.1 paper, e.g. "(p.27)". Every plac
 | thread | an MLS conversation (`chat.conversations.conversation_id`) **[CB-2]** |
 | message | an MLS application frame body (opaque bytes) plus `messageId`, `timestamp` |
 | transport signing key | the sending chat device's Ed25519 key, the key `mls-ds` registers in `chat.device_keys` **[CB-3]** |
-| metastore + mailbox server | **ATProto Spaces only** (`I14`, `I15`): `at://<did>/space/blue.catbird.labyrinth.mailbox/self` for the personal mailbox Space and `at://<authority>/space/blue.catbird.mls.conversation/<gen>` for conversation Spaces; `mls-ds` serves strictly as directory + sequencer, never a content store (§9) |
+| metastore + mailbox server | **ATProto Spaces only** (`I14`, `I15`): `at://<did>/space/blue.catbird.labyrinth.mailbox/self` for the personal mailbox Space and `at://<authority>/space/blue.catbird.labyrinth.conversation/<id>` for conversation Spaces; `mls-ds` serves strictly as directory + sequencer, never a content store (§9) |
 
 ## 2. Encodings
 
@@ -324,7 +324,7 @@ Stored record: `(threadId, messageId, timestamp, epochSequenceID, version, encry
   where `kind` selects one of four padded, server-indistinguishable payloads:
   - `0x00` — plain unattributed message frame (`body = frame`);
   - `0x01` — delete-for-me tombstone (`body = author_did_utf8`, empty if unscoped, §7.5);
-  - `0x02` — `I13` sequencer-receipt-committed frame (`body = frame_nonce(32) || u32_be(len(receipt_json)) || receipt_json || frame`), verified on read against the conversation's `sequencer_receipt_key` (`ES256`, `#mls-receipt-1`) and blinded `HMAC-SHA256` commitment, with `LoadedMessage::sender` populated from `receipt.signed.payload.split_sender_device()`;
+  - `0x02` — `I13` sequencer-receipt-committed frame (`body = frame_nonce(32) || frame`, paired with `sequencerReceipt` on the enclosing `OwnerMessage` record), verified on read against the conversation's `sequencer_receipt_key` (`ES256`, `#mls-receipt-1`) and blinded `HMAC-SHA256` commitment, with `LoadedMessage::sender` populated from `receipt.signed.payload.split_sender_device()`;
   - `0x03` — sender-attributed frame (`body = u16_be(len(sender_did)) || sender_did || frame`), preserving authenticated `sender_did` when re-archiving plain sender batches before leave or rescuing locally cached/queued messages after involuntary removal ([CB-22]).
 - Readers also accept version 3 (the paper's writer) and versions 0, 2, 4 from the paper's implementation notes (p.51–52), all with the paper's AAD; version 1 and anything above 5 are rejected.
 

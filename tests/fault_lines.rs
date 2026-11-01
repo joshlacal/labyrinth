@@ -1028,3 +1028,354 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
             .all(|m| m.message_id != "bob-cached-before-kick")
     );
 }
+
+#[test]
+fn fault_line_3_directory_incomplete_and_chunked_concurrent_delete_and_otc_squat_healing() {
+    let net = MemoryBackend::new();
+    let host = MemorySpaceHost::new();
+    let convo_space = SpaceRef::parse(&format!(
+        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+    ))
+    .unwrap();
+    host.grant_space_member(&convo_space, ALICE_DID);
+    let mb_space = SpaceRef::parse(&format!(
+        "at://{ALICE_DID}/space/blue.catbird.labyrinth.mailbox/self"
+    ))
+    .unwrap();
+
+    // 1. Initialize `phone` with ONLY PDS published (`publishers: vec![]` omits `ds_publisher`),
+    // so `CompositeDirectory::new` sees PDS present + DS absent -> `Error::DirectoryIncomplete`!
+    let t1 = transport(11);
+    net.register_chat_device(ALICE_DID, t1.transport_public_key());
+    let mailbox_pds_only = SpaceMailboxStore::new(
+        host.client(ALICE_DID),
+        mb_space.clone(),
+        ALICE_DID.to_owned(),
+    )
+    .with_key_publisher(Box::new(net.pds_publisher(ALICE_DID)));
+    let mut phone_incomplete = block_on(Labyrinth::initialize(
+        ALICE_DID,
+        Box::new(t1),
+        Backends {
+            mailbox: Box::new(mailbox_pds_only),
+            threads: Box::new(SpaceThreadStore::new(
+                host.client(ALICE_DID),
+                ALICE_DID.to_owned(),
+            )),
+            directory: Box::new(CompositeDirectory::new(
+                Box::new(net.directory()),
+                Box::new(net.ds_directory()),
+            )),
+            publishers: vec![], // Intentionally omit DS publisher to trigger DirectoryIncomplete!
+            clock: Box::new(SystemClock),
+        },
+    ))
+    .expect("init with pds-only publication");
+
+    // Plant a bogus `epoch/1` + 210 `epochMember/1-*` records (> MAX_WRITES = 200 chunk boundary).
+    let alice_mb = SpaceMailboxStore::new(
+        host.client(ALICE_DID),
+        mb_space.clone(),
+        ALICE_DID.to_owned(),
+    );
+    let e0 = block_on(alice_mb.get_epoch(0)).unwrap().unwrap().value;
+    let mut bogus_e1 = e0.clone();
+    bogus_e1.public.epoch_number = 1;
+    bogus_e1.public.previous_epoch_head = Some(e0.public.epoch_head.clone());
+    bogus_e1.public.prev_sig = Some(e0.public.self_sig.clone());
+    bogus_e1.encrypted_previous_epoch_number = Some(Bytes(vec![5; 40]));
+    bogus_e1.encrypted_previous_epoch_root_key = Some(Bytes(vec![5; 60]));
+    // Use an unregistered/missing `openedBy` device pubkey so `is_epoch_header_or_opener_invalid`
+    // also exercises missing-opener squat classification during `enroll_via_otc` below!
+    bogus_e1.opened_by = Bytes(vec![0xAB; 32]);
+
+    let raw_client = host.client(ALICE_DID);
+    block_on(
+        raw_client.procedure(
+            "com.atproto.space.applyWrites",
+            &serde_json::to_vec(&serde_json::json!({
+                "repo": ALICE_DID,
+                "space": mb_space.to_string(),
+                "validate": false,
+                "writes": [{
+                    "$type": "com.atproto.space.applyWrites#create",
+                    "collection": nsid::EPOCH,
+                    "rkey": format!("{:012}", 1),
+                    "value": serde_json::to_value(&bogus_e1).unwrap(),
+                }],
+            }))
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    for chunk_idx in 0..2 {
+        let mut writes = Vec::new();
+        let start = chunk_idx * 150;
+        let end = ((chunk_idx + 1) * 150).min(210);
+        for i in start..end {
+            let mut pk = [0u8; 32];
+            pk[0] = (i & 0xFF) as u8;
+            pk[1] = ((i >> 8) & 0xFF) as u8;
+            pk[31] = 0xEE;
+            let m = EpochMember {
+                type_: nsid::EPOCH_MEMBER.to_owned(),
+                epoch_number: 1,
+                device_key_pubkey: Bytes::from_slice(&pk),
+                encrypted_entropy: Some(Bytes(vec![3; 64])),
+                device_mac: Bytes(vec![3; 32]),
+                created_at: "2026-11-01T12:10:00.000Z".into(),
+            };
+            writes.push(serde_json::json!({
+                "$type": "com.atproto.space.applyWrites#create",
+                "collection": nsid::EPOCH_MEMBER,
+                "rkey": m.rkey(),
+                "value": serde_json::to_value(&m).unwrap(),
+            }));
+        }
+        block_on(
+            raw_client.procedure(
+                "com.atproto.space.applyWrites",
+                &serde_json::to_vec(&serde_json::json!({
+                    "repo": ALICE_DID,
+                    "space": mb_space.to_string(),
+                    "validate": false,
+                    "writes": writes,
+                }))
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    }
+    assert_eq!(block_on(alice_mb.list_epoch_members(1)).unwrap().len(), 210);
+
+    // Guard A: `DirectoryIncomplete` MUST fail closed and leave `epoch/1` + all 210 members intact!
+    assert!(matches!(
+        block_on(phone_incomplete.clear_squatted_epoch(1)).unwrap_err(),
+        Error::DirectoryIncomplete { .. }
+    ));
+    assert!(block_on(alice_mb.get_epoch(1)).unwrap().is_some());
+    assert_eq!(block_on(alice_mb.list_epoch_members(1)).unwrap().len(), 210);
+
+    // Guard B: Simulate a concurrent sibling deleting ONE `epochMember/1-*` right after
+    // `list_epoch_members(1)` runs inside `delete_squatted_epoch`, forcing `applyWrites#delete`
+    // to return `RecordNotFound` and exercising the per-record `delete_record_idempotent` fallback
+    // across > 200 records!
+    struct ConcurrentMemberDeleteRpc {
+        inner: Arc<dyn labyrinth::store::space::SpaceRpc>,
+        space: String,
+        deleted_once: std::sync::atomic::AtomicBool,
+    }
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl labyrinth::store::space::SpaceRpc for ConcurrentMemberDeleteRpc {
+        async fn query(
+            &self,
+            nsid: &str,
+            params: &[(&str, String)],
+        ) -> core::result::Result<Vec<u8>, labyrinth::store::space::SpaceError> {
+            self.inner.query(nsid, params).await
+        }
+        async fn procedure(
+            &self,
+            nsid_name: &str,
+            payload: &[u8],
+        ) -> core::result::Result<Vec<u8>, labyrinth::store::space::SpaceError> {
+            if nsid_name == "com.atproto.space.applyWrites"
+                && !self
+                    .deleted_once
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let v: serde_json::Value = serde_json::from_slice(payload).unwrap();
+                if let Some(first_del_rkey) = v["writes"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|op| {
+                        (op["$type"] == "com.atproto.space.applyWrites#delete")
+                            .then(|| op["rkey"].as_str())
+                            .flatten()
+                    })
+                {
+                    let _ = self
+                        .inner
+                        .procedure(
+                            "com.atproto.space.deleteRecord",
+                            &serde_json::to_vec(&serde_json::json!({
+                                "repo": ALICE_DID,
+                                "space": self.space,
+                                "collection": nsid::EPOCH_MEMBER,
+                                "rkey": first_del_rkey,
+                            }))
+                            .unwrap(),
+                        )
+                        .await;
+                }
+            }
+            self.inner.procedure(nsid_name, payload).await
+        }
+    }
+
+    let phone_state = phone_incomplete.export_state().unwrap();
+    let racing_rpc: Arc<dyn labyrinth::store::space::SpaceRpc> =
+        Arc::new(ConcurrentMemberDeleteRpc {
+            inner: Arc::new(host.client(ALICE_DID)),
+            space: mb_space.to_string(),
+            deleted_once: std::sync::atomic::AtomicBool::new(false),
+        });
+    let mut phone_healthy = block_on(Labyrinth::from_state(
+        &phone_state,
+        ALICE_DID,
+        Box::new(transport(11)),
+        Backends {
+            mailbox: Box::new(
+                SpaceMailboxStore::new(racing_rpc, mb_space.clone(), ALICE_DID.to_owned())
+                    .with_key_publisher(Box::new(net.pds_publisher(ALICE_DID))),
+            ),
+            threads: Box::new(SpaceThreadStore::new(
+                host.client(ALICE_DID),
+                ALICE_DID.to_owned(),
+            )),
+            directory: Box::new(CompositeDirectory::new(
+                Box::new(net.directory()),
+                Box::new(net.ds_directory()),
+            )),
+            publishers: vec![Box::new(net.ds_publisher(ALICE_DID))],
+            clock: Box::new(SystemClock),
+        },
+    ))
+    .unwrap();
+    // Publish epoch 0 to DS so `CompositeDirectory` is healthy at epoch 0.
+    block_on(phone_healthy.publish_latest_keys()).unwrap();
+
+    assert!(block_on(phone_healthy.clear_squatted_epoch(1)).unwrap());
+    assert!(block_on(alice_mb.get_epoch(1)).unwrap().is_none());
+    assert!(block_on(alice_mb.list_epoch_members(1)).unwrap().is_empty());
+
+    // Prepare two OTC handshakes from `phone_healthy` at epoch 0 before planting the in-flight squat:
+    let mut offer = phone_healthy.otc_offer().unwrap();
+    let code = offer.code().as_str().to_owned();
+    let (init_otc, hello) = Labyrinth::otc_start(ALICE_DID, &code).unwrap();
+    let reply = block_on(phone_healthy.otc_respond(&mut offer, &hello)).unwrap();
+
+    let mut stale_offer = phone_healthy.otc_offer().unwrap();
+    let stale_code = stale_offer.code().as_str().to_owned();
+    let (stale_init, stale_hello) = Labyrinth::otc_start(ALICE_DID, &stale_code).unwrap();
+    let stale_reply = block_on(phone_healthy.otc_respond(&mut stale_offer, &stale_hello)).unwrap();
+
+    // Guard C: Re-plant the missing-opener `bogus_e1` at `epoch/1` (while `CompositeDirectory`
+    // is still anchored at epoch 0) in the race window between `otc_respond` and `enroll_via_otc`,
+    // and confirm `enroll_via_otc` heals the unanchored squat automatically and enrolls `laptop` at epoch 1!
+    block_on(
+        raw_client.procedure(
+            "com.atproto.space.applyWrites",
+            &serde_json::to_vec(&serde_json::json!({
+                "repo": ALICE_DID,
+                "space": mb_space.to_string(),
+                "validate": false,
+                "writes": [{
+                    "$type": "com.atproto.space.applyWrites#create",
+                    "collection": nsid::EPOCH,
+                    "rkey": format!("{:012}", 1),
+                    "value": serde_json::to_value(&bogus_e1).unwrap(),
+                }],
+            }))
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let laptop_t = transport(12);
+    net.register_chat_device(ALICE_DID, laptop_t.transport_public_key());
+    let (laptop, _) = block_on(Labyrinth::enroll_via_otc(
+        ALICE_DID,
+        init_otc,
+        &reply.message,
+        &reply.sealed_payload,
+        Box::new(laptop_t),
+        Backends {
+            mailbox: Box::new(
+                SpaceMailboxStore::new(
+                    host.client(ALICE_DID),
+                    mb_space.clone(),
+                    ALICE_DID.to_owned(),
+                )
+                .with_key_publisher(Box::new(net.pds_publisher(ALICE_DID))),
+            ),
+            threads: Box::new(SpaceThreadStore::new(
+                host.client(ALICE_DID),
+                ALICE_DID.to_owned(),
+            )),
+            directory: Box::new(CompositeDirectory::new(
+                Box::new(net.directory()),
+                Box::new(net.ds_directory()),
+            )),
+            publishers: vec![Box::new(net.ds_publisher(ALICE_DID))],
+            clock: Box::new(SystemClock),
+        },
+    ))
+    .expect("enroll_via_otc must clear unanchored missing-opener squat at epoch 1");
+    assert_eq!(laptop.latest_epoch(), 1);
+
+    // Guard D: `CompositeDirectory` now anchors `epoch/1`, while `stale_reply` carries E = 0.
+    // Even if `epoch/1` in Space were replaced with a malformed/missing-opener record,
+    // `enroll_via_otc` MUST fail closed with `Error::EpochTruncated` instead of deleting `epoch/1`!
+    block_on(
+        raw_client.procedure(
+            "com.atproto.space.applyWrites",
+            &serde_json::to_vec(&serde_json::json!({
+                "repo": ALICE_DID,
+                "space": mb_space.to_string(),
+                "validate": false,
+                "writes": [{
+                    "$type": "com.atproto.space.applyWrites#update",
+                    "collection": nsid::EPOCH,
+                    "rkey": format!("{:012}", 1),
+                    "value": serde_json::to_value(&bogus_e1).unwrap(),
+                }],
+            }))
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let tablet_t = transport(13);
+    net.register_chat_device(ALICE_DID, tablet_t.transport_public_key());
+    let enroll_err = match block_on(Labyrinth::enroll_via_otc(
+        ALICE_DID,
+        stale_init,
+        &stale_reply.message,
+        &stale_reply.sealed_payload,
+        Box::new(tablet_t),
+        Backends {
+            mailbox: Box::new(
+                SpaceMailboxStore::new(
+                    host.client(ALICE_DID),
+                    mb_space.clone(),
+                    ALICE_DID.to_owned(),
+                )
+                .with_key_publisher(Box::new(net.pds_publisher(ALICE_DID))),
+            ),
+            threads: Box::new(SpaceThreadStore::new(
+                host.client(ALICE_DID),
+                ALICE_DID.to_owned(),
+            )),
+            directory: Box::new(CompositeDirectory::new(
+                Box::new(net.directory()),
+                Box::new(net.ds_directory()),
+            )),
+            publishers: vec![Box::new(net.ds_publisher(ALICE_DID))],
+            clock: Box::new(SystemClock),
+        },
+    )) {
+        Ok(_) => panic!("enroll_via_otc must refuse to delete directory-anchored epoch 1"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        enroll_err,
+        Error::EpochTruncated {
+            published: 1,
+            reached: 0,
+        }
+    );
+    assert!(block_on(alice_mb.get_epoch(1)).unwrap().is_some());
+}
