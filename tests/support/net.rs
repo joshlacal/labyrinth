@@ -175,11 +175,20 @@ impl MailboxStore for Faulty {
     async fn list_epoch_members(&self, s: u64) -> labyrinth::Result<Vec<EpochMember>> {
         let mut v = self.inner.list_epoch_members(s).await?;
         if let Some(k) = *self.omit.lock().unwrap() {
-            if self
-                .omit_skip
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_err()
-            {
+            let skipped = loop {
+                let cur = self.omit_skip.load(Ordering::SeqCst);
+                let Some(next) = cur.checked_sub(1) else {
+                    break false;
+                };
+                if self
+                    .omit_skip
+                    .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break true;
+                }
+            };
+            if !skipped {
                 v.retain(|m| m.device_key_pubkey.0 != k.0);
             }
         }
