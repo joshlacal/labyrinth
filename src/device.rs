@@ -144,11 +144,23 @@ impl DeviceSecrets {
         Self::assemble(device_key, storage, Some(auth))
     }
 
+    /// A fresh physical device generated from a caller-supplied deterministic
+    /// randomness source (for DST / simulation testing).
+    pub fn generate_physical_with_random(hook: crate::encoding::RandomFillHook) -> Result<Self> {
+        crate::encoding::with_random_hook(hook, Self::generate_physical)
+    }
+
     /// A fresh virtual device (no auth key, `0x32` storage signature; `Gate 2`).
     pub fn generate_virtual() -> Result<Self> {
         let device_key = XSigningKey::generate()?;
         let (storage, _) = hawk_enc_keygen()?;
         Self::assemble(device_key, storage, None)
+    }
+
+    /// A fresh virtual device generated from a caller-supplied deterministic
+    /// randomness source (for DST / simulation testing).
+    pub fn generate_virtual_with_random(hook: crate::encoding::RandomFillHook) -> Result<Self> {
+        crate::encoding::with_random_hook(hook, Self::generate_virtual)
     }
 
     fn assemble(

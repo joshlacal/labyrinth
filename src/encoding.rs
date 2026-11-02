@@ -57,9 +57,39 @@ pub fn b64_decimal(n: u64) -> String {
     base64::engine::general_purpose::STANDARD.encode(n.to_string())
 }
 
-/// Fill `out` from the OS CSPRNG.
+/// Fill `out` from the active deterministic [`with_random_hook`] if installed
+/// on the current thread, or otherwise from the OS CSPRNG.
 pub fn random(out: &mut [u8]) -> crate::Result<()> {
+    let hook = RANDOM_HOOK.with(|slot| slot.borrow().clone());
+    if let Some(fill) = hook {
+        return fill(out);
+    }
     getrandom::fill(out).map_err(|_| crate::Error::Rng)
+}
+
+/// Thread-safe byte filler callback used by [`with_random_hook`] for deterministic
+/// simulation testing without altering production call sites.
+pub type RandomFillHook = std::sync::Arc<dyn Fn(&mut [u8]) -> crate::Result<()> + Send + Sync>;
+
+std::thread_local! {
+    static RANDOM_HOOK: std::cell::RefCell<Option<RandomFillHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Execute `f` with every [`random`] draw on the current thread routed through
+/// `hook` instead of the OS CSPRNG. Restores any outer hook on return or unwind.
+pub fn with_random_hook<T>(hook: RandomFillHook, f: impl FnOnce() -> T) -> T {
+    struct RestoreGuard(Option<RandomFillHook>);
+    impl Drop for RestoreGuard {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            RANDOM_HOOK.with(|slot| {
+                *slot.borrow_mut() = prev;
+            });
+        }
+    }
+    let prev = RANDOM_HOOK.with(|slot| slot.borrow_mut().replace(hook));
+    let _guard = RestoreGuard(prev);
+    f()
 }
 
 #[cfg(test)]
@@ -157,5 +187,36 @@ mod tests {
         random(&mut b).unwrap();
         assert_ne!(a, b);
         random(&mut []).unwrap();
+    }
+
+    #[test]
+    fn with_random_hook_produces_deterministic_device_and_restores_os_rng() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let make_hook = |seed: u64| -> RandomFillHook {
+            let ctr = AtomicU64::new(seed);
+            std::sync::Arc::new(move |out: &mut [u8]| {
+                for chunk in out.chunks_mut(32) {
+                    let n = ctr.fetch_add(1, Ordering::SeqCst);
+                    let block = sha256(&n.to_le_bytes());
+                    chunk.copy_from_slice(&block[..chunk.len()]);
+                }
+                Ok(())
+            })
+        };
+
+        let d1 =
+            crate::device::DeviceSecrets::generate_physical_with_random(make_hook(77)).unwrap();
+        let d2 =
+            crate::device::DeviceSecrets::generate_physical_with_random(make_hook(77)).unwrap();
+        let d3 =
+            crate::device::DeviceSecrets::generate_physical_with_random(make_hook(78)).unwrap();
+        assert_eq!(d1.public(), d2.public());
+        assert_ne!(d1.public(), d3.public());
+
+        let mut os_a = [0u8; 32];
+        let mut os_b = [0u8; 32];
+        random(&mut os_a).unwrap();
+        random(&mut os_b).unwrap();
+        assert_ne!(os_a, os_b);
     }
 }
