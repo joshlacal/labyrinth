@@ -324,7 +324,7 @@ pub struct SpaceMailboxStore {
     space: SpaceRef,
     t: Arc<dyn SpaceRpc>,
     keys: Box<dyn KeyPublisher>,
-    now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+    now_ms: crate::store::ClockFn,
     page: usize,
 }
 
@@ -395,7 +395,7 @@ impl SpaceMailboxStore {
     }
 
     /// Replaces the clock that stamps `lastUsedAt`.
-    pub fn with_clock(mut self, now_ms: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+    pub fn with_clock(mut self, now_ms: crate::store::ClockFn) -> Self {
         self.now_ms = now_ms;
         self
     }

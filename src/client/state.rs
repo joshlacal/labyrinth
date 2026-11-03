@@ -34,6 +34,8 @@
 //! verified seq u64, u32 × 32          members verified in epoch seq ([CB-25])
 //! pins     u32 × (did str16, seq u64, head 32, sigKey 32)
 //! meks     u32 × (threadId str16, u32 × (secret 32, rosterHash 32, provenance))
+//!          threads in ascending threadId byte order, MEKs oldest first;
+//!          decode accepts any thread order, export is always canonical
 //! provenance = 0x00 | 0x01 senderDid str16 head 32 | 0x02 transportPub 32 createdHere u8
 //! opt(x)   = 0x00 | 0x01 x;   str16 = u16 length || UTF-8
 //! ```
@@ -324,7 +326,7 @@ impl Labyrinth {
             };
             pins.insert(peer, pin);
         }
-        let mut meks: std::collections::HashMap<String, Vec<Mek>> = Default::default();
+        let mut meks = BTreeMap::new();
         for _ in 0..r.count(2 + 4)? {
             let thread = r.str()?;
             let mut list = Vec::new();

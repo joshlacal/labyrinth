@@ -1,7 +1,7 @@
 //! Reader path: loading a thread's history, and owner-mode archiving
 //! (SPEC §7.1, §7.4, [CB-22]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::Labyrinth;
 use crate::deletion::StoredRedaction;
@@ -18,8 +18,12 @@ use crate::{Error, Result};
 /// Where a loaded message came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageSource {
-    /// A sender `batch` in the conversation space (v1.1).
+    /// The author's own sender `batch` in the conversation space (v1.1).
     Sender,
+    /// A witness copy: another member's receipt-committed message, archived
+    /// in the conversation space by a member that received it. Attributed to
+    /// the receipt's sender, never to the witness.
+    Witness,
     /// An `ownerBatch` in this account's mailbox (v1.0 / re-archive).
     Owner,
 }
@@ -30,14 +34,44 @@ pub struct LoadedMessage {
     pub thread_id: String,
     pub message_id: String,
     pub timestamp: u64,
-    /// Sender DID for sender-mode messages; owner records carry none.
+    /// Sender DID: the batch author, or the receipt's sender for a witness
+    /// copy. Unattributed legacy owner records carry none.
     pub sender: Option<String>,
     pub frame: Vec<u8>,
+    /// Sequencer receipt whose signature and frame commitment were verified.
+    /// Absent for uncommitted legacy frames.
+    pub archived_receipt: Option<ArchivedReceipt>,
+    /// Blinding nonce authenticated together with `archived_receipt`.
+    pub frame_nonce: Option<[u8; 32]>,
     pub source: MessageSource,
-    /// True when another, different copy with the same `message_id` was
-    /// also loaded (from another author, or a differing owner copy). Both
-    /// copies are returned; the caller decides which one MLS vouches for.
+    /// True when another, different sender or owner copy with the same
+    /// `message_id` was also loaded (from another author, or a differing
+    /// owner copy). Both copies are returned; the caller decides which one
+    /// MLS vouches for. A witness copy never sets it: one that contradicts
+    /// an accepted copy is in [`ThreadHistory::rejected`] instead.
     pub conflict: bool,
+}
+
+/// A verified witness copy that was not accepted (ruling 3). Nothing
+/// authenticates the message id a witness files a receipt under, so it
+/// never replaces, flags or re-attributes an accepted copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedCopy {
+    pub message_id: String,
+    pub timestamp: u64,
+    /// The receipt's sender the copy names.
+    pub sender: Option<String>,
+    pub reason: Rejection,
+}
+
+/// Why a witness copy was rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rejection {
+    /// An accepted copy with its message id has another frame, nonce,
+    /// receipt or sender.
+    Contradicts,
+    /// An accepted copy with another message id holds its sequencer receipt.
+    ReceiptReused,
 }
 
 /// A message this device could see but not open.
@@ -80,6 +114,8 @@ pub struct ThreadHistory {
     /// Message ids hidden by this account's delete-for-me tombstones
     /// ([CB-38]).
     pub deleted_for_me: Vec<String>,
+    /// Witness copies that contradict an accepted copy (ruling 3).
+    pub rejected: Vec<RejectedCopy>,
     /// False if the conversation space refused reads ([`Error::Forbidden`]);
     /// only owner-archived messages are then included.
     pub space_readable: bool,
@@ -98,15 +134,10 @@ pub(super) enum OpenedSealed {
         frame_nonce: [u8; 32],
         frame: Vec<u8>,
         receipt: ArchivedReceipt,
+        /// The receipt's sender DID: the batch author, or the original
+        /// sender of a witness copy.
+        sender: String,
     },
-}
-
-impl OpenedSealed {
-    pub(super) fn into_frame(self) -> Vec<u8> {
-        match self {
-            Self::Plain(f) | Self::Committed { frame: f, .. } => f,
-        }
-    }
 }
 
 impl Labyrinth {
@@ -128,22 +159,18 @@ impl Labyrinth {
 
     /// Open an explicitly supplied owner record with the same checks as history.
     pub async fn open_owner_record(&mut self, batch: OwnerBatch) -> Result<ThreadHistory> {
-        let messages = batch.to_messages()?;
+        let thread_id = batch.thread_id.clone();
+        let stored = Stored {
+            author: self.did.clone(),
+            rkey: String::new(),
+            order: None,
+            value: batch,
+        };
         let mut history = ThreadHistory::default();
-        for message in messages {
-            let thread_id = message.thread_id.clone();
-            let single = OwnerBatch::from_messages(&[message], batch.created_at.clone())?;
-            let stored = Stored {
-                author: self.did.clone(),
-                rkey: String::new(),
-                order: None,
-                value: single,
-            };
-            let tombstones = self
-                .open_owner_batches(&thread_id, vec![stored], &|_, _| true, &mut history)
-                .await?;
-            finish(&mut history, &tombstones);
-        }
+        let tombstones = self
+            .open_owner_batches(&thread_id, vec![stored], &|_, _| true, &mut history)
+            .await?;
+        finish(&mut history, &tombstones);
         Ok(history)
     }
 
@@ -162,7 +189,8 @@ impl Labyrinth {
             self.b.threads.list_batches(thread_id, None, range).await,
         )?;
         let keep = |_: &str, ts: u64| range.contains(ts);
-        self.open_batches(thread_id, batches, &keep, &mut h).await?;
+        self.open_batches(thread_id, batches, &keep, &mut h, true)
+            .await?;
         let owner = self.b.mailbox.list_owner_batches(thread_id, range).await?;
         let tombstones = self
             .open_owner_batches(thread_id, owner, &keep, &mut h)
@@ -180,7 +208,7 @@ impl Labyrinth {
     ) -> Result<Vec<Stored<Batch>>> {
         match r {
             Ok(b) => Ok(b),
-            Err(Error::Forbidden | Error::NotFound("space" | "conversation")) => {
+            Err(Error::Forbidden) => {
                 h.space_readable = false;
                 Ok(Vec::new())
             }
@@ -189,14 +217,19 @@ impl Labyrinth {
     }
 
     /// Opens every item of `batches` that `keep(messageId, timestamp)`
-    /// selects into `h`.
+    /// selects into `h`, in server admission order, so witness copies reach
+    /// [`finish`] earliest-admitted first. An unverifiable redaction fails
+    /// the read with [`Error::BadSignature`] when `strict`; otherwise it is
+    /// skipped.
     pub(super) async fn open_batches(
         &mut self,
         thread_id: &str,
-        batches: Vec<Stored<Batch>>,
+        mut batches: Vec<Stored<Batch>>,
         keep: Keep<'_>,
         h: &mut ThreadHistory,
+        strict: bool,
     ) -> Result<()> {
+        batches.sort_by_key(|b| b.order.map(|o| o.labyrinth_seq));
         for b in batches {
             let author = Some(b.author.clone());
             let items = if b.value.thread_id == thread_id {
@@ -216,9 +249,10 @@ impl Labyrinth {
                     continue;
                 }
             };
-            for entry in items
+            for (entry, raw) in items
                 .into_iter()
-                .filter(|e| keep(e.message_id(), e.timestamp()))
+                .zip(&b.value.items)
+                .filter(|(e, _)| keep(e.message_id(), e.timestamp()))
             {
                 let s = match entry {
                     BatchEntry::Sealed(s) => s,
@@ -227,49 +261,62 @@ impl Labyrinth {
                         timestamp,
                         redaction,
                     } => {
-                        let (by_author, account_deleted) = match &redaction {
-                            StoredRedaction::Author(r)
-                                if self
-                                    .redaction_by_author(thread_id, &b.author, &message_id, r)
-                                    .await =>
-                            {
-                                (true, false)
+                        let receipt_sender = raw.sequencer_receipt.as_ref().map(|r| &*r.sender_did);
+                        match self
+                            .verify_redaction(
+                                thread_id,
+                                &b.author,
+                                receipt_sender,
+                                &message_id,
+                                &redaction,
+                            )
+                            .await
+                        {
+                            Some((sender, by_author, account_deleted)) => {
+                                h.redacted.push(RedactedMessage {
+                                    message_id,
+                                    timestamp,
+                                    sender,
+                                    by_author,
+                                    account_deleted,
+                                    removed_by_server: false,
+                                })
                             }
-                            StoredRedaction::Server(r)
-                                if self
-                                    .redaction_by_sequencer(thread_id, &b.author, &message_id, r)
-                                    .await =>
-                            {
-                                (false, true)
-                            }
-                            _ => return Err(Error::BadSignature),
-                        };
-                        h.redacted.push(RedactedMessage {
-                            message_id,
-                            timestamp,
-                            sender: b.author.clone(),
-                            by_author,
-                            account_deleted,
-                            removed_by_server: false,
-                        });
+                            None if strict => return Err(Error::BadSignature),
+                            None => {}
+                        }
                         continue;
                     }
                 };
                 let at = VouchAt::of(b.order, s.timestamp);
-                match self
-                    .open_sealed_inner(thread_id, &b.author, &s, at)
-                    .await
-                    .map(OpenedSealed::into_frame)
-                {
-                    Ok(frame) => h.messages.push(LoadedMessage {
-                        thread_id: thread_id.to_owned(),
-                        message_id: s.message_id.clone(),
-                        timestamp: s.timestamp,
-                        sender: author.clone(),
-                        frame,
-                        source: MessageSource::Sender,
-                        conflict: false,
-                    }),
+                match self.open_sealed_inner(thread_id, &b.author, &s, at).await {
+                    Ok(opened) => {
+                        let (frame, archived_receipt, frame_nonce, sender) = match opened {
+                            OpenedSealed::Plain(frame) => (frame, None, None, b.author.clone()),
+                            OpenedSealed::Committed {
+                                frame,
+                                receipt,
+                                frame_nonce,
+                                sender,
+                            } => (frame, Some(receipt), Some(frame_nonce), sender),
+                        };
+                        let source = if sender == b.author {
+                            MessageSource::Sender
+                        } else {
+                            MessageSource::Witness
+                        };
+                        h.messages.push(LoadedMessage {
+                            thread_id: thread_id.to_owned(),
+                            message_id: s.message_id.clone(),
+                            timestamp: s.timestamp,
+                            sender: Some(sender),
+                            frame,
+                            archived_receipt,
+                            frame_nonce,
+                            source,
+                            conflict: false,
+                        });
+                    }
                     Err(error) => h.undecryptable.push(Undecryptable {
                         message_id: s.message_id.clone(),
                         timestamp: s.timestamp,
@@ -280,6 +327,44 @@ impl Labyrinth {
             }
         }
         Ok(())
+    }
+
+    /// The attributed sender and `(by_author, account_deleted)` of a
+    /// verified redaction of `message_id` on `author`'s item ([CB-38]);
+    /// `None` otherwise. A witness copy of a deleted account's message
+    /// (`receipt_sender` ≠ `author`) carries the sequencer's
+    /// account-deletion redaction for the receipt's sender.
+    async fn verify_redaction(
+        &self,
+        thread_id: &str,
+        author: &str,
+        receipt_sender: Option<&str>,
+        message_id: &str,
+        redaction: &StoredRedaction,
+    ) -> Option<(String, bool, bool)> {
+        match redaction {
+            StoredRedaction::Author(r)
+                if self
+                    .redaction_by_author(thread_id, author, message_id, r)
+                    .await =>
+            {
+                Some((author.to_owned(), true, false))
+            }
+            StoredRedaction::Server(r) => {
+                for sender in
+                    core::iter::once(author).chain(receipt_sender.filter(|s| *s != author))
+                {
+                    if self
+                        .redaction_by_sequencer(thread_id, sender, message_id, r)
+                        .await
+                    {
+                        return Some((sender.to_owned(), false, true));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     /// [CB-38]: the redaction is signed by a chat device of `author` that
@@ -358,6 +443,8 @@ impl Labyrinth {
                                 timestamp: m.timestamp,
                                 sender: None,
                                 frame,
+                                archived_receipt: None,
+                                frame_nonce: None,
                                 source: MessageSource::Owner,
                                 conflict: false,
                             });
@@ -378,13 +465,15 @@ impl Labyrinth {
                                 timestamp: m.timestamp,
                                 sender: Some(sender_did),
                                 frame,
+                                archived_receipt: None,
+                                frame_nonce: None,
                                 source: MessageSource::Owner,
                                 conflict: false,
                             });
                         }
                     }
                     Ok(OwnerContent::CommittedFrame { frame_nonce, frame }) => {
-                        let verified = (|| -> Result<String> {
+                        let verified = async {
                             let archived = m
                                 .sequencer_receipt
                                 .as_ref()
@@ -396,14 +485,29 @@ impl Labyrinth {
                                 archived.signed.payload.split_sender_device().map_err(|_| {
                                     Error::Malformed("invalid senderDevice in receipt")
                                 })?;
-                            if let Some(ref rk) = receipt_key {
-                                labyrinth_protocol::verify_sequencer_receipt_sec1(
-                                    &rk.public_key_sec1,
-                                    &rk.did,
-                                    &archived.signed,
-                                )
-                                .map_err(|_| Error::BadSignature)?;
-                            }
+                            // The receipt issuer is trusted only now: owner AEAD
+                            // authenticated the complete receipt before this branch.
+                            let resolved = if receipt_key.is_none() {
+                                self.b
+                                    .directory
+                                    .sequencer_receipt_key_for_authority(
+                                        thread_id,
+                                        &archived.signed.payload.sequencer_did,
+                                    )
+                                    .await?
+                            } else {
+                                None
+                            };
+                            let rk = receipt_key
+                                .as_ref()
+                                .or(resolved.as_ref())
+                                .ok_or(Error::Unattested)?;
+                            labyrinth_protocol::verify_sequencer_receipt_sec1(
+                                &rk.public_key_sec1,
+                                &rk.did,
+                                &archived.signed,
+                            )
+                            .map_err(|_| Error::BadSignature)?;
                             labyrinth_protocol::verify_archived_item_commitment(
                                 &archived.signed,
                                 &frame_nonce,
@@ -411,7 +515,8 @@ impl Labyrinth {
                             )
                             .map_err(|_| Error::ReceiptCommitmentMismatch)?;
                             Ok(sender_did.to_owned())
-                        })();
+                        }
+                        .await;
                         match verified {
                             Ok(sender_did) => h.messages.push(LoadedMessage {
                                 thread_id: thread_id.to_owned(),
@@ -419,6 +524,8 @@ impl Labyrinth {
                                 timestamp: m.timestamp,
                                 sender: Some(sender_did),
                                 frame,
+                                archived_receipt: m.sequencer_receipt,
+                                frame_nonce: Some(frame_nonce),
                                 source: MessageSource::Owner,
                                 conflict: false,
                             }),
@@ -448,6 +555,11 @@ impl Labyrinth {
     /// SPEC §7.4 + Gate 1 (`I13`): verifies sequencer receipt + blinded
     /// `archiveCommitment` when present (or required by `sequencer_receipt_key`),
     /// checks sender chat device validity, opens the MEK, and decrypts.
+    ///
+    /// A receipt naming another sender is a witness copy: `author` received
+    /// that member's message and archived it. Every check is unchanged (the
+    /// sealing key must still be one of `author`'s chat devices at the
+    /// receipt's order); the result names the receipt's sender.
     pub(super) async fn open_sealed_inner(
         &mut self,
         thread_id: &str,
@@ -466,11 +578,7 @@ impl Labyrinth {
                 .payload
                 .split_sender_device()
                 .map_err(|_| Error::Malformed("invalid senderDevice in receipt"))?;
-            if receipt_sender_did != author {
-                return Err(Error::Malformed(
-                    "receipt senderDevice DID does not match batch author",
-                ));
-            }
+            let sender = receipt_sender_did.to_owned();
             labyrinth_protocol::verify_sequencer_receipt_sec1(
                 &rk.public_key_sec1,
                 &rk.did,
@@ -508,6 +616,7 @@ impl Labyrinth {
                 frame_nonce,
                 frame,
                 receipt: archived.clone(),
+                sender,
             });
         }
 
@@ -598,8 +707,33 @@ impl Labyrinth {
     }
 }
 
-/// Applies delete-for-me tombstones, merges copies and sorts.
+/// Applies redactions and delete-for-me tombstones, merges copies and sorts.
 pub(super) fn finish(h: &mut ThreadHistory, tombstones: &[Tombstone]) {
+    // A verified unsend or account-deletion redaction ([CB-38]) replaces the
+    // author's own item. Wherever it is stored, it also hides every other
+    // copy attributed to that author: witness copies and owner copies.
+    h.redacted.sort_by(|a, b| {
+        (&a.message_id, &a.sender, !a.by_author, a.timestamp).cmp(&(
+            &b.message_id,
+            &b.sender,
+            !b.by_author,
+            b.timestamp,
+        ))
+    });
+    h.redacted
+        .dedup_by(|later, kept| later.message_id == kept.message_id && later.sender == kept.sender);
+    let gone: HashSet<(&str, &str)> = h
+        .redacted
+        .iter()
+        .map(|r| (r.message_id.as_str(), r.sender.as_str()))
+        .collect();
+    h.messages.retain(|m| {
+        m.source == MessageSource::Sender
+            || !m
+                .sender
+                .as_deref()
+                .is_some_and(|s| gone.contains(&(m.message_id.as_str(), s)))
+    });
     let hidden = |id: &str, sender: Option<&String>| {
         tombstones.iter().any(|(t, author)| {
             t == id && (sender.is_none() || author.is_none() || author.as_ref() == sender)
@@ -627,23 +761,96 @@ pub(super) fn finish(h: &mut ThreadHistory, tombstones: &[Tombstone]) {
         .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
     h.redacted
         .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
+    h.rejected
+        .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
 }
 
-/// Merge provably identical copies and flag the rest (see
-/// [`Labyrinth::load_thread`]). Sender copies are considered first, followed
-/// by attributed owner copies, then unattributed legacy owner copies.
+fn committed(m: &LoadedMessage) -> bool {
+    m.archived_receipt.is_some() || m.frame_nonce.is_some()
+}
+
+/// Copies of one message id that are provably the same message: equal
+/// frames, no differing sender, and equal receipts and nonces when both are
+/// committed.
+fn same(k: &LoadedMessage, m: &LoadedMessage) -> bool {
+    k.frame == m.frame
+        && (k.sender.is_none() || m.sender.is_none() || k.sender == m.sender)
+        && (!committed(k)
+            || !committed(m)
+            || (k.archived_receipt == m.archived_receipt && k.frame_nonce == m.frame_nonce))
+}
+
+/// The sequenced entry a committed copy's receipt names.
+fn receipt_entry(m: &LoadedMessage) -> Option<(String, String)> {
+    m.archived_receipt.as_ref().map(|r| {
+        (
+            r.signed.payload.sequencer_did.clone(),
+            r.signed.payload.entry_id.clone(),
+        )
+    })
+}
+
+/// Accept, merge and flag copies (see [`Labyrinth::load_thread`]).
+///
+/// Sender and owner copies are accepted as they are. Neither a receipt nor a
+/// frame authenticates the message id a witness files a copy under (the
+/// sequencer's `entryId` is its own), so a witness copy is a third party's
+/// claim: in admission order it is accepted only if it equals an accepted
+/// copy with its message id, or if it is the first claim on both that id and
+/// its receipt's entry. Otherwise it is rejected (ruling 3). Accepted copies
+/// then merge: the author's own sender copy is kept first, then the earliest
+/// witness copy, then attributed owner copies, then unattributed legacy
+/// owner copies. Differing sender or owner copies of one id are flagged.
 fn dedupe(h: &mut ThreadHistory) {
-    let mut all = core::mem::take(&mut h.messages);
-    all.sort_by_key(|m| (m.source != MessageSource::Sender, m.sender.is_none()));
+    let (witnesses, mut accepted): (Vec<_>, Vec<_>) = core::mem::take(&mut h.messages)
+        .into_iter()
+        .partition(|m| m.source == MessageSource::Witness);
+    let mut ids: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut entries: HashSet<(String, String)> = HashSet::new();
+    for (i, k) in accepted.iter().enumerate() {
+        ids.entry(k.message_id.clone()).or_default().push(i);
+        entries.extend(receipt_entry(k));
+    }
+    for w in witnesses {
+        let reason = match ids.get(&w.message_id) {
+            Some(ix) if ix.iter().any(|&i| same(&accepted[i], &w)) => None,
+            Some(_) => Some(Rejection::Contradicts),
+            None if receipt_entry(&w).is_some_and(|e| entries.contains(&e)) => {
+                Some(Rejection::ReceiptReused)
+            }
+            None => None,
+        };
+        if let Some(reason) = reason {
+            h.rejected.push(RejectedCopy {
+                message_id: w.message_id,
+                timestamp: w.timestamp,
+                sender: w.sender,
+                reason,
+            });
+            continue;
+        }
+        ids.entry(w.message_id.clone())
+            .or_default()
+            .push(accepted.len());
+        entries.extend(receipt_entry(&w));
+        accepted.push(w);
+    }
+    accepted.sort_by_key(|m| match m.source {
+        MessageSource::Sender => (0, false, 0),
+        MessageSource::Witness => (1, false, m.timestamp),
+        MessageSource::Owner => (2, m.sender.is_none(), 0),
+    });
     let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
-    for m in all {
-        let same = by_id.get(&m.message_id).is_some_and(|ix| {
-            ix.iter().any(|&i| {
-                let k = &h.messages[i];
-                k.frame == m.frame && (m.sender.is_none() || k.sender == m.sender)
-            })
-        });
-        if !same {
+    for m in accepted {
+        let same_ix = by_id
+            .get(&m.message_id)
+            .and_then(|ix| ix.iter().copied().find(|&i| same(&h.messages[i], &m)));
+        if let Some(i) = same_ix {
+            if !committed(&h.messages[i]) {
+                h.messages[i].archived_receipt = m.archived_receipt;
+                h.messages[i].frame_nonce = m.frame_nonce;
+            }
+        } else {
             by_id
                 .entry(m.message_id.clone())
                 .or_default()

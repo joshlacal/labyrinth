@@ -274,4 +274,23 @@ impl MailboxDirectory for CompositeDirectory {
             None => self.pds.sequencer_receipt_key(thread_id).await,
         }
     }
+
+    async fn sequencer_receipt_key_for_authority(
+        &self,
+        thread_id: &str,
+        expected_authority: &str,
+    ) -> Result<Option<SequencerReceiptKey>> {
+        match self
+            .ds
+            .sequencer_receipt_key_for_authority(thread_id, expected_authority)
+            .await?
+        {
+            Some(key) => Ok(Some(key)),
+            None => {
+                self.pds
+                    .sequencer_receipt_key_for_authority(thread_id, expected_authority)
+                    .await
+            }
+        }
+    }
 }

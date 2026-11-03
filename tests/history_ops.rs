@@ -8,7 +8,7 @@ use futures::executor::block_on;
 use labyrinth::Error;
 use labyrinth::client::{Labyrinth, MessageSource, ThreadCursor, ThreadHistory};
 use labyrinth::store::memory::MemoryBackend;
-use labyrinth::store::{MailboxDirectory, TimeRange};
+use labyrinth::store::{MailboxDirectory, MailboxStore, TimeRange};
 use labyrinth::virtual_device::Mechanism;
 use net::*;
 
@@ -57,6 +57,80 @@ fn delete_for_me_hides_a_message_on_every_own_device_only() {
     assert!(ranged.messages.is_empty());
     // ... and nobody else's view changes.
     assert_eq!(ids(&read(&mut alice, T)), ["m1", "m2"]);
+}
+
+#[test]
+fn open_owner_record_applies_tombstones_once_for_the_whole_batch() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut alice = init(&net, &clock, A, 1);
+    block_on(alice.archive_owner(T, "deleted", 10, b"deleted")).unwrap();
+    block_on(alice.archive_owner(T, "kept", 20, b"kept")).unwrap();
+    block_on(alice.delete_for_me(T, "deleted", 10, None, &[])).unwrap();
+
+    let batches = block_on(net.mailbox(A).list_owner_batches(T, TimeRange::ALL)).unwrap();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0].value;
+    assert_eq!(batch.items.len(), 3);
+    // A tombstone before its target must not resurrect it; a later frame
+    // must not clear the deletion metadata either.
+    for order in [[2, 0, 1], [0, 2, 1], [0, 1, 2]] {
+        let mut reordered = batch.clone();
+        reordered.items = order.iter().map(|&i| batch.items[i].clone()).collect();
+        let history = block_on(alice.open_owner_record(reordered)).unwrap();
+        assert_eq!(ids(&history), ["kept"], "item order {order:?}");
+        assert_eq!(history.deleted_for_me, ["deleted"], "item order {order:?}");
+        assert!(history.undecryptable.is_empty());
+    }
+}
+
+#[test]
+fn missing_active_space_is_not_an_owner_archive_fallback() {
+    use labyrinth::store::space::{SpaceError, SpaceRpc, SpaceThreadStore};
+    use std::sync::Arc;
+
+    struct DeniedSpace(u16, &'static str);
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl SpaceRpc for DeniedSpace {
+        async fn query(
+            &self,
+            _nsid: &str,
+            _params: &[(&str, String)],
+        ) -> Result<Vec<u8>, SpaceError> {
+            Err(SpaceError::named(self.0, self.1, "injected read denial"))
+        }
+        async fn procedure(&self, _nsid: &str, _body: &[u8]) -> Result<Vec<u8>, SpaceError> {
+            panic!("history reads must not write to the conversation Space")
+        }
+    }
+
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut alice = init(&net, &clock, A, 1);
+    block_on(alice.archive_owner(T, "saved", 10, b"saved")).unwrap();
+    block_on(alice.flush_owner(T)).unwrap();
+    let state = alice.export_state().unwrap();
+    for (status, name) in [
+        (404, "SpaceNotFound"),
+        (400, "SpaceNotFound"),
+        (403, "Forbidden"),
+    ] {
+        let mut b = backends(&net, &clock, A);
+        let rpc: Arc<dyn SpaceRpc> = Arc::new(DeniedSpace(status, name));
+        b.threads =
+            Box::new(SpaceThreadStore::new(rpc, A).with_authority_did("did:web:ds.example"));
+        let mut restored =
+            block_on(Labyrinth::from_state(&state, A, Box::new(signer(1)), b)).unwrap();
+        let result = block_on(restored.load_thread(T, TimeRange::ALL));
+        if status == 403 {
+            let history = result.unwrap();
+            assert!(!history.space_readable);
+            assert_eq!(ids(&history), ["saved"]);
+        } else {
+            assert_eq!(result.unwrap_err(), Error::NotFound("space"));
+        }
+    }
 }
 
 #[test]

@@ -48,7 +48,10 @@ pub use epochs::{RotationReport, SyncReport};
 pub use lookup::{ThreadCursor, ThreadList, ThreadPage, ThreadSummary};
 pub use members::{ExcludedMember, ExclusionReason};
 pub use pins::{PeerPin, RepinProposal};
-pub use read::{LoadedMessage, MessageSource, RedactedMessage, ThreadHistory, Undecryptable};
+pub use read::{
+    LoadedMessage, MessageSource, RedactedMessage, RejectedCopy, Rejection, ThreadHistory,
+    Undecryptable,
+};
 pub use recovery::{AUTO_RECOVERY_TTL_MS, RecoveryMethod, recovery_expiry};
 pub use send::{ArchiveOutcome, FlushedBatch, ResolvedRoster, RosterExclusion};
 
@@ -135,8 +138,10 @@ pub struct Labyrinth {
     verified: (u64, BTreeSet<[u8; 32]>),
     /// Newest accepted epoch of every peer this client addressed ([CB-29]).
     pins: BTreeMap<String, PeerPin>,
-    /// MEKs minted or opened here, per thread, newest last.
-    meks: HashMap<String, Vec<Mek>>,
+    /// MEKs minted or opened here, per thread, newest last. Ordered so
+    /// [`Labyrinth::export_state`] bytes are canonical: the same logical
+    /// state always exports identically, across reloads and processes.
+    meks: BTreeMap<String, Vec<Mek>>,
     outbox: BTreeMap<String, Vec<SealedMessage>>,
     /// Canonical `(DID, epoch head)` roster under which each sender buffer's
     /// MEK was distributed. Flush revalidates it so a queued ciphertext
@@ -189,7 +194,7 @@ impl Labyrinth {
             revoked: BTreeSet::new(),
             verified: (latest, BTreeSet::new()),
             pins: BTreeMap::new(),
-            meks: HashMap::new(),
+            meks: BTreeMap::new(),
             outbox: BTreeMap::new(),
             outbox_rosters: BTreeMap::new(),
             owner_outbox: BTreeMap::new(),

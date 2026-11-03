@@ -57,6 +57,15 @@ pub trait MaybeSync {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> MaybeSync for T {}
 
+/// A millisecond clock for store adapters: `Send + Sync` on native targets,
+/// unconstrained on `wasm32`, like [`MaybeSend`] and [`MaybeSync`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type ClockFn = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
+/// A millisecond clock for store adapters: `Send + Sync` on native targets,
+/// unconstrained on `wasm32`, like [`MaybeSend`] and [`MaybeSync`].
+#[cfg(target_arch = "wasm32")]
+pub type ClockFn = std::sync::Arc<dyn Fn() -> u64>;
+
 /// Sequencer ES256 verification key `{did}#mls-receipt-1` (`I13`, Gate 1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SequencerReceiptKey {
@@ -464,6 +473,19 @@ pub trait MailboxDirectory: MaybeSend + MaybeSync {
     async fn sequencer_receipt_key(&self, thread_id: &str) -> Result<Option<SequencerReceiptKey>> {
         let _ = thread_id;
         Ok(None)
+    }
+    /// Resolve a receipt key for an authority already authenticated by owner
+    /// ciphertext, never an issuer taken only from public receipt fields.
+    /// The default cannot discover a new authority or override a pinned key.
+    async fn sequencer_receipt_key_for_authority(
+        &self,
+        thread_id: &str,
+        expected_authority: &str,
+    ) -> Result<Option<SequencerReceiptKey>> {
+        Ok(self
+            .sequencer_receipt_key(thread_id)
+            .await?
+            .filter(|key| key.did == expected_authority))
     }
 }
 

@@ -868,7 +868,7 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
         1_791_200_000_002,
         &bob_nonce,
         bob_body,
-        &bob_receipt,
+        &labyrinth::message::ArchivedReceipt::new(bob_receipt.clone()),
     ))
     .unwrap();
     block_on(bob.flush()).unwrap();
@@ -935,7 +935,7 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
         1_791_200_000_004,
         &alice_nonce,
         alice_body,
-        &alice_receipt,
+        &labyrinth::message::ArchivedReceipt::new(alice_receipt.clone()),
     ))
     .unwrap();
 
@@ -967,7 +967,7 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
             1_791_200_000_005,
             &alice_nonce,
             alice_body,
-            &wrong_thread_receipt,
+            &labyrinth::message::ArchivedReceipt::new(wrong_thread_receipt.clone()),
         ))
         .is_err()
     );

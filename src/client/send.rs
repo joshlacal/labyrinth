@@ -55,7 +55,7 @@ enum OutgoingPayload<'a> {
     Committed {
         frame_nonce: &'a [u8; 32],
         payload_bytes: &'a [u8],
-        receipt: &'a labyrinth_protocol::SignedSequencerReceipt,
+        receipt: &'a ArchivedReceipt,
         verify_commitment: bool,
     },
 }
@@ -162,7 +162,7 @@ impl Labyrinth {
         timestamp: u64,
         frame_nonce: &[u8; 32],
         payload_bytes: &[u8],
-        receipt: &labyrinth_protocol::SignedSequencerReceipt,
+        receipt: &ArchivedReceipt,
     ) -> Result<ArchiveOutcome> {
         self.archive_outgoing_inner(
             thread_id,
@@ -192,7 +192,7 @@ impl Labyrinth {
         timestamp: u64,
         frame_nonce: &[u8; 32],
         payload_bytes: &[u8],
-        receipt: &labyrinth_protocol::SignedSequencerReceipt,
+        receipt: &ArchivedReceipt,
     ) -> Result<ArchiveOutcome> {
         self.archive_outgoing_inner(
             thread_id,
@@ -224,11 +224,11 @@ impl Labyrinth {
             verify_commitment: true,
         } = &payload
         {
-            if receipt.payload.conversation_id != thread_id {
+            if receipt.signed.payload.conversation_id != thread_id {
                 return Err(Error::Malformed("receipt conversation_id mismatch"));
             }
             labyrinth_protocol::verify_archived_item_commitment(
-                receipt,
+                &receipt.signed,
                 frame_nonce,
                 payload_bytes,
             )
@@ -316,19 +316,16 @@ impl Labyrinth {
                 payload_bytes,
                 receipt,
                 ..
-            } => {
-                let archived = ArchivedReceipt::new(receipt.clone());
-                seal_sender_committed(
-                    &mek,
-                    thread_id,
-                    message_id,
-                    timestamp,
-                    frame_nonce,
-                    payload_bytes,
-                    &archived,
-                    self.transport.as_ref(),
-                )?
-            }
+            } => seal_sender_committed(
+                &mek,
+                thread_id,
+                message_id,
+                timestamp,
+                frame_nonce,
+                payload_bytes,
+                receipt,
+                self.transport.as_ref(),
+            )?,
         };
 
         let mek_changed = self

@@ -4,11 +4,11 @@
 use std::collections::HashSet;
 
 use super::Labyrinth;
-use super::read::{MessageSource, OpenedSealed, ThreadHistory};
+use super::read::{ThreadHistory, finish};
 use crate::epoch::EpochKeys as _;
 use crate::message::{ArchivedReceipt, seal_owner, seal_owner_attributed, seal_owner_committed};
-use crate::records::{BATCH_BYTE_BUDGET, BatchEntry, MAX_BATCH_ITEMS};
-use crate::store::{LeaveArchiveReport, TimeRange, VouchAt};
+use crate::records::{BATCH_BYTE_BUDGET, MAX_BATCH_ITEMS};
+use crate::store::{LeaveArchiveReport, TimeRange};
 use crate::{Error, Result};
 
 impl Labyrinth {
@@ -62,16 +62,15 @@ impl Labyrinth {
         timestamp: u64,
         frame_nonce: &[u8; 32],
         frame: &[u8],
-        receipt: &labyrinth_protocol::SignedSequencerReceipt,
+        receipt: &ArchivedReceipt,
     ) -> Result<Option<super::FlushedBatch>> {
-        if receipt.payload.conversation_id != thread_id {
+        if receipt.signed.payload.conversation_id != thread_id {
             return Err(Error::Malformed("receipt conversation_id mismatch"));
         }
-        labyrinth_protocol::verify_archived_item_commitment(receipt, frame_nonce, frame)
+        labyrinth_protocol::verify_archived_item_commitment(&receipt.signed, frame_nonce, frame)
             .map_err(|_| Error::ReceiptCommitmentMismatch)?;
         self.sync_epochs().await?;
         let e = self.epoch_secret(self.latest).await?;
-        let archived = ArchivedReceipt::new(receipt.clone());
         let m = seal_owner_committed(
             e.root(),
             e.seq,
@@ -80,7 +79,7 @@ impl Labyrinth {
             timestamp,
             frame_nonce,
             frame,
-            &archived,
+            receipt,
         )?;
         self.queue_owner(thread_id, m).await
     }
@@ -195,6 +194,8 @@ impl Labyrinth {
             return Err(Error::WrongEpoch);
         }
 
+        // The same acceptance as reading: redactions, tombstones and ruling 3
+        // decide what survives; only those copies are re-archived.
         let mut h = ThreadHistory {
             space_readable: true,
             ..ThreadHistory::default()
@@ -206,6 +207,8 @@ impl Labyrinth {
                 .list_batches(thread_id, None, TimeRange::ALL)
                 .await,
         )?;
+        self.open_batches(thread_id, batches, &|_, _| true, &mut h, false)
+            .await?;
         let owner_batches = self
             .b
             .mailbox
@@ -215,100 +218,53 @@ impl Labyrinth {
         let tombstones = self
             .open_owner_batches(thread_id, owner_batches, &|_, _| true, &mut owner)
             .await?;
-
-        let hidden = |id: &str, sender: Option<&str>| {
-            tombstones
-                .iter()
-                .any(|(t, author)| t == id && (author.is_none() || author.as_deref() == sender))
-        };
-
         let mut archived: HashSet<(String, Vec<u8>)> = owner
             .messages
-            .into_iter()
-            .filter(|m| m.source == MessageSource::Owner)
-            .map(|m| (m.message_id, m.frame))
+            .iter()
+            .map(|m| (m.message_id.clone(), m.frame.clone()))
             .collect();
+        h.messages.append(&mut owner.messages);
+        finish(&mut h, &tombstones);
 
         let epoch = self.epoch_secret(self.latest).await?;
-        let mut candidates: Vec<(u64, String, String, OpenedSealed)> = Vec::new();
-        for b in batches {
-            if b.value.thread_id != thread_id {
-                continue;
-            }
-            let Ok(entries) = b.value.entries() else {
-                continue;
-            };
-            for entry in entries {
-                let BatchEntry::Sealed(s) = entry else {
-                    continue;
-                };
-                if hidden(&s.message_id, Some(&b.author)) {
-                    continue;
-                }
-                let at = VouchAt::of(b.order, s.timestamp);
-                if let Ok(opened) = self.open_sealed_inner(thread_id, &b.author, &s, at).await {
-                    candidates.push((s.timestamp, s.message_id, b.author.clone(), opened));
-                }
-            }
-        }
-        candidates.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-
         let mut n = 0;
-        for (timestamp, message_id, author, opened) in candidates {
-            match opened {
-                OpenedSealed::Plain(frame) => {
-                    let key = (message_id, frame);
-                    if archived.contains(&key) {
-                        continue;
-                    }
-                    let m = if author.starts_with("did:") {
-                        seal_owner_attributed(
-                            epoch.root(),
-                            epoch.seq,
-                            thread_id,
-                            &key.0,
-                            timestamp,
-                            &author,
-                            &key.1,
-                        )?
-                    } else {
-                        seal_owner(
-                            epoch.root(),
-                            epoch.seq,
-                            thread_id,
-                            &key.0,
-                            timestamp,
-                            &key.1,
-                        )?
-                    };
-                    self.queue_owner(thread_id, m).await?;
-                    archived.insert(key);
-                    n += 1;
-                }
-                OpenedSealed::Committed {
-                    frame_nonce,
-                    frame,
-                    receipt,
-                } => {
-                    let key = (message_id, frame);
-                    if archived.contains(&key) {
-                        continue;
-                    }
-                    let m = seal_owner_committed(
-                        epoch.root(),
-                        epoch.seq,
-                        thread_id,
-                        &key.0,
-                        timestamp,
-                        &frame_nonce,
-                        &key.1,
-                        &receipt,
-                    )?;
-                    self.queue_owner(thread_id, m).await?;
-                    archived.insert(key);
-                    n += 1;
-                }
+        for m in h.messages {
+            let key = (m.message_id, m.frame);
+            if archived.contains(&key) {
+                continue;
             }
+            let sealed = match (&m.archived_receipt, &m.frame_nonce, m.sender.as_deref()) {
+                (Some(receipt), Some(frame_nonce), _) => seal_owner_committed(
+                    epoch.root(),
+                    epoch.seq,
+                    thread_id,
+                    &key.0,
+                    m.timestamp,
+                    frame_nonce,
+                    &key.1,
+                    receipt,
+                )?,
+                (_, _, Some(author)) if author.starts_with("did:") => seal_owner_attributed(
+                    epoch.root(),
+                    epoch.seq,
+                    thread_id,
+                    &key.0,
+                    m.timestamp,
+                    author,
+                    &key.1,
+                )?,
+                _ => seal_owner(
+                    epoch.root(),
+                    epoch.seq,
+                    thread_id,
+                    &key.0,
+                    m.timestamp,
+                    &key.1,
+                )?,
+            };
+            self.queue_owner(thread_id, sealed).await?;
+            archived.insert(key);
+            n += 1;
         }
         self.flush_owner(thread_id).await?;
         Ok(n)

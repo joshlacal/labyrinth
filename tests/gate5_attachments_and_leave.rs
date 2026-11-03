@@ -156,7 +156,7 @@ fn gate5_attachments_redact_siblings_intact_and_rearchive_before_leave() {
             1_791_181_720_000 + seq,
             &nonce,
             body,
-            &receipt,
+            &labyrinth::message::ArchivedReceipt::new(receipt.clone()),
         ))
         .unwrap();
     }

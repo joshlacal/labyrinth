@@ -1120,6 +1120,75 @@ fn state_round_trips_and_a_restarted_client_keeps_working() {
 }
 
 #[test]
+fn exported_mek_cache_is_canonical_whatever_the_insertion_or_encoded_order() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    net.register_chat_device(A, tpub(1));
+    net.register_chat_device(B, tpub(3));
+    let mut alice = block_on(Labyrinth::initialize(
+        A,
+        Box::new(signer(1)),
+        backends(&net, &clock, A, Box::new(net.mailbox(A))),
+    ))
+    .unwrap();
+    let _bob = block_on(Labyrinth::initialize(
+        B,
+        Box::new(signer(3)),
+        backends(&net, &clock, B, Box::new(net.mailbox(B))),
+    ))
+    .unwrap();
+    let roster = block_on(alice.resolve_roster(&[A, B])).unwrap();
+    // Scrambled insertion order; same-length thread IDs give same-size entries.
+    let threads = ["t7", "t2", "t9", "t0", "t5", "t3", "t8", "t1", "t6", "t4"];
+    for (i, t) in threads.iter().enumerate() {
+        block_on(alice.archive_outgoing(t, &roster, &format!("m{i}"), 10 + i as u64, b"x"))
+            .unwrap();
+    }
+    block_on(alice.flush()).unwrap();
+    let state = alice.export_state().unwrap();
+    assert_eq!(*alice.export_state().unwrap(), *state, "export is stable");
+    let restore = |bytes: &[u8]| {
+        block_on(Labyrinth::from_state(
+            bytes,
+            A,
+            Box::new(signer(1)),
+            backends(&net, &clock, A, Box::new(net.mailbox(A))),
+        ))
+        .unwrap()
+        .export_state()
+        .unwrap()
+    };
+    // A load/save cycle of unchanged state is byte-identical, repeatedly.
+    for _ in 0..4 {
+        assert_eq!(*restore(&state), *state);
+    }
+
+    // The MEK section is the tail: u32 count, then one entry per thread in
+    // ascending thread ID order.
+    let n = threads.len();
+    let mut head = (n as u32).to_be_bytes().to_vec();
+    head.extend_from_slice(&[0, 2, b't', b'0']);
+    let start = state
+        .windows(head.len())
+        .rposition(|w| w == head)
+        .expect("canonical MEK section starts with t0");
+    let body = &state[start + 4..];
+    assert_eq!(body.len() % n, 0);
+    let entries: Vec<&[u8]> = body.chunks(body.len() / n).collect();
+    for (i, e) in entries.iter().enumerate() {
+        assert_eq!(&e[..4], &[0, 2, b't', b'0' + i as u8][..]);
+    }
+    // A state written in any other order (e.g. by the old HashMap cache)
+    // still decodes, and re-exports in canonical order.
+    let mut reordered = state[..start + 4].to_vec();
+    for i in [3, 9, 0, 6, 1, 8, 2, 7, 5, 4] {
+        reordered.extend_from_slice(entries[i]);
+    }
+    assert_ne!(reordered, *state);
+    assert_eq!(*restore(&reordered), *state);
+}
+
+#[test]
 fn reached_epoch_readmitting_a_revoked_device_is_not_activated() {
     let net = MemoryBackend::new();
     let clock = TestClock::default();

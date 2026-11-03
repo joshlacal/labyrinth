@@ -122,11 +122,17 @@ pub fn owner_message_key(root: &[u8; 32], seq: u64, thread_id: &str) -> Zeroizin
     owner_message_key_versioned(3, root, seq, thread_id).expect("version 3 is supported")
 }
 
-/// The owner-message AAD: the paper's `message_thread_<threadId>` for
-/// versions 0–4; for version 5 ([CB-37]) a string that also binds the
-/// message id and timestamp.
-fn owner_aad(version: u8, thread_id: &str, message_id: &str, timestamp: u64) -> Vec<u8> {
-    if version >= 5 {
+/// Owner-message AAD: version 5 binds message id and timestamp; committed
+/// owner records additionally bind the complete retained receipt. Successful
+/// owner decryption therefore authenticates its sequencer authority.
+fn owner_aad(
+    version: u8,
+    thread_id: &str,
+    message_id: &str,
+    timestamp: u64,
+    receipt: Option<&ArchivedReceipt>,
+) -> Result<Vec<u8>> {
+    let mut aad = if version >= 5 {
         format!(
             "catbird.labyrinth.owner_message_v5:message_id={message_id};thread_id={};\
              timestamp={timestamp}",
@@ -135,7 +141,16 @@ fn owner_aad(version: u8, thread_id: &str, message_id: &str, timestamp: u64) -> 
         .into_bytes()
     } else {
         format!("message_thread_{thread_id}").into_bytes()
+    };
+    if let Some(receipt) = receipt {
+        let encoded = serde_ipld_dagcbor::to_vec(
+            &crate::records::defs::SequencerReceiptDef::from_archived(receipt),
+        )
+        .map_err(|_| Error::Malformed("owner receipt DAG-CBOR"))?;
+        aad.extend_from_slice(b"\0catbird.labyrinth.owner_receipt_v1\0");
+        aad.extend_from_slice(&encoded);
     }
+    Ok(aad)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -151,7 +166,13 @@ fn seal_owner_kind(
     sequencer_receipt: Option<ArchivedReceipt>,
 ) -> Result<OwnerMessage> {
     let key = owner_message_key_versioned(OWNER_VERSION, epoch_root, epoch_seq, thread_id)?;
-    let aad = owner_aad(OWNER_VERSION, thread_id, message_id, timestamp);
+    let aad = owner_aad(
+        OWNER_VERSION,
+        thread_id,
+        message_id,
+        timestamp,
+        sequencer_receipt.as_ref(),
+    )?;
     let content = Zeroizing::new([&[kind], body].concat());
     Ok(OwnerMessage {
         thread_id: thread_id.to_owned(),
@@ -270,7 +291,13 @@ pub fn seal_owner_tombstone(
 /// Decrypt an owner record; `epoch_root` is the root of `msg.epoch_seq`.
 pub fn open_owner_content(epoch_root: &[u8; 32], msg: &OwnerMessage) -> Result<OwnerContent> {
     let key = owner_message_key_versioned(msg.version, epoch_root, msg.epoch_seq, &msg.thread_id)?;
-    let aad = owner_aad(msg.version, &msg.thread_id, &msg.message_id, msg.timestamp);
+    let aad = owner_aad(
+        msg.version,
+        &msg.thread_id,
+        &msg.message_id,
+        msg.timestamp,
+        msg.sequencer_receipt.as_ref(),
+    )?;
     let padded = Zeroizing::new(aead::decrypt(&key, &aad, &msg.encrypted)?);
     let content = unpad(&padded)?;
     if msg.version < 5 {
@@ -305,6 +332,9 @@ pub fn open_owner_content(epoch_root: &[u8; 32], msg: &OwnerMessage) -> Result<O
             })
         }
         KIND_COMMITTED_FRAME => {
+            if msg.sequencer_receipt.is_none() {
+                return Err(Error::ReceiptCommitmentMismatch);
+            }
             let (nonce, frame) = body
                 .split_first_chunk::<32>()
                 .ok_or(Error::ReceiptCommitmentMismatch)?;
@@ -626,7 +656,7 @@ mod tests {
             encrypted: aead::encrypt(
                 Suite::GcmExtended,
                 &key,
-                &owner_aad(3, "th", "m", 1),
+                &owner_aad(3, "th", "m", 1, None).unwrap(),
                 &pad(b"old"),
             )
             .unwrap(),

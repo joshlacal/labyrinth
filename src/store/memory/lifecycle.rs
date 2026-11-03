@@ -50,41 +50,45 @@ impl State {
         Ok(n)
     }
 
-    /// mls-ds `deleteAccountData`: redact every live item `did` authored
-    /// with the sequencer's account-deletion redaction (signed when it has
-    /// a key; a bare `{redactedAt}` without [`MemoryBackend::set_sequencer`]),
-    /// then purge.
+    /// mls-ds `deleteAccountData`: redact every live item attributed to
+    /// `did` with the sequencer's account-deletion redaction (signed when it
+    /// has a key; a bare `{redactedAt}` without [`MemoryBackend::set_sequencer`]),
+    /// then purge. That is `did`'s own items and every witness copy of its
+    /// messages in other members' repos (receipt sender `did`).
     pub(super) fn delete_account_data(&mut self, did: &str) -> usize {
         let at = datetime_from_ms(self.server_now);
         let sequencer = self.sequencer.clone();
         let mut n = 0;
         for (thread_id, t) in self.threads.iter_mut() {
-            for (b, _) in t
-                .repos
-                .get_mut(did)
-                .into_iter()
-                .flat_map(|r| r.batches.values_mut())
-            {
-                for i in b.items.iter_mut().filter(|i| i.redaction.is_none()) {
-                    let def = match &sequencer {
-                        None => RedactionDef::account_deletion(Some(at.clone())),
-                        Some((by, seed)) => {
-                            let signer = seed.map(|s| {
-                                Ed25519Transport(ed25519_dalek::SigningKey::from_bytes(&s))
-                            });
-                            RedactionDef::from_server(&ServerRedaction::account_deletion(
-                                by,
-                                did,
-                                thread_id,
-                                &i.message_id,
-                                &at,
-                                signer.as_ref().map(|s| s as &dyn TransportSigner),
-                            ))
-                        }
-                    };
-                    i.signed_enc_message.0.clear();
-                    i.redaction = Some(def);
-                    n += 1;
+            for (repo, r) in t.repos.iter_mut() {
+                for (b, _) in r.batches.values_mut() {
+                    for i in b.items.iter_mut().filter(|i| {
+                        i.redaction.is_none()
+                            && (repo == did
+                                || i.sequencer_receipt
+                                    .as_ref()
+                                    .is_some_and(|r| r.sender_did == did))
+                    }) {
+                        let def = match &sequencer {
+                            None => RedactionDef::account_deletion(Some(at.clone())),
+                            Some((by, seed)) => {
+                                let signer = seed.map(|s| {
+                                    Ed25519Transport(ed25519_dalek::SigningKey::from_bytes(&s))
+                                });
+                                RedactionDef::from_server(&ServerRedaction::account_deletion(
+                                    by,
+                                    did,
+                                    thread_id,
+                                    &i.message_id,
+                                    &at,
+                                    signer.as_ref().map(|s| s as &dyn TransportSigner),
+                                ))
+                            }
+                        };
+                        i.signed_enc_message.0.clear();
+                        i.redaction = Some(def);
+                        n += 1;
+                    }
                 }
             }
         }
@@ -158,8 +162,9 @@ impl State {
 }
 
 impl MemoryBackend {
-    /// The server-side account deletion (mls-ds `deleteAccountData`):
-    /// unsigned redactions of every item `did` authored, then a mailbox
+    /// The server-side account deletion (mls-ds `deleteAccountData`): the
+    /// sequencer's redaction of every item attributed to `did` (its own and
+    /// other members' witness copies of its messages), then a mailbox
     /// purge. Returns how many items were redacted.
     pub fn delete_account_data(&self, did: &str) -> usize {
         self.lock().delete_account_data(did)

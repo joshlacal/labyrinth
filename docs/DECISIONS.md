@@ -2,6 +2,8 @@
 
 This log records choices where the Labyrinth whitepaper is silent, or where it's written for Messenger rather than Catbird. Each entry is provisional and can be overridden before the `labyrinth-1.1` bookmark merges. `docs/SPEC.md` uses the same `[CB-n]` tags. Format follows the Catbird workspace convention: what we chose, why, and how to undo it.
 
+**Reading older entries.** Entries before 2026-10-31 describe designs that the clean-slate Spaces-only profile retired. Those are mls-ds as a Labyrinth content store (the `xrpc` feature, `XrpcThreadStore`, `XrpcDirectory`, ORF, `appendBatch`, `getEpoch`), synchronous store traits, and the October 23 delivery-service-admitted Space references. They stay here as history. The current contracts are [SPEC.md](SPEC.md), [SPACE_CONVERSATIONS.md](SPACE_CONVERSATIONS.md) and [MLSDS_BACKEND.md](MLSDS_BACKEND.md).
+
 ## 2026-10-04 · Scope and architecture
 
 **Implement Labyrinth 1.1 in full, with hybrid storage.** Josh asked for full 1.1 because Catbird chat is heading to more platforms.
@@ -272,6 +274,11 @@ Chose (provisional):
 
 Reversible until: merge of `clean-slate-2026-10-31`. Override by: editing `labyrinth/src/{client,message.rs,store}`, `catbird-mls/src/{labyrinth,client,orchestrator}`, and `CatbirdMLSCore/Sources/CatbirdMLSCore/{Client,Service,Transport}` (`tests/fault_lines.rs`, `tests/client_labyrinth_fault_lines.rs`, `MLSConcurrencyFaultLineTests.swift`).
 
+**Superseded in part (2026-11-03, below).**
+- The Fault Line 2 triggers are narrowed to `Forbidden` or an authenticated local removal. Omission from the DS roster, `NotFound("conversation")` while the local roster still holds the account, and `NotFound("space")` no longer trigger the owner fallback. A missing active Space is an error.
+- `CatbirdMlsClient` rescues only with `archive_owner_committed`, so every rescued copy keeps its `I13` evidence.
+- Fault Line 1's own-send outbox row is enqueued only after the accepted response's `I13` receipt verifies (`finish_application_send`).
+
 ## 2026-11-01 · labyrinth / catbird-mls / CatbirdMLSCore · Fault-line review hardening
 
 Chose (provisional):
@@ -281,3 +288,21 @@ Chose (provisional):
 
 Reversible until: merge of `clean-slate-2026-10-31`. Override by: reverting the review-hardening commit on `clean-slate-2026-10-31` in `labyrinth`, `catbird-mls`, and `CatbirdMLSCore`.
 
+**Superseded in part (2026-11-03).** The `applyWrites` and `VirtualDevice` client code in the second bullet now lives only in catbird-mls's test-only harness (`src/client/offline_archive.rs`, opened with `open_offline_archive_for_test`). Production `CatbirdMlsClient` archives through `LabyrinthSession` (`src/client/native_archive.rs`).
+
+## 2026-11-03 · labyrinth / catbird-mls · Task 4 R1 archive contract
+
+Status: Task 4 R1, unsealed. In labyrinth it is a provisional commit on top of `6462096a`; in catbird-mls it is the provisional commits from `7ab0572d` on top of `79a40b5f`. The final Task 4 gate has not passed.
+
+Chose (provisional):
+- **Witness copies are third-party claims ("ruling 3" in code comments).** A member that verified another member's committed message archives the same frame, nonce and receipt in its own repo, under its receive-time MLS roster (`archive_outgoing_committed`). Readers attribute the copy to the receipt's sender (`MessageSource::Witness`). Nothing authenticates the message ID a witness files under, so sender and owner copies are accepted first. A witness copy is accepted only if it equals an accepted copy with its ID, or if it is the first claim on both its ID and its receipt's entry. Otherwise it is rejected into `ThreadHistory::rejected` (`Rejection::Contradicts`, `Rejection::ReceiptReused`).
+  - *Because:* pre-removal history must survive a sender removed before it flushes, without letting a member relabel, flag or re-attribute another member's message.
+  - *Rejected:* reporting contradictions as `conflict`, which lets a third party taint a genuine message; and preferring an earlier witness over the sender's own copy.
+- **Committed owner records bind the full receipt.** The owner AEAD associated data includes the receipt's DAG-CBOR (issuer, signature and generation). A device with no receipt key for the thread resolves one only for that authenticated issuer (`MailboxDirectory::sequencer_receipt_key_for_authority`), never over an existing pin. Both committed archive APIs take `&ArchivedReceipt`, so re-archiving keeps the generation.
+  - *Because:* a fresh device restoring after removal must verify owner copies without trusting an issuer read from a public receipt.
+  - *Rejected:* commitment-only attribution, and resetting the generation on re-archive.
+- **Active members trust the conversation Space.** The owner-mailbox fallback runs only on `Forbidden` or an authenticated local kick or leave. A missing active Space (`NotFound("space")`) is an error. Leave re-archives exactly what reading accepts (redactions, tombstones, witness rejection).
+  - *Because:* treating an outage or a missing Space as removal would silently move active history out of the shared archive.
+- **Deleted accounts are hidden by the client** until mls-ds writes redaction overlays. catbird-mls verifies each sequenced `accountDeletedEntry` under the conversation's `#mls-receipt-1`, then drops the account's witness duty. From then on it hides every copy of the account's messages (sender, witness and owner) unless the copy's receipt orders it after the deletion. A copy without a receipt is hidden.
+
+Reversible until: merge of `clean-slate-2026-10-31`. Override by: editing `dedupe` in `src/client/read.rs`, `owner_aad` in `src/message.rs`, and catbird-mls `src/client/native_archive.rs` / `src/client/live_sync.rs`. Pinned by `tests/witness_archive.rs`, `tests/history_ops.rs` and `tests/gate1_receipt_commitment.rs`, and by catbird-mls's `native_restore_tests`.
