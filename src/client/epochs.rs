@@ -1043,6 +1043,27 @@ impl Labyrinth {
         self.revoked.iter().map(|k| XVerifyingKey(*k))
     }
 
+    /// Rotate the mailbox to the next epoch while carrying over unrevoked members.
+    pub async fn rotate_epoch(&mut self) -> Result<u64> {
+        if self.outbox.values().any(|items| !items.is_empty())
+            || self.owner_outbox.values().any(|items| !items.is_empty())
+        {
+            return Err(Error::PendingWrites);
+        }
+        self.sync_epochs().await?;
+        for _ in 0..ROTATE_ATTEMPTS {
+            let exclude = self.revoked.clone();
+            match self.rotate(&exclude).await {
+                Err(Error::Conflict) => {
+                    self.sync_epochs().await?;
+                }
+                Ok((epoch, _)) => return Ok(epoch),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Conflict)
+    }
+
     /// Open the epoch after `self.latest`, carrying over every member of
     /// the previous epoch except this device (the opener is added by
     /// [`open_next`]), the devices in `exclude`, and devices the store

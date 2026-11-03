@@ -110,6 +110,43 @@ impl OpenedSealed {
 }
 
 impl Labyrinth {
+    /// Read only this account's authenticated owner archive, without consulting
+    /// a conversation Space that may no longer exist or admit this account.
+    pub async fn load_owner_thread(&mut self, thread_id: &str) -> Result<ThreadHistory> {
+        let batches = self
+            .b
+            .mailbox
+            .list_owner_batches(thread_id, TimeRange::ALL)
+            .await?;
+        let mut history = ThreadHistory::default();
+        let tombstones = self
+            .open_owner_batches(thread_id, batches, &|_, _| true, &mut history)
+            .await?;
+        finish(&mut history, &tombstones);
+        Ok(history)
+    }
+
+    /// Open an explicitly supplied owner record with the same checks as history.
+    pub async fn open_owner_record(&mut self, batch: OwnerBatch) -> Result<ThreadHistory> {
+        let messages = batch.to_messages()?;
+        let mut history = ThreadHistory::default();
+        for message in messages {
+            let thread_id = message.thread_id.clone();
+            let single = OwnerBatch::from_messages(&[message], batch.created_at.clone())?;
+            let stored = Stored {
+                author: self.did.clone(),
+                rkey: String::new(),
+                order: None,
+                value: single,
+            };
+            let tombstones = self
+                .open_owner_batches(&thread_id, vec![stored], &|_, _| true, &mut history)
+                .await?;
+            finish(&mut history, &tombstones);
+        }
+        Ok(history)
+    }
+
     /// Load and decrypt every message of `thread_id` in `range`.
     pub async fn load_thread(
         &mut self,

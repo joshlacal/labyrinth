@@ -96,6 +96,11 @@ impl SpaceThreadStore {
         self
     }
 
+    pub fn with_clock(mut self, now_ms: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.now_ms = now_ms;
+        self
+    }
+
     pub fn register_thread_space(&mut self, thread_id: &str, space: SpaceRef) {
         self.spaces
             .lock()
