@@ -172,7 +172,7 @@ impl KeyPublisher for Recorder {
 }
 
 #[test]
-fn every_epoch_is_published_to_every_publisher() {
+fn every_epoch_is_published_by_its_attesting_device() {
     let net = MemoryBackend::new();
     let clock = TestClock::default();
     let rec = Recorder::default();
@@ -214,7 +214,14 @@ fn every_epoch_is_published_to_every_publisher() {
         .unwrap()
         .0
     };
-    let laptop = enroll_sibling_with_rec(&mut phone, 2);
+    let mut laptop = enroll_sibling_with_rec(&mut phone, 2);
+    let laptop_replay_start = rec.seen.lock().unwrap().len();
+    block_on(laptop.publish_latest_keys()).unwrap();
+    assert_eq!(
+        &rec.seen.lock().unwrap()[laptop_replay_start..],
+        &[1],
+        "a sibling must not republish an epoch attested by another device"
+    );
     let tablet = enroll_sibling_with_rec(&mut phone, 3);
     block_on(phone.revoke_device(&laptop.device_public().device_key_pub)).unwrap();
     let vd = block_on(phone.create_recovery_code(Mechanism::Code)).unwrap();
@@ -238,8 +245,8 @@ fn every_epoch_is_published_to_every_publisher() {
     block_on(phone.publish_latest_keys()).unwrap();
     assert_eq!(
         &rec.seen.lock().unwrap()[replay_start..],
-        &[0, 1, 2, 3, 4, 5],
-        "a retry must replay the complete verifiable chain"
+        &[0, 3, 4, 5],
+        "a retry must skip intermediate epochs attested by sibling devices"
     );
 }
 

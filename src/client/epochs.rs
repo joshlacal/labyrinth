@@ -622,8 +622,15 @@ impl Labyrinth {
             return Err(Error::Malformed("pending publication is not latest epoch"));
         }
         self.ensure_latest_revocation_safe().await?;
+        let mine = self.transport.transport_public_key();
         for seq in 0..=pending {
             let public = self.epoch_record(seq).await?.1.public;
+            if public.attestation.transport_public_key != mine {
+                if seq == pending {
+                    return Err(Error::Unattested);
+                }
+                continue;
+            }
             match self.publish_keys(&public).await {
                 Ok(()) => {}
                 Err(Error::EpochRollback { pinned, .. }) if seq < pending && pinned <= pending => {}
