@@ -21,6 +21,9 @@ impl Labyrinth {
         timestamp: u64,
         frame: &[u8],
     ) -> Result<Option<super::FlushedBatch>> {
+        if self.receipt_required(thread_id).await? {
+            return Err(Error::ReceiptCommitmentMismatch);
+        }
         self.sync_epochs().await?;
         self.archive_owner_synced(thread_id, message_id, timestamp, frame)
             .await
@@ -37,6 +40,9 @@ impl Labyrinth {
         sender_did: &str,
         frame: &[u8],
     ) -> Result<Option<super::FlushedBatch>> {
+        if self.receipt_required(thread_id).await? {
+            return Err(Error::ReceiptCommitmentMismatch);
+        }
         self.sync_epochs().await?;
         let e = self.epoch_secret(self.latest).await?;
         let m = seal_owner_attributed(
@@ -67,8 +73,25 @@ impl Labyrinth {
         if receipt.signed.payload.conversation_id != thread_id {
             return Err(Error::Malformed("receipt conversation_id mismatch"));
         }
+        let (sender_did, sender_device_id) = receipt
+            .signed
+            .payload
+            .split_sender_device()
+            .map_err(|_| Error::Malformed("invalid senderDevice in receipt"))?;
+        if receipt.original_sender_attestation.sender_did != sender_did
+            || receipt.original_sender_attestation.sender_device_id != sender_device_id
+        {
+            return Err(Error::BadSignature);
+        }
+        receipt.original_sender_attestation.verify(
+            thread_id,
+            message_id,
+            &receipt.signed.payload.archive_commitment,
+        )?;
         labyrinth_protocol::verify_archived_item_commitment(&receipt.signed, frame_nonce, frame)
             .map_err(|_| Error::ReceiptCommitmentMismatch)?;
+        self.verify_and_remember_receipt(thread_id, &receipt.signed)
+            .await?;
         self.sync_epochs().await?;
         let e = self.epoch_secret(self.latest).await?;
         let m = seal_owner_committed(
@@ -207,16 +230,44 @@ impl Labyrinth {
                 .list_batches(thread_id, None, TimeRange::ALL)
                 .await,
         )?;
-        self.open_batches(thread_id, batches, &|_, _| true, &mut h, false)
-            .await?;
         let owner_batches = self
             .b
             .mailbox
             .list_owner_batches(thread_id, TimeRange::ALL)
             .await?;
+        let receipts_required = self.receipt_required(thread_id).await?
+            || batches.iter().any(|batch| {
+                batch
+                    .value
+                    .items
+                    .iter()
+                    .any(|item| item.sequencer_receipt.is_some())
+            })
+            || owner_batches.iter().any(|batch| {
+                batch
+                    .value
+                    .items
+                    .iter()
+                    .any(|item| item.sequencer_receipt.is_some())
+            });
+        self.open_batches(
+            thread_id,
+            batches,
+            &|_, _| true,
+            &mut h,
+            false,
+            receipts_required,
+        )
+        .await?;
         let mut owner = ThreadHistory::default();
         let tombstones = self
-            .open_owner_batches(thread_id, owner_batches, &|_, _| true, &mut owner)
+            .open_owner_batches(
+                thread_id,
+                owner_batches,
+                &|_, _| true,
+                &mut owner,
+                receipts_required,
+            )
             .await?;
         let mut archived: HashSet<(String, Vec<u8>)> = owner
             .messages

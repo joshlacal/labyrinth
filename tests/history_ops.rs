@@ -143,23 +143,33 @@ fn unsend_redacts_for_everyone_and_is_author_only() {
     send(&mut alice, T, &[A, B], "m2", 20);
     block_on(alice.flush()).unwrap();
 
-    // Bob cannot unsend Alice's message: he has no item with that id.
-    assert_eq!(
-        block_on(bob.unsend(T, "m2")).unwrap_err(),
-        Error::NotFound("message")
+    // Bob can publish an immutable redaction for a raced local outbox item,
+    // but author scoping means it cannot hide Alice's message.
+    assert_eq!(block_on(bob.unsend(T, "m2")).unwrap(), 0);
+    let after_bob = read(&mut bob, T);
+    assert_eq!(ids(&after_bob), ["m1", "m2"]);
+    assert!(
+        after_bob
+            .redacted
+            .iter()
+            .any(|redaction| redaction.sender == B)
     );
+
     assert_eq!(block_on(alice.unsend(T, "m2")).unwrap(), 1);
     let h = read(&mut bob, T);
     assert_eq!(ids(&h), ["m1"]);
-    assert_eq!(h.redacted.len(), 1);
-    let r = &h.redacted[0];
+    let r = h
+        .redacted
+        .iter()
+        .find(|redaction| redaction.sender == A)
+        .expect("Alice's author-scoped redaction");
     assert_eq!((r.message_id.as_str(), r.timestamp), ("m2", 20));
-    assert_eq!(r.sender, A);
     assert!(r.by_author, "signed by one of Alice's chat devices");
     assert!(h.undecryptable.is_empty());
     // By id, too.
     let one = block_on(bob.load_message(T, "m2")).unwrap();
-    assert!(one.messages.is_empty() && one.redacted.len() == 1);
+    assert!(one.messages.is_empty());
+    assert!(one.redacted.iter().any(|redaction| redaction.sender == A));
 
     // An unflushed message is simply dropped from the outbox.
     send(&mut alice, T, &[A, B], "m3", 30);

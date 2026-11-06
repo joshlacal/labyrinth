@@ -24,12 +24,63 @@ use crate::attachment::{AttachmentCiphertextMeta, verify_attachment_ciphertext};
 use crate::deletion::Redaction;
 use crate::encoding::sha256;
 use crate::records::{
-    AttachmentManifest, Batch, MekDistribution, RedactionDef, datetime_from_ms, nsid,
+    AttachmentManifest, AuthorRedaction, Batch, Bytes, MekDistribution, SealedMessageDef,
+    datetime_from_ms, ms_from_datetime, nsid,
 };
 use crate::store::{Stored, ThreadStore, TimeRange};
 use crate::{Error, Result};
 
 const THREAD_COLLECTIONS: [&str; 3] = [nsid::MEK, nsid::BATCH, nsid::ATTACHMENT_MANIFEST];
+
+fn overlay_author_redactions(
+    thread_id: &str,
+    author: &str,
+    batches: &mut Vec<Stored<Batch>>,
+    redactions: Vec<(String, AuthorRedaction)>,
+) -> Result<()> {
+    for (rkey, record) in redactions {
+        if record.thread_id != thread_id || record.rkey() != rkey {
+            return Err(Error::Malformed("authorRedaction coordinates or rkey"));
+        }
+        let redaction = record.to_redaction()?;
+        redaction.verify(author, thread_id, &record.message_id)?;
+        let mut found = false;
+        for batch in batches.iter_mut() {
+            for item in batch
+                .value
+                .items
+                .iter_mut()
+                .filter(|item| item.message_id == record.message_id)
+            {
+                item.redaction = Some(record.redaction.clone());
+                found = true;
+            }
+        }
+        if !found {
+            batches.push(Stored {
+                author: author.to_owned(),
+                rkey: format!("redaction-{rkey}"),
+                order: None,
+                value: Batch {
+                    type_: nsid::BATCH.into(),
+                    thread_id: thread_id.to_owned(),
+                    items: vec![SealedMessageDef {
+                        message_id: record.message_id,
+                        seq: None,
+                        timestamp: ms_from_datetime(&record.created_at).unwrap_or(0),
+                        mek_id: Bytes::default(),
+                        sender_transport_pubkey: Bytes::default(),
+                        signed_enc_message: Bytes::default(),
+                        sequencer_receipt: None,
+                        redaction: Some(record.redaction),
+                    }],
+                    created_at: record.created_at,
+                },
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Canonical DRISL bytes and CID v1 (DAG-CBOR, SHA-256) of a sender batch record.
 pub fn batch_cid(batch: &Batch) -> Result<String> {
@@ -386,16 +437,31 @@ impl ThreadStore for SpaceThreadStore {
             if sender.is_some_and(|s| s != did.as_str()) {
                 continue;
             }
-            for (rkey, b) in self.list_repo::<Batch>(&space, &did, nsid::BATCH).await? {
-                if b.thread_id == thread_id && b.items.iter().any(|i| range.contains(i.timestamp)) {
-                    out.push(Stored {
-                        author: did.clone(),
-                        rkey,
-                        value: b,
-                        order: None,
-                    });
-                }
-            }
+            let mut batches: Vec<Stored<Batch>> = self
+                .list_repo::<Batch>(&space, &did, nsid::BATCH)
+                .await?
+                .into_iter()
+                .map(|(rkey, value)| Stored {
+                    author: did.clone(),
+                    rkey,
+                    value,
+                    order: None,
+                })
+                .collect();
+            overlay_author_redactions(
+                thread_id,
+                &did,
+                &mut batches,
+                self.list_repo(&space, &did, nsid::AUTHOR_REDACTION).await?,
+            )?;
+            out.extend(batches.into_iter().filter(|batch| {
+                batch.value.thread_id == thread_id
+                    && batch
+                        .value
+                        .items
+                        .iter()
+                        .any(|item| range.contains(item.timestamp))
+            }));
         }
         Ok(out)
     }
@@ -418,38 +484,72 @@ impl ThreadStore for SpaceThreadStore {
         if stamped.redacted_at.is_none() {
             stamped.redacted_at = Some(datetime_from_ms((self.now_ms)()));
         }
-        let def = RedactionDef::from_redaction(&stamped);
+        let record = AuthorRedaction::new(
+            thread_id,
+            message_id,
+            &stamped,
+            stamped
+                .redacted_at
+                .clone()
+                .ok_or(Error::Malformed("redaction timestamp"))?,
+        );
+        let rkey = record.rkey();
         let batches = self
             .list_repo::<Batch>(&space, &self.did, nsid::BATCH)
             .await?;
-        let mut count = 0usize;
-        let mut updates = Vec::new();
-        for (rkey, mut batch) in batches {
-            let mut changed = false;
-            for item in &mut batch.items {
-                if item.message_id == message_id && item.redaction.is_none() {
-                    item.signed_enc_message.0.clear();
-                    item.sequencer_receipt = None;
-                    item.redaction = Some(def.clone());
-                    count += 1;
-                    changed = true;
+        let count = batches
+            .iter()
+            .flat_map(|(_, batch)| &batch.items)
+            .filter(|item| item.message_id == message_id)
+            .count();
+
+        if let Some(existing) = self
+            .get_from::<AuthorRedaction>(&space, &self.did, nsid::AUTHOR_REDACTION, &rkey)
+            .await?
+        {
+            existing
+                .to_redaction()?
+                .verify(&self.did, thread_id, message_id)?;
+            if existing.thread_id != thread_id
+                || existing.message_id != message_id
+                || existing.rkey() != rkey
+            {
+                return Err(Error::Conflict);
+            }
+            return Ok(count);
+        }
+
+        match self
+            .apply(
+                &space,
+                &[WriteOp::Create {
+                    collection: nsid::AUTHOR_REDACTION,
+                    rkey: Some(rkey.clone()),
+                    value: encode(&record)?,
+                }],
+            )
+            .await
+        {
+            Ok(_) => Ok(count),
+            Err(Error::Conflict) => {
+                let existing = self
+                    .get_from::<AuthorRedaction>(&space, &self.did, nsid::AUTHOR_REDACTION, &rkey)
+                    .await?
+                    .ok_or(Error::Conflict)?;
+                existing
+                    .to_redaction()?
+                    .verify(&self.did, thread_id, message_id)?;
+                if existing.thread_id == thread_id
+                    && existing.message_id == message_id
+                    && existing.rkey() == rkey
+                {
+                    Ok(count)
+                } else {
+                    Err(Error::Conflict)
                 }
             }
-            if changed {
-                updates.push(WriteOp::Update {
-                    collection: nsid::BATCH,
-                    rkey,
-                    value: encode(&batch)?,
-                });
-            }
+            Err(error) => Err(error),
         }
-        if count == 0 {
-            return Err(Error::NotFound("message"));
-        }
-        for chunk in updates.chunks(MAX_WRITES) {
-            self.apply(&space, chunk).await?;
-        }
-        Ok(count)
     }
 
     async fn upload_and_commit_attachment(
@@ -530,6 +630,8 @@ impl ThreadStore for SpaceThreadStore {
             .await
     }
 
+    /// Deletes mutable ciphertext and key material only. Immutable
+    /// `authorRedaction` records intentionally survive leave/account cleanup.
     async fn clear_records(&self, thread_id: &str) -> Result<()> {
         let space = self.space_for(thread_id)?;
         for collection in THREAD_COLLECTIONS {

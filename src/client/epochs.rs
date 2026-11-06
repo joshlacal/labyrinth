@@ -6,7 +6,6 @@ use std::collections::BTreeSet;
 use super::members::{Audit, ExcludedMember, ExclusionReason};
 use super::{Backends, Labyrinth};
 use crate::device::{ChatBinding, DevicePublic, DeviceSecrets};
-use crate::encoding::random;
 use crate::epoch::{
     EpochMemberRecord, EpochRecord, EpochSecret, OpenedEpoch, backward_chain, forward_chain,
     open_genesis, open_next, verify_member, verify_public,
@@ -532,8 +531,6 @@ impl Labyrinth {
         }
         let device = DeviceSecrets::generate()?;
         let (pending, new) = open_genesis(did, &device, transport.as_ref())?;
-        let mut salt = [0u8; 32];
-        random(&mut salt)?;
         let now = crate::records::datetime_from_ms(b.clock.now_ms());
         let members: Vec<_> = new
             .members
@@ -547,7 +544,7 @@ impl Labyrinth {
             .await?;
         let epoch = Epoch::from_record(&new.record, now);
         let id = create_epoch_reconciled(b.mailbox.as_ref(), &epoch, &members).await?;
-        let mut me = Self::assemble(did, device, transport, b, salt, [pending.assign_id(id)])?;
+        let mut me = Self::assemble(did, device, transport, b, [pending.assign_id(id)])?;
         // Made here, so it needs no checking.
         me.adopted(new.record.public.clone());
         me.remember_verified(0, [key.0]);
@@ -555,24 +552,96 @@ impl Labyrinth {
         Ok((me, unfinished))
     }
 
-    /// The steps of [`initialize`](Self::initialize) after epoch 0: publish
-    /// every epoch from 0 up, in order. Safe to repeat until it succeeds.
+    /// The steps of [`initialize`](Self::initialize) after epoch 0: durably
+    /// mark the latest head pending, then publish every epoch from 0 up in
+    /// order. Safe to repeat until every configured destination succeeds.
     ///
     /// Publishing from epoch 0 matters when a rotation ran before this
     /// retry: the mls-ds head chain refuses a newer epoch until it has
     /// epoch 0, and the PDS needs every per-epoch copy for [CB-29].
-    pub async fn finish_initialize(&self) -> Result<()> {
+    pub async fn finish_initialize(&mut self) -> Result<()> {
+        self.mark_directory_publication_pending()?;
+        self.retry_pending_directory_publication().await.map(|_| ())
+    }
+
+    fn mark_directory_publication_pending(&mut self) -> Result<()> {
+        if self.pending_directory_publication == Some(self.latest) {
+            return Ok(());
+        }
+        let previous = self.pending_directory_publication;
+        self.pending_directory_publication = Some(self.latest);
+        if let Err(error) = self.checkpoint_state() {
+            self.pending_directory_publication = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn clear_pending_if_two_source_superseded(&mut self, pending: u64) -> Result<bool> {
+        let Some(anchored) = self.b.directory.latest_two_source(&self.did).await? else {
+            return Ok(false);
+        };
+        if anchored.seq <= pending {
+            return Ok(false);
+        }
+
+        let mut previous = self.latest_public()?;
+        if previous.seq != pending {
+            return Err(Error::Malformed("pending publication is not latest epoch"));
+        }
+        for seq in pending + 1..=anchored.seq {
+            let next = self.epoch_record(seq).await?.1.public;
+            next.verify(&self.did, Some(&previous))?;
+            previous = next;
+        }
+        if previous.head != anchored.head {
+            return Err(Error::Malformed(
+                "superseding directory head forks from mailbox",
+            ));
+        }
+
+        self.pending_directory_publication = None;
+        if let Err(error) = self.checkpoint_state() {
+            self.pending_directory_publication = Some(pending);
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Retry a durably pending epoch-head publication. All epochs are
+    /// replayed so a destination that missed genesis can accept the head.
+    ///
+    /// A failed stale publication is cleared only when the strict directory
+    /// independently proves that PDS and `mls-ds` share a newer head and the
+    /// mailbox contains its valid chain from the pending local head.
+    pub async fn retry_pending_directory_publication(&mut self) -> Result<bool> {
+        let Some(pending) = self.pending_directory_publication else {
+            return Ok(false);
+        };
+        if pending != self.latest {
+            return Err(Error::Malformed("pending publication is not latest epoch"));
+        }
         self.ensure_latest_revocation_safe().await?;
-        for seq in 0..=self.latest {
+        for seq in 0..=pending {
             let public = self.epoch_record(seq).await?.1.public;
             match self.publish_keys(&public).await {
                 Ok(()) => {}
-                Err(Error::EpochRollback { pinned, .. })
-                    if seq < self.latest && pinned <= self.latest => {}
-                Err(e) => return Err(e),
+                Err(Error::EpochRollback { pinned, .. }) if seq < pending && pinned <= pending => {}
+                Err(error) => {
+                    return match self.clear_pending_if_two_source_superseded(pending).await {
+                        Ok(true) => Ok(true),
+                        Ok(false) => Err(error),
+                        Err(verification_error) => Err(verification_error),
+                    };
+                }
             }
         }
-        Ok(())
+        self.pending_directory_publication = None;
+        if let Err(error) = self.checkpoint_state() {
+            self.pending_directory_publication = Some(pending);
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub(super) async fn epoch_record(&self, seq: u64) -> Result<(String, EpochRecord)> {
@@ -593,14 +662,12 @@ impl Labyrinth {
         result
     }
 
-    /// Publish the newest epoch again, to the mailbox and every extra
-    /// publisher: the retry after a rotation whose epoch was created but
-    /// whose publish failed. The [CB-28] check depends on the other
-    /// directory staying current.
-    pub async fn publish_latest_keys(&self) -> Result<()> {
-        self.ensure_latest_revocation_safe().await?;
-        let public = self.latest_public()?;
-        self.publish_keys(&public).await
+    /// Durably mark and publish the newest epoch again. This is the retry
+    /// after a partial PDS/DS publication; it never clears the marker until
+    /// every configured destination succeeds.
+    pub async fn publish_latest_keys(&mut self) -> Result<()> {
+        self.mark_directory_publication_pending()?;
+        self.retry_pending_directory_publication().await.map(|_| ())
     }
 
     /// Publishing an inclusive head after a locally decided revocation
@@ -642,6 +709,10 @@ impl Labyrinth {
     ///
     /// [`Error::NotEpochMember`] means this device has been revoked.
     pub async fn sync_epochs(&mut self) -> Result<SyncReport> {
+        // Publication failure is separately durable; callers with a status
+        // surface retry it explicitly, while core sync may still reach a
+        // safely verifiable mailbox chain.
+        let _ = self.retry_pending_directory_publication().await;
         self.sync_epochs_allowing(&BTreeSet::new()).await
     }
 
@@ -1123,8 +1194,9 @@ impl Labyrinth {
         // Made here, so it needs no checking.
         self.adopted(new.record.public.clone());
         self.remember_verified(self.latest, new.members.iter().map(|m| m.device_key_pub.0));
+        self.pending_directory_publication = Some(self.latest);
         self.checkpoint_state()?;
-        self.publish_keys(&new.record.public).await?;
+        self.retry_pending_directory_publication().await?;
         let excluded = audit
             .excluded
             .into_iter()

@@ -49,6 +49,9 @@ struct Repo {
 #[derive(Default)]
 struct ThreadSpace {
     repos: BTreeMap<String, Repo>,
+    /// Immutable per-author, per-message unsends. Deliberately outside repos:
+    /// leave/account cleanup removes ciphertext repos but never these records.
+    author_redactions: BTreeMap<(String, String), crate::records::AuthorRedaction>,
     no_read: BTreeSet<String>,
     /// Labyrinth write counter (server order).
     next_seq: u64,
@@ -89,6 +92,8 @@ struct State {
     sequencer: Option<(String, Option<[u8; 32]>)>,
     /// Per-thread `I13` ES256 receipt verification keys (`Gate 1`).
     receipt_keys: HashMap<String, SequencerReceiptKey>,
+    /// Exact verification-method history, retained across current-key rotation.
+    receipt_key_history: HashMap<String, HashMap<String, SequencerReceiptKey>>,
 }
 
 impl State {
@@ -306,18 +311,86 @@ impl MemoryBackend {
             .unwrap_or_default()
     }
 
+    /// Installs the authoritative MLS device leaves for one test conversation.
+    pub fn set_member_device_keys(&self, thread_id: &str, did: &str, keys: Vec<MemberDeviceKey>) {
+        let mut state = self.lock();
+        state
+            .threads
+            .entry(thread_id.to_owned())
+            .or_default()
+            .leaves
+            .get_or_insert_with(BTreeMap::new)
+            .insert(did.to_owned(), keys);
+    }
+
     /// Configures the sequencer DS DID and optional Ed25519 redaction signing seed.
     pub fn set_sequencer(&self, did: &str, signing_seed: Option<[u8; 32]>) {
         self.lock().sequencer = Some((did.to_owned(), signing_seed));
     }
 
-    /// Registers the ES256 receipt verification key `{did}#mls-receipt-1` for `thread_id` (`Gate 1`).
+    /// Registers the first receipt key for `thread_id`.
     pub fn set_sequencer_receipt_key(&self, thread_id: &str, key: SequencerReceiptKey) {
-        self.lock().receipt_keys.insert(thread_id.to_owned(), key);
+        let key_id = labyrinth_protocol::expected_receipt_key_id(&key.did);
+        self.try_set_sequencer_receipt_key_with_id(thread_id, &key_id, key)
+            .expect("test receipt key must be a fresh method");
+    }
+
+    /// Rotates the current receipt key while retaining the exact old method.
+    pub fn set_sequencer_receipt_key_with_id(
+        &self,
+        thread_id: &str,
+        key_id: &str,
+        key: SequencerReceiptKey,
+    ) {
+        self.try_set_sequencer_receipt_key_with_id(thread_id, key_id, key)
+            .expect("test receipt key must be a fresh method");
+    }
+
+    /// Fallible variant used by key-ID reuse tests.
+    pub fn try_set_sequencer_receipt_key_with_id(
+        &self,
+        thread_id: &str,
+        key_id: &str,
+        key: SequencerReceiptKey,
+    ) -> Result<()> {
+        labyrinth_protocol::receipt_key_generation(&key.did, key_id)
+            .map_err(|_| Error::Malformed("receipt key ID does not name its authority"))?;
+        let mut state = self.lock();
+        let history = state
+            .receipt_key_history
+            .entry(thread_id.to_owned())
+            .or_default();
+        if history.get(key_id).is_some_and(|existing| existing != &key) {
+            return Err(Error::Conflict);
+        }
+        history
+            .entry(key_id.to_owned())
+            .or_insert_with(|| key.clone());
+        state.receipt_keys.insert(thread_id.to_owned(), key);
+        Ok(())
+    }
+
+    /// Remove every directory copy of a thread's receipt methods.
+    pub fn clear_sequencer_receipt_keys(&self, thread_id: &str) {
+        let mut state = self.lock();
+        state.receipt_keys.remove(thread_id);
+        state.receipt_key_history.remove(thread_id);
     }
 
     pub(super) fn receipt_key(&self, thread_id: &str) -> Option<SequencerReceiptKey> {
         self.lock().receipt_keys.get(thread_id).cloned()
+    }
+
+    pub(super) fn receipt_key_by_id(
+        &self,
+        thread_id: &str,
+        key_id: &str,
+    ) -> Option<SequencerReceiptKey> {
+        self.lock()
+            .receipt_key_history
+            .get(thread_id)
+            .and_then(|history| history.get(key_id))
+            .cloned()
     }
 
     /// Prunes `mls-ds` epoch heads strictly below `floor_seq` (`L-F01`, Gate 6).
@@ -575,28 +648,11 @@ impl MailboxStore for MemoryMailbox {
     }
 
     async fn get_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<Option<VirtualDevice>> {
-        let s = self.backend.lock();
-        let now = s.server_now;
-        Ok(s.mailboxes
-            .get(&self.did)
-            .and_then(|m| m.vdevices.get(&hex::encode(vdevice_id)))
-            .filter(|vd| !vdevice_expired_at(vd, now))
-            .cloned())
+        self.with(|m| Ok(m.vdevices.get(&hex::encode(vdevice_id)).cloned()))
     }
 
     async fn list_virtual_devices(&self) -> Result<Vec<VirtualDevice>> {
-        let s = self.backend.lock();
-        let now = s.server_now;
-        Ok(s.mailboxes
-            .get(&self.did)
-            .map(|m| {
-                m.vdevices
-                    .values()
-                    .filter(|vd| !vdevice_expired_at(vd, now))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default())
+        self.with(|m| Ok(m.vdevices.values().cloned().collect()))
     }
 
     async fn put_otc_session(&self, session: &OtcSession) -> Result<()> {
@@ -770,25 +826,6 @@ impl MailboxStore for MemoryMailbox {
         self.backend.lock().purge(&self.did);
         Ok(())
     }
-}
-
-pub(super) fn vdevice_expired_at(vd: &VirtualDevice, now_ms: u64) -> bool {
-    let Ok((rec, _)) = vd.to_bundle() else {
-        return false;
-    };
-    let Ok(created_ms) = crate::records::ms_from_datetime(&vd.created_at) else {
-        return false;
-    };
-    let Ok(last_used_ms) = vd
-        .last_used_at
-        .as_deref()
-        .map(crate::records::ms_from_datetime)
-        .transpose()
-    else {
-        return false;
-    };
-    crate::client::recovery::recovery_expiry(rec.mechanism, created_ms, last_used_ms)
-        .is_some_and(|exp| now_ms >= exp)
 }
 
 #[cfg(test)]

@@ -157,16 +157,15 @@ fn quantum_hndl_otc_resists_known_code_and_cpace_isk_without_mlkem_dk() {
         labyrinth::encoding::sha256(&m2.kem_ct).as_slice()
     );
 
-    // Enrolled device seals OtcPayload (containing epoch_root + mailbox_root_salt).
+    // Enrolled device seals the salt-free OtcPayload.
     let epoch = labyrinth::epoch::EpochSecret::from_parts(4, "000000000004", [0x77; 32]);
-    let payload = OtcPayload::new([0x55; 32], epoch.clone());
+    let payload = OtcPayload::new(epoch.clone());
     let sealed_payload = payload.seal(&resp_key).unwrap();
 
     // Legitimate initiator finishes with dk_otc and opens OtcPayload.
     let init_key = init.finish(&m2).unwrap();
     assert_eq!(init_key.as_bytes(), resp_key.as_bytes());
     let opened = OtcPayload::open(&init_key, &sealed_payload).unwrap();
-    assert_eq!(opened.mailbox_root_salt, [0x55; 32]);
     assert_eq!(opened.epoch.seq, 4);
     assert_eq!(opened.epoch.root(), &[0x77; 32]);
 
@@ -259,8 +258,7 @@ fn gate2_virtual_device_0x32_tag_device_mac_and_members_hash_binding() {
 
     // Virtual device recovery bundle round-trips 96-byte HawkEncSecret without ORF.
     let code = RecoveryCode::generate().unwrap();
-    let (vrec, vmember) =
-        create_vdevice(did, &code, &phys, &e0, &[0x44; 32], Mechanism::Code).unwrap();
+    let (vrec, vmember) = create_vdevice(did, &code, &phys, &e0, Mechanism::Code).unwrap();
     verify_member(&e0, &vmember, true).unwrap();
     assert_eq!(
         verify_member(&e0, &vmember, false),

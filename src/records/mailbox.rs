@@ -11,7 +11,7 @@ use crate::hpke::hawk::HawkEncPublic;
 use crate::mailbox::EpochPublic;
 use crate::message::OwnerMessage;
 use crate::sign::XVerifyingKey;
-use crate::virtual_device::{Mechanism, VirtualDeviceRecord};
+use crate::virtual_device::{Mechanism, RECORD_FORMAT_VERSION, VirtualDeviceRecord};
 use crate::{Error, Result};
 
 /// `blue.catbird.labyrinth.device`, rkey = `hex(deviceKeyPubkey)`.
@@ -213,13 +213,13 @@ pub struct PasskeyWrap {
 pub struct VirtualDevice {
     #[serde(rename = "$type")]
     pub type_: String,
+    pub format_version: u8,
     pub vdevice_id: Bytes,
     pub device_key_pubkey: Bytes,
     pub epoch_storage_key_pubkey: Bytes,
     pub epoch_storage_key_sig: Bytes,
     pub encrypted_device_key_priv: Bytes,
     pub encrypted_epoch_storage_key_priv: Bytes,
-    pub encrypted_mailbox_root_salt: Bytes,
     pub encrypted_epoch_root_key: Bytes,
     pub encrypted_epoch_number: Bytes,
     pub mechanism: String,
@@ -242,13 +242,13 @@ impl VirtualDevice {
     ) -> Self {
         Self {
             type_: nsid::VIRTUAL_DEVICE.into(),
+            format_version: RECORD_FORMAT_VERSION,
             vdevice_id: Bytes::from_slice(&r.vdevice_id),
             device_key_pubkey: Bytes::from_slice(&r.public.device_key_pub.0),
             epoch_storage_key_pubkey: Bytes(r.public.epoch_storage_key_pub.to_bytes()),
             epoch_storage_key_sig: Bytes::from_slice(&r.public.sig_storage),
             encrypted_device_key_priv: Bytes(r.encrypted_device_key_priv.clone()),
             encrypted_epoch_storage_key_priv: Bytes(r.encrypted_epoch_storage_key_priv.clone()),
-            encrypted_mailbox_root_salt: Bytes(r.encrypted_mailbox_root_salt.clone()),
             encrypted_epoch_root_key: Bytes(r.encrypted_epoch_root_key.clone()),
             encrypted_epoch_number: Bytes(r.encrypted_epoch_number.clone()),
             mechanism: r.mechanism.as_str().into(),
@@ -261,6 +261,9 @@ impl VirtualDevice {
 
     pub fn to_bundle(&self) -> Result<(VirtualDeviceRecord, Option<PasskeyWrap>)> {
         check_type(&self.type_, nsid::VIRTUAL_DEVICE)?;
+        if self.format_version != RECORD_FORMAT_VERSION {
+            return Err(Error::Unsupported(self.format_version));
+        }
         let public = DevicePublic {
             device_key_pub: XVerifyingKey(self.device_key_pubkey.array("deviceKeyPubkey")?),
             epoch_storage_key_pub: HawkEncPublic::from_bytes(&self.epoch_storage_key_pubkey.0)?,
@@ -283,7 +286,6 @@ impl VirtualDevice {
             public,
             encrypted_device_key_priv: self.encrypted_device_key_priv.0.clone(),
             encrypted_epoch_storage_key_priv: self.encrypted_epoch_storage_key_priv.0.clone(),
-            encrypted_mailbox_root_salt: self.encrypted_mailbox_root_salt.0.clone(),
             encrypted_epoch_root_key: self.encrypted_epoch_root_key.0.clone(),
             encrypted_epoch_number: self.encrypted_epoch_number.0.clone(),
             mechanism: Mechanism::parse(&self.mechanism)?,

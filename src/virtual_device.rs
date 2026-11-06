@@ -6,6 +6,9 @@ pub mod passkey;
 
 pub use otc_payload::OtcPayload;
 
+/// Serialized `virtualDevice` record format after the clean-slate salt removal.
+pub const RECORD_FORMAT_VERSION: u8 = 0x02;
+
 use base64::Engine as _;
 use zeroize::Zeroizing;
 
@@ -24,7 +27,6 @@ use crate::{Error, Result};
 pub mod aad {
     pub const DEVICE_KEY: &[u8] = b"virtual_device:virtual_device_private_key";
     pub const STORAGE_KEY: &[u8] = b"virtual_device:epoch_storage_private_key";
-    pub const MAILBOX_ROOT_SALT: &[u8] = b"virtual_device:mailbox_root_key";
     pub const EPOCH_ROOT: &[u8] = b"virtual_device:epoch_root_key";
     pub const EPOCH_SEQ: &[u8] = b"virtual_device:epoch_anon_id";
 }
@@ -68,7 +70,6 @@ pub struct VirtualDeviceRecord {
     pub public: DevicePublic,
     pub encrypted_device_key_priv: Vec<u8>,
     pub encrypted_epoch_storage_key_priv: Vec<u8>,
-    pub encrypted_mailbox_root_salt: Vec<u8>,
     pub encrypted_epoch_root_key: Vec<u8>,
     /// Sealed `base64(decimal(seq))`.
     pub encrypted_epoch_number: Vec<u8>,
@@ -78,7 +79,6 @@ pub struct VirtualDeviceRecord {
 /// What a recovery code unlocks.
 pub struct RestoredState {
     pub device: DeviceSecrets,
-    pub mailbox_root_salt: [u8; 32],
     /// The epoch the bundle was made in.
     pub epoch: PendingEpoch,
 }
@@ -90,7 +90,6 @@ pub fn create(
     code: &RecoveryCode,
     me: &DeviceSecrets,
     current: &EpochSecret,
-    mailbox_root_salt: &[u8; 32],
     mechanism: Mechanism,
 ) -> Result<(VirtualDeviceRecord, EpochMemberRecord)> {
     if me.is_virtual() {
@@ -110,7 +109,6 @@ pub fn create(
             aad::STORAGE_KEY,
             Zeroizing::new(v.storage.to_bytes()).as_slice(),
         )?,
-        encrypted_mailbox_root_salt: seal(aad::MAILBOX_ROOT_SALT, mailbox_root_salt)?,
         encrypted_epoch_root_key: seal(aad::EPOCH_ROOT, current.root())?,
         encrypted_epoch_number: seal(aad::EPOCH_SEQ, b64_decimal(current.seq).as_bytes())?,
         mechanism,
@@ -159,11 +157,6 @@ pub fn open(record: &VirtualDeviceRecord, code: &RecoveryCode, did: &str) -> Res
         aad::STORAGE_KEY,
         &record.encrypted_epoch_storage_key_priv,
     )?);
-    let salt = open_fixed::<32>(
-        &key,
-        aad::MAILBOX_ROOT_SALT,
-        &record.encrypted_mailbox_root_salt,
-    )?;
     let root = open_fixed::<32>(&key, aad::EPOCH_ROOT, &record.encrypted_epoch_root_key)?;
     let seq_b64 = Zeroizing::new(aead::decrypt_suite(
         Suite::DndkGcm,
@@ -178,7 +171,6 @@ pub fn open(record: &VirtualDeviceRecord, code: &RecoveryCode, did: &str) -> Res
     let device = DeviceSecrets::from_parts(device_key, storage, None, record.public.clone())?;
     Ok(RestoredState {
         device,
-        mailbox_root_salt: *salt,
         epoch: PendingEpoch::new(seq, *root),
     })
 }
@@ -213,10 +205,9 @@ mod tests {
     fn create_open_round_trip() {
         let did = "did:plc:vdev";
         let (me, epoch, code) = setup();
-        let (rec, member) = create(did, &code, &me, &epoch, &[6u8; 32], Mechanism::Code).unwrap();
+        let (rec, member) = create(did, &code, &me, &epoch, Mechanism::Code).unwrap();
         verify_member(&epoch, &member, true).unwrap();
         let r = open(&rec, &code, did).unwrap();
-        assert_eq!(r.mailbox_root_salt, [6u8; 32]);
         assert_eq!(r.epoch.seq(), 2);
         assert_eq!(r.epoch.root(), &[4u8; 32]);
         assert_eq!(r.device.public(), &rec.public);
@@ -228,21 +219,20 @@ mod tests {
     fn every_encrypted_field_is_bound_to_its_aad() {
         let did = "did:plc:vdev";
         let (me, epoch, code) = setup();
-        let (rec, _) = create(did, &code, &me, &epoch, &[6u8; 32], Mechanism::Code).unwrap();
+        let (rec, _) = create(did, &code, &me, &epoch, Mechanism::Code).unwrap();
         fn field(r: &mut VirtualDeviceRecord, i: usize) -> &mut Vec<u8> {
             match i {
                 0 => &mut r.encrypted_device_key_priv,
                 1 => &mut r.encrypted_epoch_storage_key_priv,
-                2 => &mut r.encrypted_mailbox_root_salt,
-                3 => &mut r.encrypted_epoch_root_key,
+                2 => &mut r.encrypted_epoch_root_key,
                 _ => &mut r.encrypted_epoch_number,
             }
         }
-        for i in 0..5 {
+        for i in 0..4 {
             let mut bad = rec.clone();
             field(&mut bad, i)[10] ^= 1;
             assert!(open(&bad, &code, did).is_err(), "flip {i}");
-            for j in (0..5).filter(|&j| j != i) {
+            for j in (0..4).filter(|&j| j != i) {
                 let mut bad = rec.clone();
                 let a = field(&mut bad, i).clone();
                 let b = core::mem::replace(field(&mut bad, j), a);

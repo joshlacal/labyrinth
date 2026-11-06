@@ -5,6 +5,7 @@ use futures::executor::block_on;
 use labyrinth::Error;
 use labyrinth::attachment::AttachmentCiphertextMeta;
 use labyrinth::client::{Backends, CompositeDirectory, Labyrinth, MessageSource, SystemClock};
+use labyrinth::message::OriginalSenderArchiveAttestation;
 use labyrinth::protocol::receipt::{
     SequencerReceiptPayload, compute_archive_commitment, expected_receipt_key_id,
     sign_sequencer_receipt,
@@ -13,7 +14,8 @@ use labyrinth::sign::{Ed25519Transport, TransportSigner as _};
 use labyrinth::store::space::host::MemorySpaceHost;
 use labyrinth::store::space::{SpaceMailboxStore, SpaceRef, SpaceThreadStore};
 use labyrinth::store::{
-    MailboxStore as _, MemoryBackend, SequencerReceiptKey, ThreadStore as _, TimeRange,
+    MailboxStore as _, MemberDeviceKey, MemoryBackend, SequencerReceiptKey, ThreadStore as _,
+    TimeRange,
 };
 use p256::ecdsa::SigningKey;
 
@@ -52,6 +54,15 @@ fn make_client(
 ) -> Labyrinth {
     let t = transport(seed);
     net.set_chat_devices(did, vec![t.transport_public_key()]);
+    net.set_member_device_keys(
+        CONVO_ID,
+        did,
+        vec![MemberDeviceKey {
+            key: t.transport_public_key(),
+            joined_chat_seq: 1,
+            removed_chat_seq: None,
+        }],
+    );
     let mb_space = SpaceRef::parse(&format!(
         "at://{did}/space/blue.catbird.labyrinth.mailbox/self"
     ))
@@ -156,7 +167,17 @@ fn gate5_attachments_redact_siblings_intact_and_rearchive_before_leave() {
             1_791_181_720_000 + seq,
             &nonce,
             body,
-            &labyrinth::message::ArchivedReceipt::new(receipt.clone()),
+            &labyrinth::message::ArchivedReceipt::new(
+                receipt.clone(),
+                OriginalSenderArchiveAttestation::sign(
+                    ALICE_DID.to_owned(),
+                    ALICE_DEV_ID.to_owned(),
+                    CONVO_ID,
+                    msg_id,
+                    &commitment,
+                    &transport(1),
+                ),
+            ),
         ))
         .unwrap();
     }
@@ -164,7 +185,8 @@ fn gate5_attachments_redact_siblings_intact_and_rearchive_before_leave() {
     assert_eq!(flushed.len(), 1);
     assert_eq!(flushed[0].count, 3);
 
-    // Alice unsends middle item `m-11`: rewrites ONLY `m-11` in-place, preserving `m-10` & `m-12` + receipts!
+    // Alice unsends middle item `m-11`: creates one immutable message-scoped redaction,
+    // preserving `m-10` and `m-12` plus every original receipt.
     let redacted_count = block_on(alice.unsend(CONVO_ID, "m-11")).expect("unsend m-11");
     assert_eq!(redacted_count, 1);
 
@@ -180,16 +202,17 @@ fn gate5_attachments_redact_siblings_intact_and_rearchive_before_leave() {
     assert!(bob_view.redacted[0].by_author);
     assert!(bob_view.undecryptable.is_empty());
 
-    // 3. Alice leaves conversation: `rearchive_before_leave` copies messages + attachments
-    // into Alice's personal mailbox Space BEFORE `clear_records` purges Alice's conversation Space repo!
+    // 3. Alice leaves conversation: readable messages and attachments reach
+    // Alice's personal mailbox before cleanup. Ciphertext is purged, but the
+    // immutable author-redaction record remains durable.
     let leave_report = block_on(alice.rearchive_and_clear_before_leave(CONVO_ID))
         .expect("rearchive_and_clear_before_leave");
     assert_eq!(leave_report.messages_archived, 2);
     assert_eq!(leave_report.attachments_archived, 1);
     assert_eq!(
         host.record_count(&convo_space, ALICE_DID, None),
-        0,
-        "Alice's conversation Space repo must be cleared on leave"
+        1,
+        "leave cleanup must retain the durable redaction"
     );
 
     // Revoke Alice's read membership on the conversation Space and confirm she still reads
@@ -225,5 +248,78 @@ fn gate5_attachments_redact_siblings_intact_and_rearchive_before_leave() {
     assert_eq!(
         block_on(alice_mb.get_owner_attachment_verified(&manifest_rkey)).unwrap_err(),
         Error::Decrypt
+    );
+}
+
+#[test]
+fn concurrent_unsends_are_independent_and_cleanup_retains_durable_redactions() {
+    use std::sync::{Arc, Barrier};
+
+    use labyrinth::deletion::Redaction;
+
+    let net = MemoryBackend::new();
+    let host = MemorySpaceHost::new();
+    let convo_space = SpaceRef::parse(&format!(
+        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+    ))
+    .unwrap();
+    host.grant_space_member(&convo_space, ALICE_DID);
+    host.grant_space_member(&convo_space, BOB_DID);
+    let mut alice = make_client(ALICE_DID, 1, &net, &host, &convo_space);
+    let mut bob = make_client(BOB_DID, 2, &net, &host, &convo_space);
+    let roster = block_on(alice.resolve_roster(&[ALICE_DID, BOB_DID])).unwrap();
+    for (id, timestamp) in [("race-a", 10), ("race-b", 20), ("kept", 30)] {
+        block_on(alice.archive_outgoing(CONVO_ID, &roster, id, timestamp, id.as_bytes())).unwrap();
+    }
+    block_on(alice.flush()).unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let redact = |message_id: &'static str, host: MemorySpaceHost, barrier: Arc<Barrier>| {
+        let space = convo_space.clone();
+        std::thread::spawn(move || {
+            let mut store = SpaceThreadStore::new(host.client(ALICE_DID), ALICE_DID.to_owned());
+            store.register_thread_space(CONVO_ID, space);
+            let redaction = Redaction::sign(ALICE_DID, CONVO_ID, message_id, &transport(1));
+            barrier.wait();
+            block_on(store.redact_item(CONVO_ID, message_id, &redaction)).unwrap();
+        })
+    };
+    let first = redact("race-a", host.clone(), barrier.clone());
+    let second = redact("race-b", host.clone(), barrier);
+    first.join().unwrap();
+    second.join().unwrap();
+
+    let after_race = block_on(bob.load_thread(CONVO_ID, TimeRange::ALL)).unwrap();
+    assert_eq!(
+        after_race
+            .messages
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["kept"]
+    );
+    assert_eq!(
+        after_race
+            .redacted
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["race-a", "race-b"].into_iter().collect()
+    );
+
+    // Leave/account cleanup may remove ciphertext batches, but never the
+    // separate immutable author-redaction records.
+    let mut cleanup = SpaceThreadStore::new(host.client(ALICE_DID), ALICE_DID.to_owned());
+    cleanup.register_thread_space(CONVO_ID, convo_space);
+    block_on(cleanup.clear_records(CONVO_ID)).unwrap();
+    let after_cleanup = block_on(bob.load_thread(CONVO_ID, TimeRange::ALL)).unwrap();
+    assert!(after_cleanup.messages.is_empty());
+    assert_eq!(
+        after_cleanup
+            .redacted
+            .iter()
+            .map(|message| message.message_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["race-a", "race-b"].into_iter().collect()
     );
 }

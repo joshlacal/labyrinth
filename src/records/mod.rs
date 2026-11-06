@@ -24,8 +24,8 @@ pub use mailbox::{
     Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch, VirtualDevice,
 };
 pub use thread::{
-    AttachmentManifest, Batch, BatchEntry, LabyrinthSenderDef, MekDistribution, MekSenderDef,
-    TransportSenderDef,
+    AttachmentManifest, AuthorRedaction, Batch, BatchEntry, LabyrinthSenderDef, MekDistribution,
+    MekSenderDef, TransportSenderDef,
 };
 
 use base64::Engine as _;
@@ -45,6 +45,7 @@ pub mod nsid {
     pub const MAILBOX_KEYS: &str = "blue.catbird.labyrinth.mailboxKeys";
     pub const MEK: &str = "blue.catbird.labyrinth.mek";
     pub const BATCH: &str = "blue.catbird.labyrinth.batch";
+    pub const AUTHOR_REDACTION: &str = "blue.catbird.labyrinth.authorRedaction";
     pub const ATTACHMENT_MANIFEST: &str = "blue.catbird.labyrinth.attachmentManifest";
 }
 

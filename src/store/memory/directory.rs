@@ -60,4 +60,16 @@ impl MailboxDirectory for MemoryDirectory {
     async fn sequencer_receipt_key(&self, thread_id: &str) -> Result<Option<SequencerReceiptKey>> {
         Ok(self.backend.receipt_key(thread_id))
     }
+
+    async fn sequencer_receipt_key_by_id(
+        &self,
+        thread_id: &str,
+        expected_authority: &str,
+        key_id: &str,
+    ) -> Result<Option<SequencerReceiptKey>> {
+        Ok(self
+            .backend
+            .receipt_key_by_id(thread_id, key_id)
+            .filter(|key| key.did == expected_authority))
+    }
 }

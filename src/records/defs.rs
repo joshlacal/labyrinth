@@ -8,7 +8,9 @@ use crate::hpke::X25519Public;
 use crate::hpke::hawk::HawkEncPublic;
 use crate::mailbox::{EpochPublic, MailboxPublicKeys, TransportAttestation};
 use crate::mek::MekRecipient;
-use crate::message::{ArchivedReceipt, OwnerMessage, SealedMessage};
+use crate::message::{
+    ArchivedReceipt, OriginalSenderArchiveAttestation, OwnerMessage, SealedMessage,
+};
 use crate::sign::XVerifyingKey;
 use crate::{Error, Result};
 
@@ -53,6 +55,47 @@ impl BlobRefDef {
     }
 }
 
+/// `defs#originalSenderArchiveAttestation` (`G1` / `G6`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OriginalSenderArchiveAttestationDef {
+    pub sender_did: String,
+    pub sender_device_id: String,
+    pub sender_transport_pubkey: Bytes,
+    pub signature: Bytes,
+}
+
+impl OriginalSenderArchiveAttestationDef {
+    fn from_attestation(attestation: &OriginalSenderArchiveAttestation) -> Self {
+        Self {
+            sender_did: attestation.sender_did.clone(),
+            sender_device_id: attestation.sender_device_id.clone(),
+            sender_transport_pubkey: Bytes::from_slice(&attestation.sender_transport_public_key),
+            signature: Bytes::from_slice(&attestation.signature),
+        }
+    }
+
+    fn to_attestation(&self) -> Result<OriginalSenderArchiveAttestation> {
+        if self.sender_did.is_empty()
+            || self.sender_device_id.is_empty()
+            || self.sender_did.contains('#')
+            || self.sender_device_id.contains('#')
+        {
+            return Err(Error::Malformed("original sender archive identity"));
+        }
+        Ok(OriginalSenderArchiveAttestation {
+            sender_did: self.sender_did.clone(),
+            sender_device_id: self.sender_device_id.clone(),
+            sender_transport_public_key: self
+                .sender_transport_pubkey
+                .array("original sender transport key length")?,
+            signature: self
+                .signature
+                .array("original sender archive signature length")?,
+        })
+    }
+}
+
 /// `defs#sequencerReceipt` (`I13`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -70,6 +113,7 @@ pub struct SequencerReceiptDef {
     pub sequencer_did: String,
     pub kid: String,
     pub signature: Bytes,
+    pub original_sender_attestation: OriginalSenderArchiveAttestationDef,
 }
 
 impl SequencerReceiptDef {
@@ -93,6 +137,9 @@ impl SequencerReceiptDef {
             sequencer_did: p.sequencer_did.clone(),
             kid: r.signed.key_id.clone(),
             signature: Bytes::from_slice(&r.signed.signature),
+            original_sender_attestation: OriginalSenderArchiveAttestationDef::from_attestation(
+                &r.original_sender_attestation,
+            ),
         }
     }
 
@@ -128,6 +175,14 @@ impl SequencerReceiptDef {
         payload
             .validate_structure()
             .map_err(|_| Error::Malformed("receipt payload structure"))?;
+        let original_sender_attestation = self.original_sender_attestation.to_attestation()?;
+        if original_sender_attestation.sender_did != self.sender_did
+            || original_sender_attestation.sender_device_id != self.sender_device_id
+        {
+            return Err(Error::Malformed(
+                "receipt and original sender archive identity differ",
+            ));
+        }
         Ok(ArchivedReceipt {
             signed: labyrinth_protocol::receipt::SignedSequencerReceipt {
                 payload,
@@ -135,6 +190,7 @@ impl SequencerReceiptDef {
                 signature,
             },
             generation: self.generation,
+            original_sender_attestation,
         })
     }
 }

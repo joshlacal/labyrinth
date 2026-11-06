@@ -233,11 +233,13 @@ fn transient_directory_failure_fails_the_roster_instead_of_dropping_members() {
 }
 
 #[test]
-fn incomplete_directory_fails_the_roster_instead_of_dropping_members() {
+fn restored_device_first_contact_rejects_stale_one_source_and_keeps_pin_empty() {
     let (net, clock) = (MemoryBackend::new(), TestClock::default());
     let alice = init(&net, &clock, A, 1);
     let state = alice.export_state().unwrap();
     let mut b = backends(&net, &clock, A);
+    // Model a present but stale PDS view with the independent DS source
+    // unavailable: restored first contact may not turn it into a local pin.
     b.directory = Box::new(Incomplete(net.directory()));
     let mut alice = block_on(Labyrinth::from_state(&state, A, Box::new(signer(1)), b)).unwrap();
     assert_eq!(
@@ -247,6 +249,7 @@ fn incomplete_directory_fails_the_roster_instead_of_dropping_members() {
             ds_present: false,
         }
     );
+    assert!(alice.peer_pin(B).is_none());
 }
 
 #[test]

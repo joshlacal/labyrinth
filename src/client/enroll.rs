@@ -34,6 +34,9 @@ pub struct RecoverySetup {
 /// A device enrolled by restore or one-time code.
 pub struct Enrollment {
     pub device_key: XVerifyingKey,
+    /// The restoring device's local clock considers this automatically
+    /// stored recovery method stale. Advisory only; rotation is authoritative.
+    pub stale_recovery_method: bool,
 }
 
 /// What the enrolled device sends back in a one-time-code transfer.
@@ -47,6 +50,7 @@ impl core::fmt::Debug for Enrollment {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Enrollment")
             .field("device_key", &self.device_key)
+            .field("stale_recovery_method", &self.stale_recovery_method)
             .finish_non_exhaustive()
     }
 }
@@ -67,7 +71,6 @@ fn prefer_passkey_error(current: &mut Option<Error>, candidate: Error) {
         Error::Backend(_) | Error::Forbidden => 6,
         Error::Decrypt => 5,
         Error::BadRecoveryCode => 4,
-        Error::Expired => 3,
         Error::Unsupported(_) => 2,
         _ => 1,
     };
@@ -79,14 +82,14 @@ fn prefer_passkey_error(current: &mut Option<Error>, candidate: Error) {
     }
 }
 
-fn vdevice_expiry_ms(mechanism: Mechanism, vdev: &VirtualDevice) -> Result<Option<u64>> {
+fn vdevice_stale_at_ms(mechanism: Mechanism, vdev: &VirtualDevice) -> Result<Option<u64>> {
     let created_ms = crate::records::ms_from_datetime(&vdev.created_at)?;
     let last_used_ms = vdev
         .last_used_at
         .as_deref()
         .map(crate::records::ms_from_datetime)
         .transpose()?;
-    Ok(super::recovery::recovery_expiry(
+    Ok(super::recovery::recovery_stale_at(
         mechanism,
         created_ms,
         last_used_ms,
@@ -159,6 +162,7 @@ struct PreparedRestore {
     restored: RestoredState,
     reached: Vec<EpochSecret>,
     latest_public: EpochPublic,
+    stale_recovery_method: bool,
 }
 
 impl Labyrinth {
@@ -188,14 +192,8 @@ impl Labyrinth {
         self.sync_epochs().await?;
         let current = self.epoch_secret(self.latest).await?;
         let code = RecoveryCode::generate()?;
-        let (rec, member) = virtual_device::create(
-            &self.did,
-            &code,
-            &self.device,
-            &current,
-            &self.mailbox_root_salt,
-            mechanism,
-        )?;
+        let (rec, member) =
+            virtual_device::create(&self.did, &code, &self.device, &current, mechanism)?;
         let wrap = passkey
             .map(|(prf, cred)| {
                 Ok::<_, Error>(PasskeyWrap {
@@ -206,16 +204,39 @@ impl Labyrinth {
             .transpose()?;
         let now = self.now();
         let mb = self.b.mailbox.as_ref();
-        mb.create_device(&Device::from_public(&rec.public, now.clone()))
-            .await?;
-        mb.create_virtual_device(&VirtualDevice::from_bundle(
-            &rec,
-            wrap.as_ref(),
-            now.clone(),
-        ))
-        .await?;
-        mb.create_epoch_member(&EpochMember::from_record(&member, now))
-            .await?;
+        let device = Device::from_public(&rec.public, now.clone());
+        let bundle = VirtualDevice::from_bundle(&rec, wrap.as_ref(), now.clone());
+        let epoch_member = EpochMember::from_record(&member, now);
+        mb.create_device(&device).await?;
+        mb.create_virtual_device(&bundle).await?;
+        mb.create_epoch_member(&epoch_member).await?;
+
+        // Registration succeeds only after the complete passkey/recovery
+        // bundle can be read back and cryptographically verified.
+        let persisted_device = mb
+            .get_device(&rec.public.device_key_pub)
+            .await?
+            .ok_or(Error::NotFound("persisted recovery device"))?;
+        let persisted_public = persisted_device.to_public()?;
+        persisted_public.verify()?;
+        let persisted_bundle = mb
+            .get_virtual_device(&rec.vdevice_id)
+            .await?
+            .ok_or(Error::NotFound("persisted recovery bundle"))?;
+        let (persisted_record, persisted_wrap) = persisted_bundle.to_bundle()?;
+        let persisted_member = mb
+            .get_epoch_member(current.seq(), &rec.public.device_key_pub)
+            .await?
+            .ok_or(Error::NotFound("persisted recovery member"))?
+            .to_record()?;
+        crate::epoch::verify_member(&current, &persisted_member, true)?;
+        if persisted_public != rec.public
+            || persisted_record != rec
+            || persisted_wrap.as_ref() != wrap.as_ref()
+            || persisted_member != member
+        {
+            return Err(Error::Conflict);
+        }
         Ok(RecoverySetup {
             code,
             vdevice_id: rec.vdevice_id,
@@ -263,20 +284,12 @@ impl Labyrinth {
         let candidates = select_passkey_bundles(did, prf_output, credential_id, &bundles)?;
         let mut prepared = None;
         let mut first_error = None;
-        let now = b.clock.now_ms();
         for (bundle, code) in candidates {
-            if vdevice_expiry_ms(Mechanism::Passkey, bundle)?.is_some_and(|exp| now >= exp) {
-                prefer_passkey_error(&mut first_error, Error::Expired);
-                continue;
-            }
             match Self::prepare_restore_from_bundle(did, bundle, &code, &b).await {
                 Ok(_) if prepared.is_some() => return Err(Error::Conflict),
                 Ok(candidate) => prepared = Some(candidate),
                 Err(Error::NotEpochMember) => {
                     prefer_passkey_error(&mut first_error, Error::NotEpochMember)
-                }
-                Err(Error::Expired) => {
-                    prefer_passkey_error(&mut first_error, Error::Expired);
                 }
                 Err(error) => return Err(error),
             }
@@ -310,11 +323,10 @@ impl Labyrinth {
             .await?
             .ok_or(Error::NotFound("virtual device"))?;
         let now = b.clock.now_ms();
-        if vdevice_expiry_ms(record.mechanism, bundle)?.is_some_and(|exp| now >= exp)
-            || vdevice_expiry_ms(record.mechanism, &vdev)?.is_some_and(|exp| now >= exp)
-        {
-            return Err(Error::Expired);
-        }
+        let stale_recovery_method = vdevice_stale_at_ms(record.mechanism, bundle)?
+            .is_some_and(|stale_at| now >= stale_at)
+            || vdevice_stale_at_ms(record.mechanism, &vdev)?
+                .is_some_and(|stale_at| now >= stale_at);
         let (fresh_record, _) = vdev.to_bundle()?;
         if fresh_record != record {
             return Err(Error::Conflict);
@@ -351,6 +363,7 @@ impl Labyrinth {
             restored,
             reached,
             latest_public,
+            stale_recovery_method,
         })
     }
 
@@ -365,6 +378,7 @@ impl Labyrinth {
             restored,
             mut reached,
             latest_public,
+            stale_recovery_method,
         } = prepared;
         let mine = transport.transport_public_key();
         let current = b.directory.device_transport_keys(did).await?;
@@ -409,14 +423,7 @@ impl Labyrinth {
         let next_secret = pending_next.assign_id(next_id);
         let next_seq = next_secret.seq;
         reached.push(next_secret);
-        let mut me = Self::assemble(
-            did,
-            device,
-            transport,
-            b,
-            restored.mailbox_root_salt,
-            reached,
-        )?;
+        let mut me = Self::assemble(did, device, transport, b, reached)?;
         me.adopted(new_next.record.public.clone());
         me.remember_verified(
             next_seq,
@@ -427,6 +434,7 @@ impl Labyrinth {
             me,
             Enrollment {
                 device_key: public.device_key_pub,
+                stale_recovery_method,
             },
         ))
     }
@@ -447,7 +455,7 @@ impl Labyrinth {
         self.sync_epochs().await?;
         let (message, session_key) = responder.respond(msg)?;
         let epoch = self.epoch_secret(self.latest).await?;
-        let payload = OtcPayload::create(&epoch, &self.mailbox_root_salt);
+        let payload = OtcPayload::create(&epoch);
         Ok(OtcResponse {
             message,
             sealed_payload: payload.seal(&session_key)?,
@@ -550,7 +558,6 @@ impl Labyrinth {
             device,
             transport,
             b,
-            payload.mailbox_root_salt,
             [payload.epoch.clone(), next_secret],
         )?;
         me.adopted(new_next.record.public.clone());
@@ -563,6 +570,7 @@ impl Labyrinth {
             me,
             Enrollment {
                 device_key: public.device_key_pub,
+                stale_recovery_method: false,
             },
         ))
     }

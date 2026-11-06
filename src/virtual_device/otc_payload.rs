@@ -2,8 +2,7 @@
 //!
 //! Fixed binary layout (all integers big-endian):
 //! ```text
-//! 0x02                      format version (ORF-free PQ clean-slate)
-//! mailboxRootSalt     (32)
+//! 0x03                      format version (mailbox-root-salt-free clean slate)
 //! epochRootKey        (32)
 //! epochSequenceID     (u64, 8)
 //! len(epochID)        (u16, 2)   at most 512
@@ -18,29 +17,25 @@ use crate::epoch::{EpochKeys, EpochMemberRecord, EpochSecret, member_record};
 use crate::otc::{OtcSessionKey, PAYLOAD_AAD};
 use crate::{Error, Result};
 
-/// Payload format version byte (`0x02` = ORF-free PQ clean-slate).
-pub const FORMAT_VERSION: u8 = 0x02;
+/// Payload format version byte (`0x03` = mailbox-root-salt-free clean slate).
+pub const FORMAT_VERSION: u8 = 0x03;
 /// Maximum `epochID` length in bytes.
 pub const MAX_EPOCH_ID_LEN: usize = 512;
-const FIXED_LEN: usize = 1 + 32 * 2 + 8 + 2;
+const FIXED_LEN: usize = 1 + 32 + 8 + 2;
 
-/// `{mailboxRootSalt, epochRootKey, epochID, epochSequenceID}`.
+/// `{epochRootKey, epochID, epochSequenceID}`.
 pub struct OtcPayload {
-    pub mailbox_root_salt: [u8; 32],
     /// Carries the root, `epochID`, and sequence number.
     pub epoch: EpochSecret,
 }
 
 impl OtcPayload {
-    pub fn new(mailbox_root_salt: [u8; 32], epoch: EpochSecret) -> Self {
-        Self {
-            mailbox_root_salt,
-            epoch,
-        }
+    pub fn new(epoch: EpochSecret) -> Self {
+        Self { epoch }
     }
 
-    pub fn create(epoch: &EpochSecret, mailbox_root_salt: &[u8; 32]) -> Self {
-        Self::new(*mailbox_root_salt, epoch.clone())
+    pub fn create(epoch: &EpochSecret) -> Self {
+        Self::new(epoch.clone())
     }
 
     pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
@@ -50,7 +45,6 @@ impl OtcPayload {
         }
         let mut out = Zeroizing::new(Vec::with_capacity(FIXED_LEN + id.len()));
         out.push(FORMAT_VERSION);
-        out.extend_from_slice(&self.mailbox_root_salt);
         out.extend_from_slice(self.epoch.root());
         out.extend_from_slice(&self.epoch.seq.to_be_bytes());
         out.extend_from_slice(&(id.len() as u16).to_be_bytes());
@@ -66,17 +60,15 @@ impl OtcPayload {
             return Err(Error::Unsupported(b[0]));
         }
         let arr = |at: usize| -> [u8; 32] { b[at..at + 32].try_into().expect("in bounds") };
-        let mailbox_root_salt = arr(1);
-        let root = Zeroizing::new(arr(33));
-        let seq = u64::from_be_bytes(b[65..73].try_into().expect("in bounds"));
-        let id_len = u16::from_be_bytes([b[73], b[74]]) as usize;
+        let root = Zeroizing::new(arr(1));
+        let seq = u64::from_be_bytes(b[33..41].try_into().expect("in bounds"));
+        let id_len = u16::from_be_bytes([b[41], b[42]]) as usize;
         if id_len > MAX_EPOCH_ID_LEN || b.len() != FIXED_LEN + id_len {
             return Err(Error::Malformed("otc payload epoch id length"));
         }
         let epoch_id = core::str::from_utf8(&b[FIXED_LEN..])
             .map_err(|_| Error::Malformed("otc payload epoch id utf-8"))?;
         Ok(Self {
-            mailbox_root_salt,
             epoch: EpochSecret::from_parts(seq, epoch_id, *root),
         })
     }
@@ -113,20 +105,24 @@ mod tests {
     #[test]
     fn encoding_round_trip_and_strictness() {
         let epoch = EpochSecret::from_parts(7, "000000000007", [3u8; 32]);
-        let p = OtcPayload::create(&epoch, &[9u8; 32]);
+        let p = OtcPayload::create(&epoch);
         let b = p.to_bytes().unwrap();
         assert_eq!(b.len(), FIXED_LEN + 12);
         let q = OtcPayload::from_bytes(&b).unwrap();
         assert_eq!(q.to_bytes().unwrap(), b);
+        assert_eq!(
+            hex::encode(b.as_slice()),
+            "0303030303030303030303030303030303030303030303030303030303030303030000000000000007000c303030303030303030303037"
+        );
         let mut long = b.to_vec();
         long.push(0);
         assert!(OtcPayload::from_bytes(&long).is_err());
         assert!(OtcPayload::from_bytes(&b[..b.len() - 1]).is_err());
         let mut v = b.to_vec();
-        v[0] = 1;
+        v[0] = 2;
         assert_eq!(
             OtcPayload::from_bytes(&v).err(),
-            Some(Error::Unsupported(1))
+            Some(Error::Unsupported(2))
         );
     }
 
@@ -139,7 +135,7 @@ mod tests {
         let (reply, key_b) = r.respond(&hello).unwrap();
         let key_a = init.finish(&reply).unwrap();
         let epoch = EpochSecret::from_parts(7, "000000000007", [3u8; 32]);
-        let p = OtcPayload::create(&epoch, &[9u8; 32]);
+        let p = OtcPayload::create(&epoch);
         assert!(OtcPayload::open(&key_a, &p.seal(&key_b).unwrap()).is_ok());
         let ct = aead::encrypt(
             aead::Suite::GcmExtended,

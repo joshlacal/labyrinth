@@ -6,7 +6,6 @@ use super::Labyrinth;
 use crate::deletion::Redaction;
 use crate::epoch::EpochKeys as _;
 use crate::message::seal_owner_tombstone;
-use crate::records::{Batch, RedactionDef, SealedMessageDef, nsid};
 use crate::store::{KeyPublisher, MailboxStore, TimeRange};
 use crate::{Error, Result};
 
@@ -93,35 +92,11 @@ impl Labyrinth {
             Redaction::sign(&self.did, thread_id, message_id, self.transport.as_ref());
         redaction.redacted_at = Some(self.now());
 
-        let stored = match self
+        let stored = self
             .b
             .threads
             .redact_item(thread_id, message_id, &redaction)
-            .await
-        {
-            Ok(n) => n,
-            Err(Error::NotFound(_)) if !pending.is_empty() => {
-                // A receiver may already have archived a witness copy even
-                // though the author's ciphertext never left this outbox.
-                // Publish a standalone tombstone before dropping that queue
-                // entry so the witness cannot resurrect it.
-                let mut item = SealedMessageDef::from_message(&pending[0]);
-                item.signed_enc_message.0.clear();
-                item.sequencer_receipt = None;
-                item.redaction = Some(RedactionDef::from_redaction(&redaction));
-                self.b
-                    .threads
-                    .append_batch(&Batch {
-                        type_: nsid::BATCH.into(),
-                        thread_id: thread_id.to_owned(),
-                        items: vec![item],
-                        created_at: self.now(),
-                    })
-                    .await?;
-                0
-            }
-            Err(e) => return Err(e),
-        };
+            .await?;
 
         if !pending.is_empty() {
             if let Some(q) = self.outbox.get_mut(thread_id) {

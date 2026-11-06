@@ -2,6 +2,8 @@
 
 **What this is.** This crate implements Meta's *Labyrinth Encrypted Message Storage Protocol*, version 1.1 ("Minos", whitepaper "Version 2", April 2026). The goal is end-to-end-encrypted chat **history** for Catbird. Catbird's chat runs on MLS through `mls-ds`, our delivery service on atproto. The whitepaper leaves several choices to the implementer and is written around Facebook identities. This document fixes every such choice for Catbird. **We do not claim wire compatibility with Messenger.** Meta publishes no test vectors; ours are in `tests/vectors/`.
 
+**Profile status (2026-11-06).** Stress Fix Round 3 is provisional until `clean-slate-2026-10-31` merges. G1–G16 are pending execution; this specification does not treat source review or local tests as completed stress gates.
+
 Primary sources:
 - Labyrinth v1 (Dec 2023): <https://engineering.fb.com/wp-content/uploads/2023/12/TheLabyrinthEncryptedMessageStorageProtocol_12-6-2023.pdf>
 - Labyrinth v1.1 (Apr 2026): <https://engineering.fb.com/wp-content/uploads/2026/05/Minos-Updates-2026-Encrypted-Backups-White-Paper.pdf>
@@ -180,11 +182,11 @@ prev_sig = XEdDSA(prevSigPriv, "minos.unstructured_signature.epoch_prev:" || epo
   - above epoch 0, its `prev_sig` verifies under epoch `seq - 1`'s mailbox signing key, re-derived by backward-chaining from the secret;
   - its attesting key is one of the account's chat devices in the `MailboxDirectory`, current or removed (a removed sibling may have opened it; peers still apply [CB-18]).
   - The client keeps that verified copy (`Labyrinth::latest_public`) in memory instead of re-reading the mailbox. Offline restarts verify mailbox-only invariants immediately and finish the directory attester check on the next `sync_epochs` or roster resolution.
-- **[CB-19] Discovery.** The latest `epochPublic` is published as `blue.catbird.labyrinth.mailboxKeys/self` in the account's **public** PDS repo (plus immutable `mailboxKeys/<12-digit epochNumber>` copies) AND anchored on `mls-ds`'s append-only `EpochPublicHeader` chain (`L-F01` `floor_seq`, `Gate 6`).
-- **[CB-29] Peer epoch pinning.** A sender pins, per DID it addresses, the newest `(epochNumber, epochHead, signingPubkey)` it has accepted, and immediately checkpoints the pin via `StateSink` / `export_state()` (§9.3) before any network flush:
+- **[CB-19] Discovery and durable publication.** The latest `epochPublic` is published as `blue.catbird.labyrinth.mailboxKeys/self` in the account's public PDS repo (plus immutable `mailboxKeys/<12-digit epochNumber>` copies) and anchored on mls-ds's append-only `EpochPublicHeader` chain. A locally opened epoch stays pending until both sources exactly match. Session open and sync retry the pending publication; native status exposes its epoch, stalled/error state and retry count, while archive work remains queued.
+- **[CB-29] Per-device peer epoch pinning.** Each device pins, per addressed DID, the newest `(epochNumber, epochHead, signingPubkey)` it accepted and checkpoints the pin before network flush:
   - an offered epoch older than the pin, or with the pinned number but another head, fails with `EpochRollback`;
-  - a newer epoch is accepted only if the `prev_sig` chain from the pinned head verifies through every intermediate epoch, fetched with `MailboxDirectory::epoch(did, seq)` (at most 4,096 epochs per advance);
-  - first contact is cross-checked by `CompositeDirectory` across PDS and `mls-ds`.
+  - a newer epoch is accepted only through a `prev_sig` chain for which the public PDS and mls-ds provide the exact same intermediate epochs;
+  - pins are not inherited by a restored device. Its first contact repeats strict exact two-source agreement; missing/stale one-source data is `DirectoryIncomplete`, a fork fails closed, and neither failure is cached.
 
 ### 5.4 Epoch metadata and membership (p.28–29)
 
@@ -257,15 +259,13 @@ The bundle (`blue.catbird.labyrinth.virtualDevice`) is AEAD-sealed (`Suite::Dndk
 |---|---|---|
 | `deviceKeyPriv` | 32-byte XEdDSA secret | `virtual_device:virtual_device_private_key` |
 | `epochStorageKeyPriv` | 96-byte `HawkEncSecret` (`x25519 \|\| mlkem_seed`) | `virtual_device:epoch_storage_private_key` |
-| `mailboxRootSalt` | 32 bytes | `virtual_device:mailbox_root_key` |
 | `epochRootKey` | 32 bytes | `virtual_device:epoch_root_key` |
 | `base64(seq)` | Base64 of decimal `seq` | `virtual_device:epoch_anon_id` |
-
 The bundle also publishes the virtual device's public record (`isVirtual = true`, `sigStorage` signed under use-case byte `0x32`, `Gate 2`) and its `epochMember` record. The bundle seals the epoch's sequence number; a restoring device looks up `space_epoch_id(seq)` in the mailbox Space.
 
 ### 6.3 Atomic enrollment from a recovery code (`Gate 3`)
 
-1. Fetch the bundle by `vdeviceId`, check expiry ([CB-39]), and decrypt it under `vdeviceKey`.
+1. Fetch the bundle by `vdeviceId` and decrypt it under `vdeviceKey`. A keychain or passkey method whose client-clock age is at least 180 days is marked stale but is not rejected; only an epoch rotation that excluded the virtual device makes the bundle unusable ([CB-39]).
 2. Forward-chain with the virtual device's `HawkEncSecret` to the newest reachable epoch `E`, then run `verified_own` ([CB-43]) and `check_candidate_integrity` ([CB-28]) against `CompositeDirectory`.
 3. Generate fresh physical device keys (`DeviceSecrets::generate()`) bound to the caller's current chat transport key ([CB-36]).
 4. Open `E + 1` via `open_next_enrolling` (carrying over every valid unrevoked member of `E` plus the newly enrolled physical device, signed under `E`'s mailbox signing key) and commit `touchVirtualDevice` + `device` + `epoch(E+1)` + `epochMember`s in one atomic `com.atproto.space.applyWrites` (`MailboxStore::atomic_enroll`), then publish `mailboxKeys` for `E + 1`.
@@ -278,10 +278,11 @@ Each recovery mechanism gets its own virtual device. This crate provides helpers
 
 A PIN vault (HSM or Juicebox) is out of scope for the first release.
 
-**[CB-39] Recovery-method lifecycle** (decision J2 defaults, paper p.46). `Labyrinth::list_recovery_methods` lists every bundle with its mechanism, `createdAt`, `lastUsedAt` and expiry:
-- `keychain` and `passkey` bundles, which a platform stores for the user, expire 180 days (`AUTO_RECOVERY_TTL_MS`) after `max(createdAt, lastUsedAt)`; `code` and `otc` bundles never expire.
+**[CB-39] Recovery-method lifecycle** (Stress Fix Round 3, superseding decision J2's local-clock failure, paper p.46). `Labyrinth::list_recovery_methods` lists every bundle with its mechanism, `createdAt`, `lastUsedAt` and advisory staleness:
+- `keychain` and `passkey` bundles become stale 180 days (`AUTO_RECOVERY_TTL_MS`) after `max(createdAt, lastUsedAt)`; `code` and `otc` bundles do not become stale.
+- A stale bundle may restore. `Enrollment.stale_recovery_method` tells the app to prompt for rotation or replacement. Local time alone never returns `Expired`, deletes the bundle or removes its member.
 - A restore touches its bundle (`lastUsedAt` updated atomically inside `atomic_enroll`); the app may also call `touch_recovery_method` when it confirms its keychain copy still exists.
-- `remove_recovery_method` revokes the virtual device (rotating to a new epoch without it) and then deletes the bundle (`delete_virtual_device`); `remove_expired_recovery_methods` does this for every expired bundle by the client clock.
+- `remove_recovery_method` revokes the virtual device by opening a new epoch without it, then deletes the bundle. That shared rotation is the authoritative expiry boundary: an excluded virtual device can no longer reach the new epoch.
 
 ### 6.5 Hybrid post-quantum one-time code (`CPace + ML-KEM-768`, `I16`, `Gate 3`)
 
@@ -289,11 +290,10 @@ A PIN vault (HSM or Juicebox) is out of scope for the first release.
   1. **Initiator (new device):** generates `(dk_otc, ek_otc) = ML-KEM-768.KeyGen()`, sets `ad_a = sha256(ek_otc)`, and sends `InitiatorMessage { sid, ya, ek_otc, ad_a }`.
   2. **Responder (enrolled device):** consumes 1 of 3 attempts, encapsulates `(kem_ct, mlkem_ss) = ML-KEM-768.Encaps(ek_otc)`, sets `ad_b = sha256(kem_ct)`, computes `cpace_isk = CPace_ISK(ya, ad_a, yb, ad_b)`, derives `otc_seal_key = kdf(cpace_isk || mlkem_ss, MINOS_SALT, "catbird.labyrinth.otc.pq.v2")`, and returns `ResponderMessage { yb, kem_ct, ad_b }` plus `OtcPayload` AEAD-sealed (`0x02` DNDK-GCM, AAD `"otc_payload"`).
   3. **Initiator:** decapsulates `mlkem_ss`, derives `otc_seal_key`, opens `OtcPayload`, verifies `E` against the mailbox and `CompositeDirectory`, and atomically rotates `E -> E + 1` (`Gate 3`, optionally consuming `otcSession/<rkey>` in the same `applyWrites`).
-- **[CB-26] Payload encoding (version `0x02`, big-endian, no trailing bytes):**
+- **[CB-26] Payload encoding (clean-slate version `0x03`, big-endian, no trailing bytes):**
 
 ```
-0x02                     format version (ORF-free PQ clean-slate; 0x01 rejected)
-mailboxRootSalt    (32)
+0x03                     format version (v1/v2 rejected)
 epochRootKey       (32)
 epochSequenceID    (u64, 8)
 len(epochID)       (u16, 2)    at most 512
@@ -404,11 +404,12 @@ ct  = hawk_encrypt(recip.encPub, ephPriv, ephPub, aad, mek)
 
 ### 7.4 Loading (p.41)
 
-To read a message:
+To read a committed message:
 1. Find the MEK by `mekId` in the conversation's MEK records ([CB-21]) and open it under the mailbox encryption key of the epoch it was addressed to (§7.3).
 2. Check the AAD fields against the record.
-3. Verify `sig` and that the sender key is one of the sender's MLS devices: a current one, or one active at the `I13` `SequencerReceipt`'s `seq` / `issued_at_ms` ([CB-27]). A conversation whose receipt key resolves rejects items without a receipt (`ReceiptCommitmentMismatch`). Only where no receipt key resolves does the removal bound fall back to the message's timestamp.
-4. Decrypt the message and remove the padding.
+3. Verify the sequencer receipt under the exact method it names: `{sequencerDid}#mls-receipt-N`, where `N` is canonical positive decimal. The first valid receipt durably sets `receipts_required` for the conversation and stores its authority plus P-256 SEC1 bytes by key ID. Rotation retains prior methods; a key ID is immutable and never reused. Removing a current DID-document method never restores receiptless/timestamp fallback.
+4. Verify `OriginalSenderAttestation`: Ed25519 by the original sender device over `catbird.labyrinth.original_sender_archive.v1\0`, the length-prefixed thread and message IDs, and the 32-byte archive commitment. Its `senderDid`, `senderDeviceId` and 32-byte transport key must name one historical device key and conversation leaf active at the receipt's `seq` / `issuedAtMs` ([CB-27]). The receipt sender and a freshly decrypted MLS sender must equal the attestation sender/device. A witness, batch author and sequencer cannot substitute for it.
+5. Open the committed sender ciphertext, verify the archive commitment against its nonce and frame, and remove the padding.
 
 **Lookups.** `load_message(thread, messageId)` returns every copy of one message (`ThreadStore::get_messages` / `MailboxStore::get_owner_messages`). `load_thread_page(thread, before, limit)` returns the `limit` newest messages older than the cursor, newest first, decrypting only their copies.
 - Each message has one position, taken from all of its copies: its sender copy's earliest `(timestamp, messageId)`, else its earliest witness copy's, else its earliest owner copy's. A witness stamps its receive time, so copies of one message can carry different timestamps.
@@ -417,15 +418,13 @@ To read a message:
 
 `list_threads()` lists the threads this account has history in from its own records: MEKs it wrote or was addressed in, and its owner archive, so a restored device finds conversations it has left or been removed from.
 
-**Witness copies.** A member that received and verified another member's committed message may archive the same frame, nonce and receipt in its own repo (`archive_outgoing_committed`, sealed under its own chat key and receive-time MLS roster). The reader runs the unchanged checks: the sealing key must be one of the **archiving** member's chat devices at the receipt's order. It then attributes the message to the receipt's sender, never to the witness (`MessageSource::Witness`).
+**Witness copies.** A member that received and verified another member's committed message may archive the same frame, nonce, receipt and `OriginalSenderAttestation` in its own repo (`archive_outgoing_committed`, sealed under its own chat key and receive-time MLS roster). The witness authenticates its archive act, but original sender identity comes only from the retained sender attestation (`MessageSource::Witness`).
 
-**Duplicates [CB-31] and witness acceptance.** A thread can hold several copies of one `messageId`: a sender copy, witness copies, an attributed or legacy unattributed owner-archive copy, or a different member reusing the ID.
-1. Sender and owner copies are accepted as they are.
-2. Nothing authenticates the message ID a witness files a copy under (the receipt's `entryId` is mls-ds's own). In the store's order, a witness copy is accepted only if it equals an accepted copy with its ID (same frame, nonce, receipt and sender), or if no accepted copy holds its ID or its receipt's entry. Otherwise it goes to `ThreadHistory::rejected` (`Rejection::Contradicts` or `Rejection::ReceiptReused`), and is never returned, flagged or re-attributed.
-3. Accepted copies merge in this order: the author's own sender copy, then the earliest witness copy, then attributed owner copies (`0x02`/`0x03`), then legacy unattributed owner copies (`0x00`/v3). Copies merge only when their frames are byte-equal, their senders agree (or one is unattributed), and, when both are committed, their receipts and nonces are equal.
-4. Any other duplicate `messageId` among sender and owner copies is returned with `conflict = true`, so neither an insider nor a corrupt owner copy can silently rewrite sender attribution.
-
-A verified unsend or account-deletion redaction for `(messageId, sender)` also hides that sender's witness and owner copies.
+**Duplicates [CB-31] and witness acceptance.** A thread can hold several copies of one `messageId`: a sender copy, witness copies, an attributed owner-archive copy, or a different member reusing the ID.
+1. Every committed copy must pass its sender attestation, receipt, commitment and historical-key checks before deduplication.
+2. Copies merge only when their original-sender attestations, frames, nonces, receipts and commitments are byte-equal. The author's own sender copy wins, then the earliest equal witness copy, then attributed owner copies.
+3. A witness contradiction or receipt reuse goes to `ThreadHistory::rejected` and is never returned, flagged or re-attributed. Other authenticated sender/owner collisions are returned with `conflict = true`.
+4. A verified unsend or account-deletion redaction for `(original sender, messageId)` hides every accepted witness and owner copy with that identity.
 
 ### 7.5 Deletion and edits [CB-38]
 
@@ -434,9 +433,9 @@ Decision J1 defaults (`src/deletion.rs`, `src/client/delete.rs`):
 | Operation | Mechanism | Who sees what |
 |---|---|---|
 | **Delete for me** (`delete_for_me`) | an owner-mode v5 tombstone (§7.1, kind `0x01`) in the reader's personal mailbox Space, with the target's `messageId`, `timestamp`, and optional author DID | every device of the account hides matching messages (`ThreadHistory::deleted_for_me`); author-scoped tombstones match attributed sender and attributed owner copies of that author without hiding another sender's copy |
-| **Unsend** (`unsend`) | the author's signed `redaction` replaces the item's `signedEncMessage` (now empty) inside the author's Space `batch` record (`ThreadStore::redact_item`) | every reader gets `ThreadHistory::redacted`, with `by_author = true` iff an active chat key of the author signed `"catbird.labyrinth.redaction:did=" \|\| did \|\| ";message_id=" \|\| id \|\| ";thread_id=" \|\| hex(threadId)` |
-| **Account deletion, DS redaction** | when an account deletes its chat identity, the conversation's sequencer DS signs a `redaction` (`by = sequencerDid`, `reason = "accountDeleted"`, `redactedAt`, `sig` over `"catbird.labyrinth.ds_redaction:..."`) | readers resolve `MailboxDirectory::sequencer_key(thread)` for that conversation's `sequencerDid` (federation-aware) and set `RedactedMessage::account_deleted = true` iff `sig` verifies; unsigned or mismatched redactions fail closed. mls-ds does not write these overlays today: it sequences a signed `accountDeletedEntry`, and catbird-mls hides the deleted account's copies itself ([SPACE_CONVERSATIONS.md](SPACE_CONVERSATIONS.md), "Account deletion") |
-| **Account deletion** (`purge_account`) | redact/delete authored records across every conversation Space, retract directory heads (`PdsPublisher` + `mls-ds`), and `purge_mailbox` on the personal mailbox Space | local state and personal mailbox records are wiped; peers see the user's messages as removed |
+| **Unsend** (`unsend`) | an immutable `blue.catbird.labyrinth.redaction` record at the deterministic author/message key, carrying the author's signed redaction; the source `batch` and its ciphertext are never rewritten | readers apply the redaction to every sender, witness and owner copy with the same authenticated original-sender identity. Repeated/concurrent writes converge, and Space inventory, leave and account cleanup retain the record |
+| **Account deletion, DS redaction** | when an account deletes its chat identity, the conversation's sequencer DS signs a redaction (`by = sequencerDid`, `reason = "accountDeleted"`, `redactedAt`, signature) | readers verify it with the conversation's pinned, versioned sequencer-key history and hide every copy attributed to the deleted sender; missing or mismatched keys fail closed |
+| **Account deletion** (`purge_account`) | retain the deletion/redaction evidence needed by peers, delete the account's own conversation records, retract directory heads (`PdsPublisher` + mls-ds), and `purge_mailbox` on the personal mailbox Space | local state and personal mailbox records are wiped; peers keep durable evidence that the user's messages are removed |
 | **Edit** | frame level: a new message referencing the old id in the chat frame schema | Labyrinth stores both; the client applies the edit |
 
 ## 8. Space-native encrypted attachments (`Gate 5`, `2A` ORF retired)
@@ -460,13 +459,14 @@ Every record is a `blue.catbird.labyrinth.*` lexicon in `lexicons/blue/catbird/l
 | `device` | personal mailbox Space | `hex(deviceKeyPubkey)` | immutable except `revokedAt`, set once |
 | `epoch` | personal mailbox Space | `epochID` = 12-digit zero-padded seq ([CB-9]) | immutable (`delete_squatted_epoch` clears unanchored squats only, [CB-40]) |
 | `epochMember` | personal mailbox Space | `<12-digit seq>-<hex deviceKeyPubkey>` | immutable |
-| `virtualDevice` | personal mailbox Space | `hex(vdeviceId)` | immutable except `lastUsedAt`; deleted on removal |
+| `virtualDevice` | personal mailbox Space | `hex(vdeviceId)` | immutable except `lastUsedAt`; deleted after rotation removes it |
 | `otcSession` | personal mailbox Space | `<session_id_hex>` | ephemeral OTC handshake record, consumed atomically in `Gate 3` |
 | `ownerBatch` | personal mailbox Space | TID | append-only, one thread per batch |
 | `attachmentManifest` | conversation or personal mailbox Space | deterministic manifest key | immutable blob promotion + SHA-256 integrity manifest (`Gate 5`) |
 | `mailboxKeys` | **public** PDS repo | `self`, plus `<12-digit epochNumber>` per epoch | `self` updated on rotation; per-epoch copies immutable ([CB-19], [CB-29]) |
 | `mek` | conversation Space, sender's repo | `hex(mekId)` | immutable ([CB-21]) |
-| `batch` | conversation Space, sender's repo | `<16-hex-first-seq>-<tid>` (or TID when unstamped) | append-only (`Gate 4`, [CB-15]); items may be redacted in place |
+| `batch` | conversation Space, sender's repo | `<16-hex-first-seq>-<tid>` (or TID when unstamped) | immutable and append-only (`Gate 4`, [CB-15]) |
+| `redaction` | conversation Space, author's repo | deterministic original-sender/message key | immutable author unsend ([CB-38]) |
 
 Every `epochNumber` is bounded at 2⁴⁰. `mek#labyrinthSender` embeds the sender's full `epochPublic` (including `membersHash`, `self_sig`, and [CB-18] `attestation`).
 
@@ -475,19 +475,19 @@ Every `epochNumber` is bounded at 2⁴⁰. `mek#labyrinthSender` embeds the send
 All store traits (`MailboxStore`, `ThreadStore`, `MailboxDirectory`, `KeyPublisher`) are **`async`** (`#[async_trait]` on native targets requiring `Send + Sync`, and `#[async_trait(?Send)]` on `wasm32-unknown-unknown` via `MaybeSend`/`MaybeSync` marker traits so browser `JsFuture`/IndexedDB handles work without thread bounds):
 
 - `MailboxStore`: personal mailbox Space CRUD (`SpaceMailboxStore` in `src/store/space/`), atomic enrollment (`atomic_enroll`, `Gate 3`), safe squatted-epoch deletion (`delete_squatted_epoch`, [CB-40]), owner-batch paging, and `purge_mailbox`.
-- `ThreadStore`: conversation Space reads/writes (`SpaceThreadStore` in `src/store/space/thread.rs`; `ResolvingSpaceThreadStore` in `catbird-mls` adds the Space pins), ordered batch keys (`<16-hex-first-seq>-<tid>`), the `I13` `SequencerReceipt` on each sealed item (`SealedMessage::sequencer_receipt`, an `ArchivedReceipt`), and `redact_item`.
-- `MailboxDirectory`: `CompositeDirectory` cross-checking the public PDS `mailboxKeys` repo against `mls-ds`'s `EpochPublicHeader` chain (`epoch_chain` + `floor_seq`, `Gate 6`), MLS chat device transport keys (`device_transport_keys`, `member_device_keys`), and **per-conversation** sequencer verification keys (`sequencer_key(thread)` for `[CB-38]` DS redactions and `sequencer_receipt_key(thread)` for `I13` ES256 receipts, resolved from each conversation's `sequencerDid` and `{sequencerDid}#mls-receipt-1` DID document under federation).
-- `KeyPublisher`: publishes `EpochPublic` to the public PDS repo (`PdsPublisher`) and `mls-ds` (`DsDirectoryStore`).
+- `ThreadStore`: conversation Space reads/writes (`SpaceThreadStore` in `src/store/space/thread.rs`; `ResolvingSpaceThreadStore` in catbird-mls adds the Space pins), ordered batch keys (`<16-hex-first-seq>-<tid>`), immutable per-message redaction records, the `I13` `SequencerReceipt` and `OriginalSenderAttestation` on each committed item.
+- `MailboxDirectory`: `CompositeDirectory` strictly cross-checks public-PDS `mailboxKeys` against mls-ds's epoch chain, including first contact after restore. It supplies historical MLS chat-device keys/leaves keyed by immutable device ID and exact sequencer methods named `{sequencerDid}#mls-receipt-N` with canonical positive-decimal `N`. Conversation state durably stores `receipts_required` plus authority/P-256 SEC1 bytes by key ID; rotation retains prior methods, and key IDs are never reused.
+- `KeyPublisher`: publishes `EpochPublic` to the public PDS repo (`PdsPublisher`) and mls-ds (`DsDirectoryStore`).
 - `MemoryBackend` (`src/store/memory.rs`) and `MemorySpaceHost` (`src/store/space/host.rs`) provide in-memory reference implementations for deterministic tests. `mls-ds` stores **zero** Labyrinth ciphertext, MEKs, owner batches, virtual devices, or attachment blobs (`I14`, `I15`); its six remaining directory endpoints are in [MLSDS_BACKEND.md](MLSDS_BACKEND.md).
 
 **[CB-20] Batching.** Up to 256 messages per `batch`/`ownerBatch` record (flushing early near 900 KB JSON or when `mekId` changes; single-MEK sender batches), and up to 200 operations per `com.atproto.space.applyWrites` call (`MAX_WRITES`).
 
 ### 9.3 Client and crash-consistent persistence
 
-`client::Labyrinth` represents one enrolled device, holding `DeviceSecrets`, cached `EpochSecret`s, the local `revoked` set, `[CB-29]` `PeerPin`s, and cached `Mek`s.
+`client::Labyrinth` represents one enrolled device, holding `DeviceSecrets`, cached `EpochSecret`s, the local revoked set, per-device `[CB-29]` `PeerPin`s, receipt requirements/key history and cached MEKs.
 
-- **Persistence [CB-30] (`LBYS` version `0x03`):** `export_state()` serializes client state in version `0x03` (`96`-byte `HawkEncSecret`, `1,216`-byte `HawkEncPublic`, `0x30`/`0x32` `sigStorage`, verified-member set, pins, and MEKs; legacy versions `0x01`/`0x02` fail closed with `Error::Unsupported`) inside a `Zeroizing<Vec<u8>>` buffer. The encoding is canonical: every keyed collection (epochs, revoked, verified, pins, MEK threads) is written in ascending key order, so the same logical state always exports the same bytes and a load/save of unchanged state is a byte-identical no-op; `from_state` still accepts MEK threads in any order (blobs written before the ordered MEK cache).
-- **Immediate `StateSink` checkpointing:** Callers attach a synchronous `StateSink` (`with_state_sink` / `set_state_sink`, backed by SQLCipher `StateVault` in `catbird-mls`). Every mutation of `epochs`, `revoked`, `[CB-29]` `pins`, or minted/opened `meks` invokes `StateSink::save_state` **immediately** — before network batch flushes or directory `publish_keys` calls — eliminating the crash/jetsam window where a newly minted MEK, peer pin, or rotated epoch secret could be lost on flush failure. Outgoing frames are durably persisted inside the same SQLCipher write transaction as the MLS ratchet advance (`I6`) before network I/O.
+- **Persistence [CB-30] (`LBYS` version `0x04`):** `export_state()` serializes client state in clean-slate version `0x04`, including per-device peer pins, `receipts_required`, receipt authority and P-256 SEC1 bytes by key ID. `mailboxRootSalt` is absent. Versions `0x01`–`0x03` fail closed with no compatibility decoder.
+- **Immediate `StateSink` checkpointing:** Every mutation of epochs, revocations, peer pins, receipt requirements/history or MEKs checkpoints before network I/O. A pending epoch-head publication is also durable and retried on session open and sync until the PDS and DS exactly match. Native status reports pending epoch, stalled/error and retry count. Outgoing archive work remains queued throughout.
 
 ## 10. Security properties and residual paper limitations (p.47)
 
@@ -497,7 +497,7 @@ All store traits (`MailboxStore`, `ThreadStore`, `MailboxDirectory`, `KeyPublish
   - Virtual-device recovery bundles seal the 96-byte `HawkEncSecret` and 32-byte `epochRootKey` under a 256-bit HKDF key derived from ~170 bits of recovery-code entropy (§6.2).
   - One-time-code device transfers combine **CPace + ephemeral ML-KEM-768** (`§6.5`), keeping `epochRootKey` confidential even if a quantum adversary later learns the 6-digit code and breaks Ristretto255 discrete logs.
   - Classical `Ed25519`, `XEdDSA`, and `ES256` (`P-256`) signatures are used strictly for online authentication (`[CB-3]`, `[CB-18]`, `I13`), which a future quantum computer cannot retroactively forge against already-verified transcripts.
-- **Epoch truncation by a malicious Space host ([CB-28], `Gate 6`).** Mitigated by `CompositeDirectory` cross-checking the Space mailbox against both the public PDS `mailboxKeys` repo and `mls-ds`'s append-only `EpochPublicHeader` chain (`floor_seq`). The account's PDS hosts both the mailbox Space and `mailboxKeys`, so truncation requires that PDS and `mls-ds` to collude.
-- **First contact ([CB-29]).** `CompositeDirectory` requires PDS and `mls-ds` agreement on first contact, and `[CB-29]` pins (immediately checkpointed via `StateSink`) protect every subsequent send.
-- **Removed chat keys and ordering ([CB-27], `I13`, `Gate 4`).** Sequenced messages carry ES256 `SequencerReceipt`s (`#mls-receipt-1`, verified per conversation against that thread's `sequencerDid`) binding `(conversationId, seq, epoch, commitment, senderDevice, issuedAtMs)` and `<16-hex-first-seq>-<tid>` batch rkeys, preventing a removed device from backdating sequenced frames. A conversation whose receipt key resolves rejects unreceipted items. Only a conversation with no resolvable receipt key falls back to sender timestamps bounded by key removal time.
+- **Epoch truncation by a malicious Space host ([CB-28], `Gate 6`).** `CompositeDirectory` requires exact public-PDS and mls-ds agreement. Pins remain per-device; a restored device inherits none and repeats strict first contact. Missing or stale one-source data is `DirectoryIncomplete`, forks fail closed, and failures are not cached.
+- **First contact and publication ([CB-29]).** Per-device pins advance only through a chain both sources exactly verify. A locally opened epoch remains pending and is retried until both publications match; queued archive work is neither lost nor permitted to bypass the mismatch.
+- **Removed chat keys and ordering ([CB-27], `I13`, `Gate 4`).** Receipt methods are `{sequencerDid}#mls-receipt-N` with canonical positive-decimal `N`. The first valid receipt latches `receipts_required`; historical authority/P-256 SEC1 bytes remain available across method rotation/removal, and a key ID is immutable. The original sender's separate archive attestation supplies identity.
 - **Membership enumeration.** Space repo DIDs and `mek` recipient DIDs remain visible to conversation Space readers and the Space host, as in the paper.

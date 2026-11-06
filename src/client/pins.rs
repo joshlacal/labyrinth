@@ -1,18 +1,23 @@
 //! Peer epoch pinning ([CB-29]).
 //!
 //! A sender addresses MEKs to each roster member's *latest* epoch, as the
-//! [`crate::store::MailboxDirectory`] reports it. A directory (the peer's
-//! PDS) that replays an older, still-attested `epochPublic` would make the
-//! sender encrypt to keys a revoked device still holds. So the client pins,
-//! per DID it addresses, the newest `(seq, head)` it has accepted:
+//! [`crate::store::MailboxDirectory`] reports it. The production
+//! [`super::CompositeDirectory`] accepts a first-contact head only when PDS
+//! and mls-ds independently return the same signed chain. A stale or missing
+//! one-source result therefore fails closed with [`Error::DirectoryFork`] or
+//! [`Error::DirectoryIncomplete`].
+//!
+//! Pins deliberately remain per physical device: they are local rollback
+//! floors, not account-synchronized trust that another device can overwrite.
+//! A restored device has no inherited peer pins, so its first contact repeats
+//! the two-source agreement check before creating its own pin. After that the
+//! client pins, per DID it addresses, the newest `(seq, head)` it accepted:
 //!
 //! - an offered epoch older than the pin, or with the pinned `seq` but a
 //!   different head, fails with [`Error::EpochRollback`];
 //! - a newer epoch is accepted only through a verified `prev_sig` chain
 //!   from the pinned head, fetching every intermediate epoch from the
-//!   directory ([`crate::store::MailboxDirectory::epoch`]);
-//! - first contact is trust-on-first-use, anchored by the [CB-18]
-//!   attestation the caller has already checked.
+//!   directory ([`crate::store::MailboxDirectory::epoch`]).
 //!
 //! A peer that legitimately resets its mailbox (account purge, then a new
 //! genesis) fails the pin forever with [`Error::EpochRollback`]. The way
@@ -21,9 +26,6 @@
 //! which must be attested by a *current* chat device of the DID, and shows
 //! the old and new safety numbers; [`Labyrinth::repin_peer`] replaces the
 //! pin only with the head the user confirmed.
-//!
-//! Long term the latest heads should travel in MLS-authenticated group
-//! state, which removes the first-contact gap.
 
 use super::Labyrinth;
 use crate::mailbox::EpochPublic;

@@ -14,7 +14,7 @@ use labyrinth::Error;
 use labyrinth::client::{
     Labyrinth, LoadedMessage, MessageSource, Rejection, ThreadCursor, ThreadHistory,
 };
-use labyrinth::message::ArchivedReceipt;
+use labyrinth::message::{ArchivedReceipt, OriginalSenderArchiveAttestation};
 use labyrinth::protocol::receipt::{
     SequencerReceiptPayload, compute_archive_commitment, expected_receipt_key_id,
     sign_sequencer_receipt,
@@ -97,12 +97,25 @@ impl World {
         };
         let key_id = expected_receipt_key_id(SEQUENCER);
         let signed = sign_sequencer_receipt(&self.sequencer, &key_id, &payload).unwrap();
+        let sender_seed = match sender {
+            A => 1,
+            B => 2,
+            _ => panic!("sender fixture has no enrolled device key"),
+        };
+        let original_sender_attestation = OriginalSenderArchiveAttestation::sign(
+            sender.to_owned(),
+            DEVICE.to_owned(),
+            thread,
+            id,
+            &payload.archive_commitment,
+            &signer(sender_seed),
+        );
         Sent {
             id: id.to_owned(),
             sender,
             frame,
             nonce,
-            receipt: ArchivedReceipt::new(signed),
+            receipt: ArchivedReceipt::new(signed, original_sender_attestation),
         }
     }
 
@@ -266,16 +279,9 @@ fn tampered_witness_copies_are_never_attributed() {
     signature.signed.signature[0] ^= 1;
     let mut reattributed = m.receipt.clone();
     reattributed.signed.payload.sender_device_did_url = format!("{C}#{DEVICE}");
-    let tampered: [(&[u8], &[u8; 32], &ArchivedReceipt); 5] = [
+    let tampered: [(&[u8], &[u8; 32], &ArchivedReceipt); 2] = [
         (forged_frame, &m.nonce, &m.receipt),
         (&m.frame, &nonce, &m.receipt),
-        (&m.frame, &m.nonce, &signature),
-        (&m.frame, &m.nonce, &reattributed),
-        (
-            &other_thread.frame,
-            &other_thread.nonce,
-            &other_thread.receipt,
-        ),
     ];
     for (frame, nonce, receipt) in tampered {
         block_on(carol.archive_outgoing_committed_unchecked_for_test(
@@ -283,19 +289,39 @@ fn tampered_witness_copies_are_never_attributed() {
         ))
         .unwrap();
     }
-    // A genuine copy replayed under another message id: rejected, and the
-    // genuine copy is neither flagged nor replaced (ruling 3).
+    assert!(
+        block_on(carol.archive_outgoing_committed_unchecked_for_test(
+            THREAD, &roster, "m1", 150, &m.nonce, &m.frame, &signature,
+        ))
+        .is_err()
+    );
+    assert!(
+        block_on(carol.archive_outgoing_committed_unchecked_for_test(
+            THREAD,
+            &roster,
+            "m1",
+            150,
+            &m.nonce,
+            &m.frame,
+            &reattributed,
+        ))
+        .is_err()
+    );
+    // A genuine copy replayed under another message id is rejected before it
+    // enters any member repo.
     archive(&mut carol, &all, &w.sequence(A, "m2"), 160);
-    block_on(carol.archive_outgoing_committed(
-        THREAD,
-        &roster,
-        "m2-replay",
-        170,
-        &m.nonce,
-        &m.frame,
-        &m.receipt,
-    ))
-    .unwrap();
+    assert!(
+        block_on(carol.archive_outgoing_committed(
+            THREAD,
+            &roster,
+            "m2-replay",
+            170,
+            &m.nonce,
+            &m.frame,
+            &m.receipt,
+        ))
+        .is_err()
+    );
     block_on(carol.flush()).unwrap();
 
     let h = load(&mut bob);
@@ -306,7 +332,7 @@ fn tampered_witness_copies_are_never_attributed() {
             ("m2", Some(A), MessageSource::Witness, 160, false),
         ]
     );
-    assert_eq!(rejected(&h), [("m2-replay", Rejection::ReceiptReused)]);
+    assert!(rejected(&h).is_empty());
     assert_exact(&h.messages[0], &m);
     let mut errors: Vec<String> = h
         .undecryptable
@@ -320,13 +346,7 @@ fn tampered_witness_copies_are_never_attributed() {
     errors.sort();
     assert_eq!(
         errors,
-        [
-            "BadSignature",
-            "BadSignature",
-            "Malformed(\"receipt conversation_id mismatch\")",
-            "ReceiptCommitmentMismatch",
-            "ReceiptCommitmentMismatch",
-        ]
+        ["ReceiptCommitmentMismatch", "ReceiptCommitmentMismatch"]
     );
 }
 
@@ -397,7 +417,7 @@ fn redactions_and_tombstones_suppress_witness_copies() {
     // Bob's witness copies (a2 and a4 she never archived), so no copy of
     // her messages survives; an unsend stays an unsend.
     w.net.set_sequencer(SEQUENCER, Some([7; 32]));
-    assert_eq!(w.net.delete_account_data(A), 5);
+    assert_eq!(w.net.delete_account_data(A), 6);
     let h = load(&mut bob);
     assert!(h.messages.is_empty(), "{:?}", summary(&h));
     let redacted: Vec<_> = h
@@ -508,14 +528,20 @@ fn unflushed_pre_kick_history_survives_removal_through_witness_copies() {
     }
 }
 
-/// `lab` files a witness copy of `m`'s exact frame, nonce and receipt under
-/// another message id: every check that a receipt can make passes.
-fn relabel(lab: &mut Labyrinth, members: &[&str], id: &str, m: &Sent, ts: u64) {
+/// A malicious sequencer/member cannot file a genuine sender-attested frame
+/// under another message id.
+fn relabel(
+    lab: &mut Labyrinth,
+    members: &[&str],
+    id: &str,
+    m: &Sent,
+    ts: u64,
+) -> labyrinth::Result<()> {
     let roster = block_on(lab.resolve_roster(members)).unwrap();
     block_on(
         lab.archive_outgoing_committed(THREAD, &roster, id, ts, &m.nonce, &m.frame, &m.receipt),
     )
-    .unwrap();
+    .map(|_| ())
 }
 
 /// Ruling 3: a witness copy that contradicts the sender's own copy or an
@@ -523,7 +549,7 @@ fn relabel(lab: &mut Labyrinth, members: &[&str], id: &str, m: &Sent, ts: u64) {
 /// receipt, is rejected; it never flags, replaces or re-attributes the
 /// genuine copy, and re-archiving never launders it into the owner archive.
 #[test]
-fn contradicting_witness_copies_are_rejected_not_conflicts() {
+fn original_sender_attestation_rejects_relabelled_witness_copies() {
     let w = World::new();
     let mut alice = w.join(A, 1);
     let mut bob = w.join(B, 2);
@@ -536,11 +562,12 @@ fn contradicting_witness_copies_are_rejected_not_conflicts() {
     // Alice never flushes m2; Bob's witness copy is the first one admitted.
     archive(&mut bob, &all, &m2, 210);
     block_on(bob.flush()).unwrap();
-    // Carol relabels genuine copies (one backdated before Bob's) and also
-    // files one identical copy.
-    relabel(&mut carol, &all, "m1", &m2, 120);
-    relabel(&mut carol, &all, "m2", &m1, 50);
-    relabel(&mut carol, &all, "m9", &m2, 230);
+    // Carol controls a member repo and colludes with the sequencer, but does not
+    // possess Alice's historical device key. Exact sender attestations reject
+    // every changed message id before any witness record is written.
+    assert!(relabel(&mut carol, &all, "m1", &m2, 120).is_err());
+    assert!(relabel(&mut carol, &all, "m2", &m1, 50).is_err());
+    assert!(relabel(&mut carol, &all, "m9", &m2, 230).is_err());
     archive(&mut carol, &all, &m2, 205);
     block_on(carol.flush()).unwrap();
 
@@ -556,15 +583,7 @@ fn contradicting_witness_copies_are_rejected_not_conflicts() {
         );
         assert_exact(&h.messages[0], &m1);
         assert_exact(&h.messages[1], &m2);
-        assert_eq!(
-            rejected(&h),
-            [
-                ("m2", Rejection::Contradicts),
-                ("m1", Rejection::Contradicts),
-                ("m9", Rejection::ReceiptReused),
-            ]
-        );
-        assert!(h.rejected.iter().all(|r| r.sender.as_deref() == Some(A)));
+        assert!(rejected(&h).is_empty());
         let one = block_on(lab.load_message(THREAD, "m1")).unwrap();
         assert_eq!(
             summary(&one),
@@ -572,7 +591,7 @@ fn contradicting_witness_copies_are_rejected_not_conflicts() {
         );
         let alias = block_on(lab.load_message(THREAD, "m9")).unwrap();
         assert!(alias.messages.is_empty());
-        assert_eq!(rejected(&alias), [("m9", Rejection::ReceiptReused)]);
+        assert!(alias.rejected.is_empty());
         let mut cursor: Option<ThreadCursor> = None;
         let mut paged_messages = Vec::new();
         let mut paged_rejections = Vec::new();
@@ -592,7 +611,7 @@ fn contradicting_witness_copies_are_rejected_not_conflicts() {
         }
         paged_messages.sort();
         assert_eq!(paged_messages, ["m1", "m2"]);
-        assert!(paged_rejections.contains(&("m9".to_owned(), Rejection::ReceiptReused)));
+        assert!(paged_rejections.is_empty());
     }
 
     // Re-archiving keeps exactly the accepted copies.
@@ -812,11 +831,11 @@ fn active_space_deconfliction_ignores_owner_alias_but_keeps_tombstones() {
     let all = [A, B, C];
     let message = w.sequence(A, "m1");
 
-    relabel(&mut bob, &all, "m9", &message, 100);
-    block_on(bob.flush()).unwrap();
+    assert!(relabel(&mut bob, &all, "m9", &message, 100).is_err());
+    assert!(block_on(bob.flush()).unwrap().is_empty());
     assert_eq!(
         block_on(bob.rearchive_thread_before_leave(THREAD)).unwrap(),
-        1
+        0
     );
     block_on(w.net.threads(B).clear_records(THREAD)).unwrap();
     archive(&mut carol, &all, &message, 200);

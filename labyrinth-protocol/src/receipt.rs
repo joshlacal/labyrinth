@@ -1,5 +1,5 @@
 //! `I13` blinded `archive_commitment` (`HMAC-SHA256`) and ES256 sequencer receipts
-//! (`b"catbird-mls-sequencer-receipt-v2\0"`, `{SERVICE_DID}#mls-receipt-1`).
+//! (`b"catbird-mls-sequencer-receipt-v2\0"`, `{SERVICE_DID}#mls-receipt-N`).
 
 use hmac::{Hmac, Mac as _};
 use p256::ecdsa::{
@@ -137,9 +137,47 @@ mod sig64_serde {
     }
 }
 
-/// Expected verification method ID `{sequencer_did}#mls-receipt-1`.
+/// First verification method ID `{sequencer_did}#mls-receipt-1`.
+///
+/// New keys increment the final decimal generation and retain every prior
+/// method; a generation is never assigned to different key bytes.
 pub fn expected_receipt_key_id(sequencer_did: &str) -> String {
     format!("{sequencer_did}{RECEIPT_VERIFICATION_FRAGMENT}")
+}
+
+/// Validate an exact receipt verification method and return its positive,
+/// canonical decimal generation.
+pub fn receipt_key_generation(sequencer_did: &str, key_id: &str) -> Result<u64> {
+    let Some((authority, fragment)) = key_id.split_once('#') else {
+        return Err(ProtocolError::ReceiptKeyIdMismatch {
+            expected: format!("{sequencer_did}#mls-receipt-<generation>"),
+            got: key_id.to_owned(),
+        });
+    };
+    let Some(generation) = fragment.strip_prefix("mls-receipt-") else {
+        return Err(ProtocolError::ReceiptKeyIdMismatch {
+            expected: format!("{sequencer_did}#mls-receipt-<generation>"),
+            got: key_id.to_owned(),
+        });
+    };
+    if authority != sequencer_did
+        || generation.is_empty()
+        || generation.starts_with('0')
+        || !generation.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(ProtocolError::ReceiptKeyIdMismatch {
+            expected: format!("{sequencer_did}#mls-receipt-<generation>"),
+            got: key_id.to_owned(),
+        });
+    }
+    generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or_else(|| ProtocolError::ReceiptKeyIdMismatch {
+            expected: format!("{sequencer_did}#mls-receipt-<generation>"),
+            got: key_id.to_owned(),
+        })
 }
 
 /// Sign a `SequencerReceiptPayload` with ES256 (`sig.normalize_s()` low-S canonical).
@@ -149,13 +187,7 @@ pub fn sign_sequencer_receipt(
     payload: &SequencerReceiptPayload,
 ) -> Result<SignedSequencerReceipt> {
     payload.validate_structure()?;
-    let expected_kid = expected_receipt_key_id(&payload.sequencer_did);
-    if key_id != expected_kid {
-        return Err(ProtocolError::ReceiptKeyIdMismatch {
-            expected: expected_kid,
-            got: key_id.to_string(),
-        });
-    }
+    receipt_key_generation(&payload.sequencer_did, key_id)?;
     let transcript = payload.canonical_signing_bytes(key_id);
     let raw_sig: Signature = sk.sign(&transcript);
     let normalized = raw_sig.normalize_s().unwrap_or(raw_sig);
@@ -167,8 +199,8 @@ pub fn sign_sequencer_receipt(
     })
 }
 
-/// Verify a `SignedSequencerReceipt` against `expected_sequencer_did` and its
-/// `{expected_sequencer_did}#mls-receipt-1` P-256 verifying key.
+/// Verify a `SignedSequencerReceipt` against `expected_sequencer_did` and the
+/// exact P-256 verification method named by `receipt.key_id`.
 pub fn verify_sequencer_receipt(
     pk: &VerifyingKey,
     expected_sequencer_did: &str,
@@ -181,13 +213,7 @@ pub fn verify_sequencer_receipt(
             got: receipt.payload.sequencer_did.clone(),
         });
     }
-    let expected_kid = expected_receipt_key_id(expected_sequencer_did);
-    if receipt.key_id != expected_kid {
-        return Err(ProtocolError::ReceiptKeyIdMismatch {
-            expected: expected_kid,
-            got: receipt.key_id.clone(),
-        });
-    }
+    receipt_key_generation(expected_sequencer_did, &receipt.key_id)?;
     let sig = Signature::from_slice(&receipt.signature)
         .map_err(|_| ProtocolError::BadReceiptSignature)?;
     let normalized = sig.normalize_s().unwrap_or(sig);

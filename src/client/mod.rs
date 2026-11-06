@@ -16,10 +16,10 @@
 //!
 //! The client is synchronous and holds no locks; callers serialize access
 //! to one instance (the store traits explain why). Its state (device
-//! secrets, epoch cache, revoked set, peer pins, MEK cache) survives a
-//! restart through [`Labyrinth::export_state`] / [`Labyrinth::from_state`]
-//! ([`state`]); the exported bytes are secret and belong in the keychain or
-//! SQLCipher.
+//! secrets, epoch cache, revoked set, peer pins, receipt key history and MEK
+//! cache) survives a restart through [`Labyrinth::export_state`] /
+//! [`Labyrinth::from_state`] ([`state`]); the exported bytes are secret and
+//! belong in the keychain or SQLCipher.
 //!
 //! Before using anyone's epoch keys the client checks [CB-18]: the
 //! epoch's attestation key must be one of that DID's chat devices as the
@@ -52,7 +52,7 @@ pub use read::{
     LoadedMessage, MessageSource, RedactedMessage, RejectedCopy, Rejection, ThreadHistory,
     Undecryptable,
 };
-pub use recovery::{AUTO_RECOVERY_TTL_MS, RecoveryMethod, recovery_expiry};
+pub use recovery::{AUTO_RECOVERY_TTL_MS, RecoveryMethod, recovery_stale_at};
 pub use send::{ArchiveOutcome, FlushedBatch, ResolvedRoster, RosterExclusion};
 
 use crate::device::{DevicePublic, DeviceSecrets};
@@ -74,8 +74,8 @@ pub trait Clock: MaybeSend + MaybeSync {
 }
 
 /// Durable callback invoked synchronously whenever [`Labyrinth`]'s exportable
-/// state (`epochs`, `revoked`, `pins`, `meks`) mutates, closing the crash window
-/// between state/key mutation and caller-side `export_state()` persistence (`[CB-30]`).
+/// state mutates, closing the crash window between security state/key mutation
+/// and caller-side `export_state()` persistence (`[CB-30]`).
 pub trait StateSink: MaybeSend + MaybeSync {
     fn save_state(&self, exported_state: &[u8]) -> Result<()>;
 }
@@ -107,6 +107,12 @@ pub struct Backends {
     pub clock: Box<dyn Clock>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReceiptTrust {
+    authority: String,
+    keys: BTreeMap<String, Vec<u8>>,
+}
+
 /// One enrolled device of one account.
 pub struct Labyrinth {
     did: String,
@@ -114,7 +120,8 @@ pub struct Labyrinth {
     transport: Box<dyn TransportSigner>,
     b: Backends,
     state_sink: Option<Box<dyn StateSink>>,
-    mailbox_root_salt: [u8; 32],
+    /// An epoch head which must still reach every configured directory.
+    pending_directory_publication: Option<u64>,
     /// Epoch secrets this device holds, by sequence number.
     epochs: BTreeMap<u64, EpochSecret>,
     /// Newest epoch this device has reached.
@@ -142,6 +149,10 @@ pub struct Labyrinth {
     /// [`Labyrinth::export_state`] bytes are canonical: the same logical
     /// state always exports identically, across reloads and processes.
     meks: BTreeMap<String, Vec<Mek>>,
+    /// Per-conversation receipt enforcement latch and immutable historical
+    /// verification methods. A non-empty entry permanently disables
+    /// receiptless fallback for that conversation.
+    receipt_trust: BTreeMap<String, ReceiptTrust>,
     outbox: BTreeMap<String, Vec<SealedMessage>>,
     /// Canonical `(DID, epoch head)` roster under which each sender buffer's
     /// MEK was distributed. Flush revalidates it so a queued ciphertext
@@ -171,7 +182,6 @@ impl Labyrinth {
         device: DeviceSecrets,
         transport: Box<dyn TransportSigner>,
         b: Backends,
-        mailbox_root_salt: [u8; 32],
         epochs: impl IntoIterator<Item = EpochSecret>,
     ) -> Result<Self> {
         if b.mailbox.owner() != did || b.threads.author() != did {
@@ -185,7 +195,7 @@ impl Labyrinth {
             transport,
             b,
             state_sink: None,
-            mailbox_root_salt,
+            pending_directory_publication: None,
             epochs,
             latest,
             own_latest: None,
@@ -195,14 +205,15 @@ impl Labyrinth {
             verified: (latest, BTreeSet::new()),
             pins: BTreeMap::new(),
             meks: BTreeMap::new(),
+            receipt_trust: BTreeMap::new(),
             outbox: BTreeMap::new(),
             outbox_rosters: BTreeMap::new(),
             owner_outbox: BTreeMap::new(),
         })
     }
 
-    /// Attach a durable [`StateSink`] so `export_state()` is persisted immediately
-    /// whenever `MEK`s, `[CB-29]` peer pins, `epochs`, or `revoked` mutate (`[CB-30]`).
+    /// Attach a durable [`StateSink`] so every exportable security-state
+    /// mutation is persisted immediately (`[CB-30]`).
     pub fn set_state_sink(&mut self, sink: Box<dyn StateSink>) {
         self.state_sink = Some(sink);
     }
@@ -219,6 +230,75 @@ impl Labyrinth {
             sink.save_state(&exported)?;
         }
         Ok(())
+    }
+
+    pub(super) async fn receipt_required(&self, thread_id: &str) -> Result<bool> {
+        if self.receipt_trust.contains_key(thread_id) {
+            return Ok(true);
+        }
+        Ok(self
+            .b
+            .directory
+            .sequencer_receipt_key(thread_id)
+            .await?
+            .is_some())
+    }
+
+    /// Verify the exact receipt method and durably pin its bytes before the
+    /// caller accepts or archives the record.
+    pub(super) async fn verify_and_remember_receipt(
+        &mut self,
+        thread_id: &str,
+        receipt: &labyrinth_protocol::SignedSequencerReceipt,
+    ) -> Result<()> {
+        if receipt.payload.conversation_id != thread_id {
+            return Err(Error::ReceiptCommitmentMismatch);
+        }
+        let authority = receipt.payload.sequencer_did.as_str();
+        if let Some(trust) = self.receipt_trust.get(thread_id) {
+            if trust.authority != authority {
+                return Err(Error::ReceiptCommitmentMismatch);
+            }
+            if let Some(public_key) = trust.keys.get(&receipt.key_id) {
+                return labyrinth_protocol::verify_sequencer_receipt_sec1(
+                    public_key, authority, receipt,
+                )
+                .map_err(|_| Error::ReceiptCommitmentMismatch);
+            }
+        }
+        let key = self
+            .b
+            .directory
+            .sequencer_receipt_key_by_id(thread_id, authority, &receipt.key_id)
+            .await?
+            .filter(|key| key.did == authority)
+            .ok_or(Error::ReceiptCommitmentMismatch)?;
+        labyrinth_protocol::verify_sequencer_receipt_sec1(&key.public_key_sec1, authority, receipt)
+            .map_err(|_| Error::ReceiptCommitmentMismatch)?;
+
+        let created = !self.receipt_trust.contains_key(thread_id);
+        self.receipt_trust
+            .entry(thread_id.to_owned())
+            .or_insert_with(|| ReceiptTrust {
+                authority: authority.to_owned(),
+                keys: BTreeMap::new(),
+            })
+            .keys
+            .insert(receipt.key_id.clone(), key.public_key_sec1);
+        if let Err(error) = self.checkpoint_state() {
+            if created {
+                self.receipt_trust.remove(thread_id);
+            } else if let Some(trust) = self.receipt_trust.get_mut(thread_id) {
+                trust.keys.remove(&receipt.key_id);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Epoch whose PDS + directory publication is durably pending.
+    pub fn pending_directory_epoch(&self) -> Option<u64> {
+        self.pending_directory_publication
     }
 
     /// The account DID.

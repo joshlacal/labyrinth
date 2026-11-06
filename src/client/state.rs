@@ -7,17 +7,17 @@
 //! plain files, logs or backups, and should overwrite the stored copy on
 //! every change. The returned buffer zeroizes on drop.
 //!
-//! What it holds: the device secrets and public record, the mailbox root
-//! salt, every known epoch `(seq, epochID, root)`, the locally revoked
-//! device set ([CB-11]), the peer epoch pins ([CB-29]) and the MEK cache.
-//! It does **not** hold unflushed batches: call [`Labyrinth::flush`]
-//! first.
+//! What it holds: the device secrets and public record, every known epoch
+//! `(seq, epochID, root)`, the locally revoked device set ([CB-11]), the peer
+//! epoch pins ([CB-29]), the durable receipt-required/key-history latch and
+//! the MEK cache. It does **not** hold unflushed batches: call
+//! [`Labyrinth::flush`] first.
 //!
-//! Encoding (version 3), all integers big-endian, strings and lists
+//! Encoding (version 4), all integers big-endian, strings and lists
 //! length-prefixed, no trailing bytes:
 //!
 //! ```text
-//! "LBYS" 0x03            (PQ clean-slate state; 0x01/0x02 rejected)
+//! "LBYS" 0x04            (clean-slate state; earlier versions rejected)
 //! did                      str16
 //! transportPub             32
 //! deviceKey                32
@@ -27,24 +27,26 @@
 //!         storagePub       1216 (Hawk HPKE EncPublic)
 //!         sigStorage       64   (0x30 physical / 0x34 virtual)
 //!         authPub sig0x31 isVirtual  opt(32) opt(64) u8
-//! mailboxRootSalt          32
 //! latest                   u64
+//! pendingPublication       opt(u64)
 //! epochs   u32 × (seq u64, epochID str16, root 32)
 //! revoked  u32 × 32
 //! verified seq u64, u32 × 32          members verified in epoch seq ([CB-25])
 //! pins     u32 × (did str16, seq u64, head 32, sigKey 32)
+//! receipts u32 × (threadId str16, authority str16,
+//!                 u32 × (verificationMethod str16, SEC1 key blob16))
 //! meks     u32 × (threadId str16, u32 × (secret 32, rosterHash 32, provenance))
-//!          threads in ascending threadId byte order, MEKs oldest first;
-//!          decode accepts any thread order, export is always canonical
+//!          maps in ascending key byte order, MEKs oldest first;
+//!          decode accepts any map order, export is always canonical
 //! provenance = 0x00 | 0x01 senderDid str16 head 32 | 0x02 transportPub 32 createdHere u8
-//! opt(x)   = 0x00 | 0x01 x;   str16 = u16 length || UTF-8
+//! opt(x)   = 0x00 | 0x01 x;   str16/blob16 = u16 length || bytes
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use zeroize::Zeroizing;
 
-use super::{Backends, Labyrinth, PeerPin};
+use super::{Backends, Labyrinth, PeerPin, ReceiptTrust};
 use crate::device::{DevicePublic, DeviceSecrets};
 use crate::epoch::{EpochKeys as _, EpochSecret};
 use crate::hpke::hawk::{HAWK_ENC_PUBLIC_LEN, HAWK_ENC_SECRET_LEN, HawkEncPublic, HawkEncSecret};
@@ -54,8 +56,8 @@ use crate::sign::{TransportSigner, XSigningKey, XVerifyingKey};
 use crate::{Error, Result};
 
 const MAGIC: &[u8; 4] = b"LBYS";
-/// Version byte of the PQ clean-slate state encoding (`I16`, `2A`).
-pub const STATE_VERSION: u8 = 0x03;
+/// Version byte of the clean-slate state encoding.
+pub const STATE_VERSION: u8 = 0x04;
 
 /// Writer. A first pass with `buf = None` only measures, so the real
 /// buffer is allocated once at its final size and never reallocates
@@ -88,6 +90,12 @@ impl W {
         let n = u16::try_from(s.len()).map_err(|_| Error::Malformed("state string too long"))?;
         self.bytes(&n.to_be_bytes());
         self.bytes(s.as_bytes());
+        Ok(())
+    }
+    fn blob(&mut self, b: &[u8]) -> Result<()> {
+        let n = u16::try_from(b.len()).map_err(|_| Error::Malformed("state blob too long"))?;
+        self.bytes(&n.to_be_bytes());
+        self.bytes(b);
         Ok(())
     }
     fn opt(&mut self, b: Option<&[u8]>) {
@@ -152,6 +160,10 @@ impl<'a> R<'a> {
         let n = u16::from_be_bytes(self.arr()?) as usize;
         String::from_utf8(self.take(n)?.to_vec()).map_err(|_| Error::Malformed("state string"))
     }
+    fn blob(&mut self) -> Result<Vec<u8>> {
+        let n = u16::from_be_bytes(self.arr()?) as usize;
+        Ok(self.take(n)?.to_vec())
+    }
     fn opt<const N: usize>(&mut self) -> Result<Option<[u8; N]>> {
         if self.bool()? {
             Ok(Some(self.arr()?))
@@ -201,8 +213,14 @@ impl Labyrinth {
         w.opt(p.sig_0x31.as_ref().map(|s| s.as_slice()));
         w.u8(p.is_virtual.into());
 
-        w.bytes(&self.mailbox_root_salt);
         w.u64(self.latest);
+        match self.pending_directory_publication {
+            Some(seq) => {
+                w.u8(1);
+                w.u64(seq);
+            }
+            None => w.u8(0),
+        }
         w.u32(self.epochs.len())?;
         for e in self.epochs.values() {
             w.u64(e.seq);
@@ -224,6 +242,16 @@ impl Labyrinth {
             w.u64(pin.seq);
             w.bytes(&pin.head);
             w.bytes(&pin.sig_key.0);
+        }
+        w.u32(self.receipt_trust.len())?;
+        for (thread, trust) in &self.receipt_trust {
+            w.str(thread)?;
+            w.str(&trust.authority)?;
+            w.u32(trust.keys.len())?;
+            for (key_id, public_key) in &trust.keys {
+                w.str(key_id)?;
+                w.blob(public_key)?;
+            }
         }
         w.u32(self.meks.len())?;
         for (thread, meks) in &self.meks {
@@ -300,8 +328,8 @@ impl Labyrinth {
         };
         let device = DeviceSecrets::from_parts(device_key, storage, storage_auth, public)?;
 
-        let salt = *r.secret()?;
         let latest = r.u64()?;
+        let pending_directory_publication = if r.bool()? { Some(r.u64()?) } else { None };
         let mut epochs = Vec::new();
         for _ in 0..r.count(8 + 2 + 32)? {
             let seq = r.u64()?;
@@ -325,6 +353,32 @@ impl Labyrinth {
                 sig_key: XVerifyingKey(r.arr()?),
             };
             pins.insert(peer, pin);
+        }
+        let mut receipt_trust = BTreeMap::new();
+        for _ in 0..r.count(2 + 2 + 4)? {
+            let thread = r.str()?;
+            let authority = r.str()?;
+            let mut keys = BTreeMap::new();
+            for _ in 0..r.count(2 + 2)? {
+                let key_id = r.str()?;
+                labyrinth_protocol::receipt_key_generation(&authority, &key_id)
+                    .map_err(|_| Error::Malformed("state receipt verification method"))?;
+                let public_key = r.blob()?;
+                p256::ecdsa::VerifyingKey::from_sec1_bytes(&public_key)
+                    .map_err(|_| Error::Malformed("state receipt public key"))?;
+                if keys.insert(key_id, public_key).is_some() {
+                    return Err(Error::Malformed("duplicate state receipt method"));
+                }
+            }
+            if thread.is_empty() || keys.is_empty() {
+                return Err(Error::Malformed("empty state receipt trust"));
+            }
+            if receipt_trust
+                .insert(thread, ReceiptTrust { authority, keys })
+                .is_some()
+            {
+                return Err(Error::Malformed("duplicate state receipt conversation"));
+            }
         }
         let mut meks = BTreeMap::new();
         for _ in 0..r.count(2 + 4)? {
@@ -353,9 +407,12 @@ impl Labyrinth {
             return Err(Error::Malformed("trailing bytes after state"));
         }
 
-        let mut me = Self::assemble(did, device, transport, b, salt, epochs)?;
+        let mut me = Self::assemble(did, device, transport, b, epochs)?;
         if me.latest != latest {
             return Err(Error::Malformed("state latest epoch is not cached"));
+        }
+        if pending_directory_publication.is_some_and(|seq| seq != latest) {
+            return Err(Error::Malformed("state pending publication is not latest"));
         }
         // [CB-43] Everything the mailbox alone can prove is checked now.
         // The attester lookup may wait for the directory: a restart must
@@ -376,9 +433,11 @@ impl Labyrinth {
             Err(Error::Unattested) => return Err(Error::Unattested),
             Err(_) => false,
         };
+        me.pending_directory_publication = pending_directory_publication;
         me.revoked = revoked;
         me.verified = verified;
         me.pins = pins;
+        me.receipt_trust = receipt_trust;
         me.meks = meks;
         Ok(me)
     }

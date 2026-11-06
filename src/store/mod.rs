@@ -66,7 +66,7 @@ pub type ClockFn = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
 #[cfg(target_arch = "wasm32")]
 pub type ClockFn = std::sync::Arc<dyn Fn() -> u64>;
 
-/// Sequencer ES256 verification key `{did}#mls-receipt-1` (`I13`, Gate 1).
+/// Sequencer ES256 verification key for one DID receipt method (`I13`, Gate 1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SequencerReceiptKey {
     pub did: String,
@@ -443,6 +443,13 @@ pub trait ThreadStore: MaybeSend + MaybeSync {
 pub trait MailboxDirectory: MaybeSend + MaybeSync {
     /// The DID's published latest epoch (`mailboxKeys/self`), unverified.
     async fn latest(&self, did: &str) -> Result<Option<EpochPublic>>;
+    /// The newest head independently verified from both the account PDS and
+    /// `mls-ds`. Single-source directories must keep the default: absence of
+    /// two-source evidence can never supersede a pending publication.
+    async fn latest_two_source(&self, did: &str) -> Result<Option<EpochPublic>> {
+        let _ = did;
+        Ok(None)
+    }
     /// The DID's published epoch `seq` (`mailboxKeys/<12-digit seq>`), unverified.
     async fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>>;
     /// Verified/unverified full epoch head chain `(headers, floor_seq)` from `mls-ds` (`Gate 6`).
@@ -469,7 +476,7 @@ pub trait MailboxDirectory: MaybeSend + MaybeSync {
         let _ = thread_id;
         Ok(None)
     }
-    /// The ES256 receipt signing key `{did}#mls-receipt-1` of the DS that sequences `thread_id` (`I13`).
+    /// The sequencer's current ES256 receipt verification key for `thread_id` (`I13`).
     async fn sequencer_receipt_key(&self, thread_id: &str) -> Result<Option<SequencerReceiptKey>> {
         let _ = thread_id;
         Ok(None)
@@ -486,6 +493,21 @@ pub trait MailboxDirectory: MaybeSend + MaybeSync {
             .sequencer_receipt_key(thread_id)
             .await?
             .filter(|key| key.did == expected_authority))
+    }
+    /// Resolve the exact receipt verification method named by a signed
+    /// receipt. Implementations backed by DID documents retain old methods
+    /// across rotation. The default supports only the first-generation key.
+    async fn sequencer_receipt_key_by_id(
+        &self,
+        thread_id: &str,
+        expected_authority: &str,
+        key_id: &str,
+    ) -> Result<Option<SequencerReceiptKey>> {
+        if key_id != labyrinth_protocol::expected_receipt_key_id(expected_authority) {
+            return Ok(None);
+        }
+        self.sequencer_receipt_key_for_authority(thread_id, expected_authority)
+            .await
     }
 }
 

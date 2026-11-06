@@ -17,6 +17,7 @@ use labyrinth::Error;
 use labyrinth::client::{
     Backends, CompositeDirectory, Labyrinth, MessageSource, StateSink, SystemClock,
 };
+use labyrinth::message::OriginalSenderArchiveAttestation;
 use labyrinth::protocol::receipt::{
     SequencerReceiptPayload, compute_archive_commitment, expected_receipt_key_id,
     sign_sequencer_receipt,
@@ -29,7 +30,8 @@ use labyrinth::store::memory::MemoryBackend;
 use labyrinth::store::space::host::MemorySpaceHost;
 use labyrinth::store::space::{SpaceMailboxStore, SpaceRef, SpaceRpc as _, SpaceThreadStore};
 use labyrinth::store::{
-    KeyPublisher, MailboxStore, SequencerReceiptKey, Stored, ThreadStore, TimeRange,
+    KeyPublisher, MailboxStore, MemberDeviceKey, SequencerReceiptKey, Stored, ThreadStore,
+    TimeRange,
 };
 use net::*;
 use p256::ecdsa::SigningKey;
@@ -112,6 +114,24 @@ fn transport(seed: u8) -> Ed25519Transport {
     Ed25519Transport(ed25519_dalek::SigningKey::from_bytes(&[seed; 32]))
 }
 
+fn original_sender_attestation(
+    seed: u8,
+    did: &str,
+    device_id: &str,
+    thread_id: &str,
+    message_id: &str,
+    commitment: &[u8; 32],
+) -> OriginalSenderArchiveAttestation {
+    OriginalSenderArchiveAttestation::sign(
+        did.to_owned(),
+        device_id.to_owned(),
+        thread_id,
+        message_id,
+        commitment,
+        &transport(seed),
+    )
+}
+
 fn sequencer_keys() -> (SigningKey, SequencerReceiptKey) {
     let sk = SigningKey::from_bytes((&[0x66u8; 32]).into()).expect("valid p256 sk");
     let pk_sec1 = sk
@@ -137,6 +157,15 @@ fn make_space_client(
 ) -> Labyrinth {
     let t = transport(seed);
     net.register_chat_device(did, t.transport_public_key());
+    net.set_member_device_keys(
+        CONVO_ID,
+        did,
+        vec![MemberDeviceKey {
+            key: t.transport_public_key(),
+            joined_chat_seq: 1,
+            removed_chat_seq: None,
+        }],
+    );
     let mb_space = SpaceRef::parse(&format!(
         "at://{did}/space/blue.catbird.labyrinth.mailbox/self"
     ))
@@ -868,15 +897,24 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
         1_791_200_000_002,
         &bob_nonce,
         bob_body,
-        &labyrinth::message::ArchivedReceipt::new(bob_receipt.clone()),
+        &labyrinth::message::ArchivedReceipt::new(
+            bob_receipt.clone(),
+            original_sender_attestation(
+                2,
+                BOB_DID,
+                BOB_DEV_ID,
+                CONVO_ID,
+                "bob-committed",
+                &bob_commitment,
+            ),
+        ),
     ))
     .unwrap();
     block_on(bob.flush()).unwrap();
 
     // 2. While Alice is still in the Space, active-Space history is authoritative: owner
-    // copies cannot make an otherwise inadmissible Space record visible. The committed message
-    // remains visible without conflict; the pre-I13 message returns from the owner archive only
-    // after Space access is revoked below.
+    // copies cannot make an otherwise inadmissible Space record visible. The first valid
+    // receipt latches receipt enforcement, so the pre-I13 message is no longer readable.
     let copied_committed = block_on(alice.rearchive_thread_before_leave(CONVO_ID)).unwrap();
     assert_eq!(copied_committed, 1);
 
@@ -889,8 +927,9 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
     // 3. Now simulate involuntary removal / kick: revoke Alice's Space read/write membership!
     host.revoke_space_member(&convo_space, ALICE_DID);
 
-    // Alice also rescues locally cached SQLCipher messages + queued outbox items via
-    // `archive_owner_attributed` and `archive_owner_committed`!
+    // Receipt enforcement is already latched: a receiptless cached row cannot
+    // be backdated into the owner archive, while a committed queued item below
+    // remains rescuable after the kick.
     assert!(
         block_on(alice.archive_owner_attributed(
             CONVO_ID,
@@ -902,14 +941,17 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
         .is_err(),
         "archive_owner_attributed must reject non-DID sender strings"
     );
-    block_on(alice.archive_owner_attributed(
-        CONVO_ID,
-        "bob-cached-before-kick",
-        1_791_200_000_003,
-        BOB_DID,
-        b"rescued from sqlcipher cache",
-    ))
-    .unwrap();
+    assert_eq!(
+        block_on(alice.archive_owner_attributed(
+            CONVO_ID,
+            "bob-cached-before-kick",
+            1_791_200_000_003,
+            BOB_DID,
+            b"rescued from sqlcipher cache",
+        ))
+        .unwrap_err(),
+        Error::ReceiptCommitmentMismatch
+    );
 
     let alice_nonce = [0x77u8; 32];
     let alice_body = b"queued outbox message rescued after kick";
@@ -933,7 +975,17 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
         1_791_200_000_004,
         &alice_nonce,
         alice_body,
-        &labyrinth::message::ArchivedReceipt::new(alice_receipt.clone()),
+        &labyrinth::message::ArchivedReceipt::new(
+            alice_receipt.clone(),
+            original_sender_attestation(
+                1,
+                ALICE_DID,
+                ALICE_DEV_ID,
+                CONVO_ID,
+                "alice-queued-after-kick",
+                &alice_rp.archive_commitment,
+            ),
+        ),
     ))
     .unwrap();
 
@@ -965,65 +1017,69 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
             1_791_200_000_005,
             &alice_nonce,
             alice_body,
-            &labyrinth::message::ArchivedReceipt::new(wrong_thread_receipt.clone()),
+            &labyrinth::message::ArchivedReceipt::new(
+                wrong_thread_receipt.clone(),
+                original_sender_attestation(
+                    1,
+                    ALICE_DID,
+                    ALICE_DEV_ID,
+                    &wrong_thread_rp.conversation_id,
+                    "replayed-other-convo",
+                    &wrong_thread_rp.archive_commitment,
+                ),
+            ),
         ))
         .is_err()
     );
 
     let after_kick = block_on(alice_restored.load_thread(CONVO_ID, TimeRange::ALL)).unwrap();
     assert!(!after_kick.space_readable);
-    assert_eq!(after_kick.messages.len(), 4);
-    assert!(after_kick.undecryptable.is_empty());
+    assert_eq!(after_kick.messages.len(), 2);
+    assert_eq!(after_kick.undecryptable.len(), 1);
+    assert_eq!(after_kick.undecryptable[0].message_id, "bob-plain");
 
     let by_id: std::collections::HashMap<_, _> = after_kick
         .messages
         .iter()
         .map(|m| (m.message_id.as_str(), m))
         .collect();
-    assert_eq!(by_id["bob-plain"].sender.as_deref(), Some(BOB_DID));
-    assert_eq!(by_id["bob-plain"].source, MessageSource::Owner);
     assert_eq!(by_id["bob-committed"].sender.as_deref(), Some(BOB_DID));
     assert_eq!(by_id["bob-committed"].source, MessageSource::Owner);
-    assert_eq!(
-        by_id["bob-cached-before-kick"].sender.as_deref(),
-        Some(BOB_DID)
-    );
     assert_eq!(
         by_id["alice-queued-after-kick"].sender.as_deref(),
         Some(ALICE_DID)
     );
 
-    // 4. Author-scoped `delete_for_me` tombstones:
-    // Tombstoning `(ALICE_DID, "bob-cached-before-kick")` does NOT hide Bob's message,
-    // whereas tombstoning `(BOB_DID, "bob-cached-before-kick")` hides it!
+    // 4. Author-scoped `delete_for_me` tombstones: the wrong author does not
+    // hide Bob's committed message, while Bob's DID does.
     block_on(alice_restored.delete_for_me(
         CONVO_ID,
-        "bob-cached-before-kick",
-        1_791_200_000_003,
+        "bob-committed",
+        1_791_200_000_002,
         Some(ALICE_DID),
         &[],
     ))
     .unwrap();
     let after_wrong_author_del =
         block_on(alice_restored.load_thread(CONVO_ID, TimeRange::ALL)).unwrap();
-    assert_eq!(after_wrong_author_del.messages.len(), 4);
+    assert_eq!(after_wrong_author_del.messages.len(), 2);
 
     block_on(alice_restored.delete_for_me(
         CONVO_ID,
-        "bob-cached-before-kick",
-        1_791_200_000_003,
+        "bob-committed",
+        1_791_200_000_002,
         Some(BOB_DID),
         &[],
     ))
     .unwrap();
     let after_right_author_del =
         block_on(alice_restored.load_thread(CONVO_ID, TimeRange::ALL)).unwrap();
-    assert_eq!(after_right_author_del.messages.len(), 3);
+    assert_eq!(after_right_author_del.messages.len(), 1);
     assert!(
         after_right_author_del
             .messages
             .iter()
-            .all(|m| m.message_id != "bob-cached-before-kick")
+            .all(|m| m.message_id != "bob-committed")
     );
 }
 

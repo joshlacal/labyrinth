@@ -58,7 +58,7 @@ fn space_attachment_manifests_verify_integrity_and_rearchive_before_leave() {
 }
 
 #[test]
-fn recovery_methods_expire_are_touched_and_can_be_removed() {
+fn recovery_methods_become_stale_are_touched_and_require_explicit_rotation() {
     let net = MemoryBackend::new();
     let clock = TestClock::default();
     let mut phone = init(&net, &clock, A, 1);
@@ -71,14 +71,14 @@ fn recovery_methods_expire_are_touched_and_can_be_removed() {
         .find(|m| m.vdevice_id == keychain.vdevice_id)
         .unwrap();
     assert_eq!(
-        kc.expires_at_ms,
+        kc.stale_at_ms,
         Some(kc.created_at_ms + AUTO_RECOVERY_TTL_MS)
     );
     let cm = methods
         .iter()
         .find(|m| m.vdevice_id == code.vdevice_id)
         .unwrap();
-    assert_eq!(cm.expires_at_ms, None);
+    assert_eq!(cm.stale_at_ms, None);
 
     // A restore 100 days in touches the keychain bundle (server clock).
     clock.advance(100 * 86_400_000);
@@ -101,20 +101,26 @@ fn recovery_methods_expire_are_touched_and_can_be_removed() {
         Some(1_791_000_000_000 + 100 * 86_400_000)
     );
 
-    // 181 days after creation it has not expired (it was used at day 100);
-    // 281 days after creation it has, and only it is removed.
+    // At day 181 it is still fresh because the day-100 restore touched it.
+    // At day 281 it is stale but remains usable until an explicit rotation.
     clock.advance(81 * 86_400_000);
-    assert!(
-        block_on(phone.remove_expired_recovery_methods())
-            .unwrap()
-            .is_empty()
-    );
+    let kc = block_on(phone.list_recovery_methods())
+        .unwrap()
+        .into_iter()
+        .find(|m| m.vdevice_id == keychain.vdevice_id)
+        .unwrap();
+    assert!(!kc.stale_at(1_791_000_000_000 + 181 * 86_400_000));
     clock.advance(100 * 86_400_000);
     block_on(phone.sync_epochs()).unwrap();
-    assert_eq!(
-        block_on(phone.remove_expired_recovery_methods()).unwrap(),
-        vec![keychain.vdevice_id]
-    );
+    let kc = block_on(phone.list_recovery_methods())
+        .unwrap()
+        .into_iter()
+        .find(|m| m.vdevice_id == keychain.vdevice_id)
+        .unwrap();
+    assert!(kc.stale_at(1_791_000_000_000 + 281 * 86_400_000));
+    let before = phone.latest_epoch();
+    let report = block_on(phone.remove_recovery_method(&keychain.vdevice_id)).unwrap();
+    assert_eq!(report.new_epoch, before + 1);
     let left: Vec<_> = block_on(phone.list_recovery_methods())
         .unwrap()
         .into_iter()
@@ -213,7 +219,14 @@ fn every_epoch_is_published_to_every_publisher() {
     block_on(phone.revoke_device(&laptop.device_public().device_key_pub)).unwrap();
     let vd = block_on(phone.create_recovery_code(Mechanism::Code)).unwrap();
     block_on(phone.remove_recovery_method(&vd.vdevice_id)).unwrap();
-    assert_eq!(*rec.seen.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+    let seen_before_failure = rec.seen.lock().unwrap().clone();
+    for epoch in 0..=4 {
+        assert!(
+            seen_before_failure.contains(&epoch),
+            "epoch {epoch} was never published"
+        );
+    }
+    assert_eq!(seen_before_failure.last(), Some(&4));
     assert_eq!(block_on(net.directory().latest(A)).unwrap().unwrap().seq, 4);
 
     // A failed publish surfaces as an error, and the retry catches up.
@@ -221,8 +234,13 @@ fn every_epoch_is_published_to_every_publisher() {
     assert!(block_on(phone.revoke_device(&tablet.device_public().device_key_pub)).is_err());
     *rec.fail.lock().unwrap() = false;
     assert_eq!(phone.latest_epoch(), 5);
+    let replay_start = rec.seen.lock().unwrap().len();
     block_on(phone.publish_latest_keys()).unwrap();
-    assert_eq!(*rec.seen.lock().unwrap(), vec![0, 1, 2, 3, 4, 5]);
+    assert_eq!(
+        &rec.seen.lock().unwrap()[replay_start..],
+        &[0, 1, 2, 3, 4, 5],
+        "a retry must replay the complete verifiable chain"
+    );
 }
 
 #[test]
@@ -247,76 +265,69 @@ fn safety_numbers_match_on_both_sides_and_change_on_rotation() {
 }
 
 #[test]
-fn expired_un_gcd_recovery_bundles_fail_with_expired() {
+fn stale_local_clock_warns_but_rotation_removes_recovery_authority() {
     let net = MemoryBackend::new();
     let clock = TestClock::default();
     let mut phone = init(&net, &clock, A, 1);
     let keychain = block_on(phone.create_recovery_code(Mechanism::Keychain)).unwrap();
-    let prf = [0x42u8; 32];
-    let cred = b"cred-exp-1";
-    block_on(phone.create_passkey_recovery(&prf, cred)).unwrap();
 
-    // Advance client clock past 180-day TTL while leaving `net` server clock
-    // un-advanced so the server still serves the un-GC'd bundles.
-    clock.advance(AUTO_RECOVERY_TTL_MS + 1);
+    // The restoring device's clock is 181 days ahead while the authoritative
+    // store still serves an active bundle.
+    clock.advance(AUTO_RECOVERY_TTL_MS + 86_400_000);
     net.register_chat_device(A, tpub(8));
-    let err = block_on(Labyrinth::restore_with_recovery_code(
+    let (_restored, enrollment) = block_on(Labyrinth::restore_with_recovery_code(
         A,
         keychain.code.as_str(),
         Box::new(signer(8)),
         backends(&net, &clock, A),
     ))
-    .unwrap_err();
-    assert_eq!(err, Error::Expired);
+    .unwrap();
+    assert!(enrollment.stale_recovery_method);
 
-    let err = block_on(Labyrinth::restore_with_passkey(
+    // Keeping the bundle document is insufficient after its virtual device is
+    // authoritatively rotated out.
+    block_on(phone.sync_epochs()).unwrap();
+    let method = block_on(phone.list_recovery_methods())
+        .unwrap()
+        .into_iter()
+        .find(|method| method.vdevice_id == keychain.vdevice_id)
+        .unwrap();
+    block_on(phone.revoke_device(&method.device_key)).unwrap();
+    net.register_chat_device(A, tpub(9));
+    let error = block_on(Labyrinth::restore_with_recovery_code(
         A,
-        &prf,
-        cred,
-        Box::new(signer(8)),
+        keychain.code.as_str(),
+        Box::new(signer(9)),
         backends(&net, &clock, A),
     ))
     .unwrap_err();
-    assert_eq!(err, Error::Expired);
+    assert_eq!(error, Error::NotEpochMember);
 }
 
 #[test]
-fn restore_with_passkey_skips_expired_bundle_in_favor_of_fresh_one() {
+fn stale_passkey_bundle_restores_with_warning() {
     let net = MemoryBackend::new();
     let clock = TestClock::default();
     let mut phone = init(&net, &clock, A, 1);
     let prf = [0x55u8; 32];
-    let cred = b"cred-rotate-1";
-    let old = block_on(phone.create_passkey_recovery(&prf, cred)).unwrap();
+    let credential = b"cred-stale-1";
+    block_on(phone.create_passkey_recovery(&prf, credential)).unwrap();
 
-    // Advance client clock past 180 days; `create_bundle` stamps
-    // `b.clock.now_ms()`, so keeping `net` server time at 0 leaves the old
-    // bundle un-GC'd on the server while its `created_at` is >180 days old.
-    clock.advance(AUTO_RECOVERY_TTL_MS + 1_000);
-    let fresh = block_on(phone.create_passkey_recovery(&prf, cred)).unwrap();
-    assert_ne!(old.vdevice_id, fresh.vdevice_id);
-    assert_eq!(
-        block_on(net.mailbox(A).list_virtual_devices())
-            .unwrap()
-            .len(),
-        2
-    );
-
+    clock.advance(AUTO_RECOVERY_TTL_MS + 1);
     net.register_chat_device(A, tpub(9));
-    let (restored, _) = block_on(Labyrinth::restore_with_passkey(
+    let (_restored, enrollment) = block_on(Labyrinth::restore_with_passkey(
         A,
         &prf,
-        cred,
+        credential,
         Box::new(signer(9)),
         backends(&net, &clock, A),
     ))
     .unwrap();
-    block_on(phone.sync_epochs()).unwrap();
-    assert_eq!(restored.latest_epoch(), phone.latest_epoch());
+    assert!(enrollment.stale_recovery_method);
 }
 
 #[test]
-fn space_get_virtual_device_does_not_refresh_last_used_at_and_memory_backend_filters_expired() {
+fn virtual_device_reads_do_not_touch_and_stale_records_remain_until_rotation() {
     let space_host = MemorySpaceHost::new();
     let space_client = space_host.client(A);
     let smb = SpaceMailboxStore::new(space_client, SpaceRef::mailbox(A), A);
@@ -345,25 +356,23 @@ fn space_get_virtual_device_does_not_refresh_last_used_at_and_memory_backend_fil
         .unwrap();
     assert!(touched.last_used_at.is_some());
 
-    // Once server_now passes `last_used_at + AUTO_RECOVERY_TTL_MS`, MemoryBackend
-    // filters the expired virtual device from get, list, and touch.
+    // Advancing server time past the advisory staleness threshold does not
+    // remove authority or hide the bundle; only a rotation can do that.
     net.set_server_time(1_791_000_000_000 + 50 * 86_400_000);
     block_on(net.mailbox(A).touch_virtual_device(&kc.vdevice_id)).unwrap();
     net.set_server_time(1_791_000_000_000 + 50 * 86_400_000 + AUTO_RECOVERY_TTL_MS);
     assert!(
         block_on(net.mailbox(A).get_virtual_device(&kc.vdevice_id))
             .unwrap()
-            .is_none()
-    );
-    assert!(
-        block_on(net.mailbox(A).list_virtual_devices())
-            .unwrap()
-            .is_empty()
+            .is_some()
     );
     assert_eq!(
-        block_on(net.mailbox(A).touch_virtual_device(&kc.vdevice_id)).unwrap_err(),
-        Error::NotFound("virtual device")
+        block_on(net.mailbox(A).list_virtual_devices())
+            .unwrap()
+            .len(),
+        1
     );
+    block_on(net.mailbox(A).touch_virtual_device(&kc.vdevice_id)).unwrap();
 }
 
 #[test]

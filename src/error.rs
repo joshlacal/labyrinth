@@ -15,8 +15,6 @@ pub enum Error {
     NotEpochMember,
     #[error("recovery code is invalid or uncorrectable")]
     BadRecoveryCode,
-    #[error("recovery bundle has expired")]
-    Expired,
     #[error("virtual device record names a non-virtual or active physical device")]
     DeviceTampered,
     #[error("unsupported version or suite: {0}")]

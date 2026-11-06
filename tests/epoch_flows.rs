@@ -256,7 +256,6 @@ fn two_typos(code: &RecoveryCode) -> String {
 fn recovery_from_virtual_device_with_typos() {
     let mut b = Backend::default();
     let a = DeviceSecrets::generate().unwrap();
-    let salt = [0x5au8; 32];
     let mut epochs = vec![genesis(&mut b, &a)];
     for _ in 0..2 {
         let prev = epochs.last().unwrap().clone();
@@ -266,7 +265,7 @@ fn recovery_from_virtual_device_with_typos() {
     // Create the virtual device at epoch 2.
     let code = RecoveryCode::generate().unwrap();
     let (vrec, vmember) =
-        virtual_device::create(DID, &code, &a, &epochs[2], &salt, Mechanism::Code).unwrap();
+        virtual_device::create(DID, &code, &a, &epochs[2], Mechanism::Code).unwrap();
     b.register(&vrec.public);
     b.members[2].push(vmember);
 
@@ -287,7 +286,6 @@ fn recovery_from_virtual_device_with_typos() {
     );
 
     let restored = virtual_device::open(&vrec, &found, DID).unwrap();
-    assert_eq!(restored.mailbox_root_salt, salt);
     let seq = restored.epoch.seq();
     assert_eq!(seq, 2);
     let start =
@@ -339,13 +337,12 @@ fn otc_payload_round_trip_and_wrong_key() {
     let isk_new = init.finish(&m2).unwrap();
     assert_eq!(isk_new, isk_existing);
 
-    let payload = OtcPayload::create(&e1, &[7u8; 32]);
+    let payload = OtcPayload::create(&e1);
     let ct = payload.seal(&isk_existing).unwrap();
     let got = OtcPayload::open(&isk_new, &ct).unwrap();
     assert_eq!(got.epoch.root(), e1.root());
     assert_eq!(got.epoch.epoch_id, e1.epoch_id);
     assert_eq!(got.epoch.seq, 1);
-    assert_eq!(got.mailbox_root_salt, [7u8; 32]);
 
     // A session with the wrong code yields a different ISK.
     let mut responder2 = Responder::generate(DID).unwrap();

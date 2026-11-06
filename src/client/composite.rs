@@ -219,6 +219,13 @@ impl MailboxDirectory for CompositeDirectory {
         }
     }
 
+    async fn latest_two_source(&self, did: &str) -> Result<Option<EpochPublic>> {
+        if self.allow_single_source {
+            return Ok(None);
+        }
+        self.latest(did).await
+    }
+
     async fn epoch(&self, did: &str, seq: u64) -> Result<Option<EpochPublic>> {
         match (
             self.pds.epoch(did, seq).await?,
@@ -289,6 +296,26 @@ impl MailboxDirectory for CompositeDirectory {
             None => {
                 self.pds
                     .sequencer_receipt_key_for_authority(thread_id, expected_authority)
+                    .await
+            }
+        }
+    }
+
+    async fn sequencer_receipt_key_by_id(
+        &self,
+        thread_id: &str,
+        expected_authority: &str,
+        key_id: &str,
+    ) -> Result<Option<SequencerReceiptKey>> {
+        match self
+            .ds
+            .sequencer_receipt_key_by_id(thread_id, expected_authority, key_id)
+            .await?
+        {
+            Some(key) => Ok(Some(key)),
+            None => {
+                self.pds
+                    .sequencer_receipt_key_by_id(thread_id, expected_authority, key_id)
                     .await
             }
         }

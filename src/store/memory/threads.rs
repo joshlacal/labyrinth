@@ -3,7 +3,10 @@
 use super::{MemoryBackend, ThreadSpace, create};
 use crate::attachment::{AttachmentCiphertextMeta, verify_attachment_ciphertext};
 use crate::deletion::Redaction;
-use crate::records::{AttachmentManifest, Batch, MekDistribution};
+use crate::records::{
+    AttachmentManifest, AuthorRedaction, Batch, Bytes, MekDistribution, SealedMessageDef,
+    ms_from_datetime, nsid,
+};
 use crate::store::{Stored, ThreadStore, TimeRange};
 use crate::{Error, Result};
 
@@ -33,6 +36,52 @@ impl MemoryThreads {
         }
         f(t)
     }
+}
+
+fn overlay_author_redaction(
+    thread_id: &str,
+    author: &str,
+    batches: &mut Vec<Stored<Batch>>,
+    record: AuthorRedaction,
+) -> Result<()> {
+    let redaction = record.to_redaction()?;
+    redaction.verify(author, thread_id, &record.message_id)?;
+    let mut found = false;
+    for batch in batches.iter_mut().filter(|batch| batch.author == author) {
+        for item in batch
+            .value
+            .items
+            .iter_mut()
+            .filter(|item| item.message_id == record.message_id)
+        {
+            item.redaction = Some(record.redaction.clone());
+            found = true;
+        }
+    }
+    if !found {
+        let rkey = record.rkey();
+        batches.push(Stored {
+            author: author.to_owned(),
+            rkey: format!("redaction-{rkey}"),
+            order: None,
+            value: Batch {
+                type_: nsid::BATCH.into(),
+                thread_id: thread_id.to_owned(),
+                items: vec![SealedMessageDef {
+                    message_id: record.message_id,
+                    seq: None,
+                    timestamp: ms_from_datetime(&record.created_at).unwrap_or(0),
+                    mek_id: Bytes::default(),
+                    sender_transport_pubkey: Bytes::default(),
+                    signed_enc_message: Bytes::default(),
+                    sequencer_receipt: None,
+                    redaction: Some(record.redaction),
+                }],
+                created_at: record.created_at,
+            },
+        });
+    }
+    Ok(())
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -112,21 +161,32 @@ impl ThreadStore for MemoryThreads {
         range: TimeRange,
     ) -> Result<Vec<Stored<Batch>>> {
         self.space(thread_id, |t| {
-            Ok(t.repos
+            let mut batches: Vec<Stored<Batch>> = t
+                .repos
                 .iter()
                 .filter(|(did, _)| sender.is_none_or(|s| s == did.as_str()))
-                .flat_map(|(did, r)| {
-                    r.batches
-                        .iter()
-                        .filter(|(_, (b, _))| b.items.iter().any(|i| range.contains(i.timestamp)))
-                        .map(|(k, (b, order))| Stored {
-                            author: did.clone(),
-                            rkey: k.clone(),
-                            value: b.clone(),
-                            order: *order,
-                        })
+                .flat_map(|(did, repo)| {
+                    repo.batches.iter().map(|(rkey, (batch, order))| Stored {
+                        author: did.clone(),
+                        rkey: rkey.clone(),
+                        value: batch.clone(),
+                        order: *order,
+                    })
                 })
-                .collect())
+                .collect();
+            for ((author, _), record) in &t.author_redactions {
+                if sender.is_none_or(|expected| expected == author) {
+                    overlay_author_redaction(thread_id, author, &mut batches, record.clone())?;
+                }
+            }
+            batches.retain(|batch| {
+                batch
+                    .value
+                    .items
+                    .iter()
+                    .any(|item| range.contains(item.timestamp))
+            });
+            Ok(batches)
         })
     }
 
@@ -137,56 +197,42 @@ impl ThreadStore for MemoryThreads {
         limit: usize,
     ) -> Result<Vec<Stored<Batch>>> {
         let target = limit.max(1).saturating_add(1);
-        let range = TimeRange {
-            from_ms: None,
-            until_ms: before_ms,
-        };
-        self.space(thread_id, |t| {
-            let mut candidates: Vec<Stored<Batch>> = t
-                .repos
+        let mut candidates = self.list_batches(thread_id, None, TimeRange::ALL).await?;
+        candidates.retain(|batch| {
+            batch
+                .value
+                .items
                 .iter()
-                .flat_map(|(did, r)| {
-                    r.batches
-                        .iter()
-                        .rev()
-                        .filter(|(_, (b, _))| b.items.iter().any(|i| range.contains(i.timestamp)))
-                        .map(|(k, (b, order))| Stored {
-                            author: did.clone(),
-                            rkey: k.clone(),
-                            value: b.clone(),
-                            order: *order,
-                        })
+                .any(|item| before_ms.is_none_or(|until| item.timestamp < until))
+        });
+        candidates
+            .sort_by_key(|batch| core::cmp::Reverse(batch.order.map(|order| order.labyrinth_seq)));
+        let mut eligible = std::collections::BTreeSet::new();
+        for batch in &candidates {
+            for item in &batch.value.items {
+                if before_ms.is_none_or(|until| item.timestamp < until.saturating_sub(1)) {
+                    eligible.insert((item.timestamp, item.message_id.clone()));
+                }
+            }
+            if eligible.len() >= target {
+                break;
+            }
+        }
+        if let Some((floor, _)) = (eligible.len() >= target)
+            .then(|| eligible.iter().rev().nth(target - 1))
+            .flatten()
+        {
+            let floor = *floor;
+            candidates.retain(|batch| {
+                batch.value.items.iter().any(|item| {
+                    item.timestamp >= floor && before_ms.is_none_or(|until| item.timestamp < until)
                 })
-                .collect();
-            candidates.sort_by_key(|b| core::cmp::Reverse(b.order.map(|o| o.labyrinth_seq)));
-            let mut eligible = std::collections::BTreeSet::new();
-            for b in &candidates {
-                for i in &b.value.items {
-                    if before_ms.is_none_or(|u| i.timestamp < u.saturating_sub(1)) {
-                        eligible.insert((i.timestamp, i.message_id.clone()));
-                    }
-                }
-                if eligible.len() >= target {
-                    break;
-                }
-            }
-            if let Some((floor, _)) = (eligible.len() >= target)
-                .then(|| eligible.iter().rev().nth(target - 1))
-                .flatten()
-            {
-                let floor = *floor;
-                candidates.retain(|b| {
-                    b.value
-                        .items
-                        .iter()
-                        .any(|i| i.timestamp >= floor && before_ms.is_none_or(|u| i.timestamp < u))
-                });
-            }
-            candidates.sort_by_key(|b| {
-                core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max())
             });
-            Ok(candidates)
-        })
+        }
+        candidates.sort_by_key(|batch| {
+            core::cmp::Reverse(batch.value.items.iter().map(|item| item.timestamp).max())
+        });
+        Ok(candidates)
     }
 
     async fn list_threads(&self) -> Result<Vec<String>> {

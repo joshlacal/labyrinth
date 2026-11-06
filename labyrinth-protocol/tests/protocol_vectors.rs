@@ -14,8 +14,8 @@ use labyrinth_protocol::{
     },
     limits::HAWK_ENC_PUBKEY_LEN,
     receipt::{
-        SequencerReceiptPayload, compute_archive_commitment, sign_sequencer_receipt,
-        verify_archived_item_commitment, verify_sequencer_receipt,
+        SequencerReceiptPayload, compute_archive_commitment, receipt_key_generation,
+        sign_sequencer_receipt, verify_archived_item_commitment, verify_sequencer_receipt,
     },
     transcripts::{EPOCH_ATTEST_PREFIX, EPOCH_PREV_SIG_PREFIX, EPOCH_SELF_SIG_PREFIX},
 };
@@ -109,7 +109,7 @@ fn archive_commitment_is_blinded_hmac_sha256_and_detects_tampering() {
 }
 
 #[test]
-fn sequencer_receipt_supports_did_plc_and_rejects_wrong_authority_or_kid() {
+fn sequencer_receipt_supports_versioned_did_methods_and_rejects_wrong_authority_or_kid() {
     let sk = SigningKey::from_slice(&[0x22u8; 32]).expect("valid P-256 scalar");
     let other_sk = SigningKey::from_slice(&[0x33u8; 32]).expect("valid P-256 scalar");
     let commitment = compute_archive_commitment(&[0x99u8; 32], b"hello");
@@ -145,6 +145,26 @@ fn sequencer_receipt_supports_did_plc_and_rejects_wrong_authority_or_kid() {
         &receipt,
     )
     .expect("did:plc receipt verifies");
+
+    let rotated = sign_sequencer_receipt(
+        &other_sk,
+        "did:plc:z72i7hdynmk6r22z27h6tvur#mls-receipt-2",
+        &payload,
+    )
+    .expect("rotated receipt signs with its exact method");
+    verify_sequencer_receipt(
+        other_sk.verifying_key(),
+        "did:plc:z72i7hdynmk6r22z27h6tvur",
+        &rotated,
+    )
+    .expect("rotated receipt verifies");
+    for invalid in [
+        "did:plc:z72i7hdynmk6r22z27h6tvur#mls-receipt-0",
+        "did:plc:z72i7hdynmk6r22z27h6tvur#mls-receipt-02",
+        "did:web:evil.example#mls-receipt-2",
+    ] {
+        assert!(receipt_key_generation(&payload.sequencer_did, invalid).is_err());
+    }
 
     // Wrong expected sequencer DID
     assert!(

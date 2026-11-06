@@ -1110,9 +1110,9 @@ fn state_round_trips_and_a_restarted_client_keeps_working() {
     let mut v2 = state.to_vec();
     v2[4] = 2;
     assert_eq!(restore(&v2, A, 1), Err(Error::Unsupported(2)));
-    let mut v4 = state.to_vec();
-    v4[4] = 4;
-    assert_eq!(restore(&v4, A, 1), Err(Error::Unsupported(4)));
+    let mut v5 = state.to_vec();
+    v5[4] = 5;
+    assert_eq!(restore(&v5, A, 1), Err(Error::Unsupported(5)));
     let mut bad_key = state.to_vec();
     let at = 4 + 1 + 2 + A.len() + 32 + 1; // second byte of deviceKey (byte 0 is clamped)
     bad_key[at] ^= 1;

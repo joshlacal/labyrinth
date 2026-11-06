@@ -221,18 +221,39 @@ impl Labyrinth {
             frame_nonce,
             payload_bytes,
             receipt,
-            verify_commitment: true,
+            verify_commitment,
         } = &payload
         {
             if receipt.signed.payload.conversation_id != thread_id {
                 return Err(Error::Malformed("receipt conversation_id mismatch"));
             }
-            labyrinth_protocol::verify_archived_item_commitment(
-                &receipt.signed,
-                frame_nonce,
-                payload_bytes,
-            )
-            .map_err(|_| Error::ReceiptCommitmentMismatch)?;
+            let (sender_did, sender_device_id) = receipt
+                .signed
+                .payload
+                .split_sender_device()
+                .map_err(|_| Error::Malformed("invalid senderDevice in receipt"))?;
+            if receipt.original_sender_attestation.sender_did != sender_did
+                || receipt.original_sender_attestation.sender_device_id != sender_device_id
+            {
+                return Err(Error::BadSignature);
+            }
+            receipt.original_sender_attestation.verify(
+                thread_id,
+                message_id,
+                &receipt.signed.payload.archive_commitment,
+            )?;
+            if *verify_commitment {
+                labyrinth_protocol::verify_archived_item_commitment(
+                    &receipt.signed,
+                    frame_nonce,
+                    payload_bytes,
+                )
+                .map_err(|_| Error::ReceiptCommitmentMismatch)?;
+            }
+            self.verify_and_remember_receipt(thread_id, &receipt.signed)
+                .await?;
+        } else if self.receipt_required(thread_id).await? {
+            return Err(Error::ReceiptCommitmentMismatch);
         }
 
         let me_public = self.own_latest_checked().await?;

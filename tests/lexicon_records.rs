@@ -52,7 +52,7 @@ fn check<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
 #[test]
 fn lexicons_are_well_formed() {
     let lex = lexicons();
-    assert_eq!(lex.docs().count(), 56);
+    assert_eq!(lex.docs().count(), 57);
     for (id, doc) in lex.docs() {
         let main = &doc["defs"]["main"];
         if let Some(t @ ("query" | "procedure")) = main["type"].as_str() {
@@ -136,8 +136,7 @@ fn mailbox_records_round_trip() {
 
     // Virtual devices, with and without the passkey wrap.
     let code = RecoveryCode::generate().unwrap();
-    let (vrec, _) =
-        virtual_device::create(DID, &code, &a, &e0, &[9u8; 32], Mechanism::Passkey).unwrap();
+    let (vrec, _) = virtual_device::create(DID, &code, &a, &e0, Mechanism::Passkey).unwrap();
     let wrap = PasskeyWrap {
         wrapped_code: passkey::wrap_code(&[4u8; 32], &code).unwrap(),
         credential_id: vec![7u8; 64],
@@ -145,11 +144,18 @@ fn mailbox_records_round_trip() {
     for pk in [None, Some(&wrap)] {
         let r = VirtualDevice::from_bundle(&vrec, pk, ts.clone());
         check(&lex, nsid::VIRTUAL_DEVICE, &r);
+        assert_eq!(r.format_version, virtual_device::RECORD_FORMAT_VERSION);
         let (back, back_pk) = r.to_bundle().unwrap();
         assert_eq!(back, vrec);
         assert_eq!(back_pk.as_ref(), pk);
         assert_eq!(r.rkey(), hex::encode(vrec.vdevice_id));
     }
+    let mut old_format = VirtualDevice::from_bundle(&vrec, None, ts.clone());
+    old_format.format_version = 1;
+    assert_eq!(
+        old_format.to_bundle().unwrap_err(),
+        labyrinth::Error::Unsupported(1)
+    );
     let vdev = Device::from_public(&vrec.public, ts.clone());
     check(&lex, nsid::DEVICE, &vdev);
     assert_eq!(vdev.to_public().unwrap(), vrec.public);
@@ -433,8 +439,7 @@ fn gap_fields_validate() {
     let (p0, _) = open_genesis(DID, &a, &transport(1)).unwrap();
     let e0 = p0.assign_id(space_epoch_id(0));
     let code = RecoveryCode::generate().unwrap();
-    let (vrec, _) =
-        virtual_device::create(DID, &code, &a, &e0, &[9u8; 32], Mechanism::Keychain).unwrap();
+    let (vrec, _) = virtual_device::create(DID, &code, &a, &e0, Mechanism::Keychain).unwrap();
     let mut vd = VirtualDevice::from_bundle(&vrec, None, ts.clone());
     vd.last_used_at = Some(datetime_from_ms(10));
     check(&lex, nsid::VIRTUAL_DEVICE, &vd);

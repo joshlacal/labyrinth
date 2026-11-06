@@ -32,18 +32,79 @@ const KIND_COMMITTED_FRAME: u8 = 0x02;
 /// preserving authenticated sender attribution across `[CB-22]` leave and kick fallbacks.
 const KIND_ATTRIBUTED_FRAME: u8 = 0x03;
 
+/// Original sender's device-key attestation for an archived frame.
+///
+/// This is retained beside the sequencer receipt, never included in the
+/// blinded commitment that it signs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginalSenderArchiveAttestation {
+    pub sender_did: String,
+    pub sender_device_id: String,
+    pub sender_transport_public_key: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl OriginalSenderArchiveAttestation {
+    pub fn sign(
+        sender_did: String,
+        sender_device_id: String,
+        thread_id: &str,
+        message_id: &str,
+        archive_commitment: &[u8; 32],
+        signer: &dyn TransportSigner,
+    ) -> Self {
+        let transcript = labyrinth_protocol::transcripts::original_sender_archive_transcript(
+            thread_id,
+            message_id,
+            archive_commitment,
+        );
+        Self {
+            sender_did,
+            sender_device_id,
+            sender_transport_public_key: signer.transport_public_key(),
+            signature: signer.sign_transport(&transcript),
+        }
+    }
+
+    pub fn verify(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        archive_commitment: &[u8; 32],
+    ) -> Result<()> {
+        if self.sender_did.is_empty() || self.sender_device_id.is_empty() {
+            return Err(Error::Malformed("original sender archive identity"));
+        }
+        let transcript = labyrinth_protocol::transcripts::original_sender_archive_transcript(
+            thread_id,
+            message_id,
+            archive_commitment,
+        );
+        verify_transport(
+            &self.sender_transport_public_key,
+            &transcript,
+            &self.signature,
+        )
+    }
+}
+
 /// Sequencer receipt carried alongside a sealed or owner-archived item (`I13`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchivedReceipt {
     pub signed: labyrinth_protocol::receipt::SignedSequencerReceipt,
     pub generation: u64,
+    pub original_sender_attestation: OriginalSenderArchiveAttestation,
 }
 
 impl ArchivedReceipt {
-    pub fn new(signed: labyrinth_protocol::receipt::SignedSequencerReceipt) -> Self {
+    pub fn new(
+        signed: labyrinth_protocol::receipt::SignedSequencerReceipt,
+        original_sender_attestation: OriginalSenderArchiveAttestation,
+    ) -> Self {
         Self {
             signed,
             generation: 0,
+            original_sender_attestation,
         }
     }
 }

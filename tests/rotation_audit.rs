@@ -181,14 +181,14 @@ impl NowForTest for TestClock {
 }
 
 #[test]
-fn pq_v3_client_state_round_trips_and_rejects_legacy_versions() {
+fn pq_v4_client_state_round_trips_and_rejects_legacy_versions() {
     let net = MemoryBackend::new();
     let clock = TestClock::default();
     let phone = init(&net, &clock, A, 1);
-    let v3 = phone.export_state().unwrap();
-    assert_eq!(v3[4], 3);
+    let v4 = phone.export_state().unwrap();
+    assert_eq!(v4[4], 4);
     let restored = block_on(labyrinth::client::Labyrinth::from_state(
-        &v3,
+        &v4,
         A,
         Box::new(signer(1)),
         backends(&net, &clock, A),
@@ -196,8 +196,8 @@ fn pq_v3_client_state_round_trips_and_rejects_legacy_versions() {
     .unwrap();
     assert_eq!(restored.device_public(), phone.device_public());
 
-    for legacy_version in [1u8, 2u8] {
-        let mut legacy = v3.clone();
+    for legacy_version in [1u8, 2u8, 3u8] {
+        let mut legacy = v4.clone();
         legacy[4] = legacy_version;
         let err = match block_on(labyrinth::client::Labyrinth::from_state(
             &legacy,

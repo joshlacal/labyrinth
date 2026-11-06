@@ -1,0 +1,40 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.authorRedaction",
+  "defs": {
+    "main": {
+      "type": "record",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "description": "Immutable per-message author unsend. The rkey is the deterministic SHA-256 transcript of threadId and messageId; records are create-only and survive thread cleanup.",
+        "required": [
+          "threadId",
+          "messageId",
+          "redaction",
+          "createdAt"
+        ],
+        "properties": {
+          "threadId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "messageId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "redaction": {
+            "type": "ref",
+            "ref": "blue.catbird.labyrinth.defs#redaction"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

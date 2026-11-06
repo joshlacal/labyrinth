@@ -12,7 +12,7 @@ use crate::message::{
     open_sender_committed, verify_sender_device,
 };
 use crate::records::{Batch, BatchEntry, MekDistribution, OwnerBatch};
-use crate::store::{ServerOrder, Stored, TimeRange, VouchAt};
+use crate::store::{ServerOrder, Stored, TimeRange, VouchAt, keys_valid_for};
 use crate::{Error, Result};
 
 /// Where a loaded message came from.
@@ -52,9 +52,9 @@ pub struct LoadedMessage {
     pub conflict: bool,
 }
 
-/// A verified witness copy that was not accepted (ruling 3). Nothing
-/// authenticates the message id a witness files a receipt under, so it
-/// never replaces, flags or re-attributes an accepted copy.
+/// A verified witness copy that was not accepted (ruling 3). The original
+/// sender attestation authenticates its message id, but a conflicting copy
+/// still never replaces, flags or re-attributes an accepted copy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RejectedCopy {
     pub message_id: String,
@@ -149,9 +149,23 @@ impl Labyrinth {
             .mailbox
             .list_owner_batches(thread_id, TimeRange::ALL)
             .await?;
+        let receipts_required = self.receipt_required(thread_id).await?
+            || batches.iter().any(|batch| {
+                batch
+                    .value
+                    .items
+                    .iter()
+                    .any(|item| item.sequencer_receipt.is_some())
+            });
         let mut history = ThreadHistory::default();
         let tombstones = self
-            .open_owner_batches(thread_id, batches, &|_, _| true, &mut history)
+            .open_owner_batches(
+                thread_id,
+                batches,
+                &|_, _| true,
+                &mut history,
+                receipts_required,
+            )
             .await?;
         finish(&mut history, &tombstones);
         Ok(history)
@@ -166,9 +180,21 @@ impl Labyrinth {
             order: None,
             value: batch,
         };
+        let receipts_required = self.receipt_required(&thread_id).await?
+            || stored
+                .value
+                .items
+                .iter()
+                .any(|item| item.sequencer_receipt.is_some());
         let mut history = ThreadHistory::default();
         let tombstones = self
-            .open_owner_batches(&thread_id, vec![stored], &|_, _| true, &mut history)
+            .open_owner_batches(
+                &thread_id,
+                vec![stored],
+                &|_, _| true,
+                &mut history,
+                receipts_required,
+            )
             .await?;
         finish(&mut history, &tombstones);
         Ok(history)
@@ -195,16 +221,31 @@ impl Labyrinth {
                 .list_batches(thread_id, None, TimeRange::ALL)
                 .await,
         )?;
-        let keep = |_: &str, ts: u64| range.contains(ts);
-        self.open_batches(thread_id, batches, &keep, &mut h, true)
-            .await?;
         let owner = self
             .b
             .mailbox
             .list_owner_batches(thread_id, TimeRange::ALL)
             .await?;
+        let receipts_required = self.receipt_required(thread_id).await?
+            || batches.iter().any(|batch| {
+                batch
+                    .value
+                    .items
+                    .iter()
+                    .any(|item| item.sequencer_receipt.is_some())
+            })
+            || owner.iter().any(|batch| {
+                batch
+                    .value
+                    .items
+                    .iter()
+                    .any(|item| item.sequencer_receipt.is_some())
+            });
+        let keep = |_: &str, ts: u64| range.contains(ts);
+        self.open_batches(thread_id, batches, &keep, &mut h, true, receipts_required)
+            .await?;
         let tombstones = self
-            .open_owner_batches(thread_id, owner, &keep, &mut h)
+            .open_owner_batches(thread_id, owner, &keep, &mut h, receipts_required)
             .await?;
         // An admitted Space is authoritative for message copies. Owner records
         // still contribute account-private tombstones, but must not reserve a
@@ -245,9 +286,32 @@ impl Labyrinth {
         keep: Keep<'_>,
         h: &mut ThreadHistory,
         strict: bool,
+        receipts_required: bool,
     ) -> Result<()> {
         batches.sort_by_key(|b| b.order.map(|o| o.labyrinth_seq));
+        let mut roster_membership = HashMap::new();
         for b in batches {
+            if receipts_required {
+                let is_member = if let Some(is_member) = roster_membership.get(&b.author) {
+                    *is_member
+                } else {
+                    let leaves = self
+                        .b
+                        .directory
+                        .member_device_keys(thread_id, &b.author)
+                        .await?
+                        .ok_or(Error::DirectoryIncomplete {
+                            pds_present: true,
+                            ds_present: false,
+                        })?;
+                    let is_member = !leaves.is_empty();
+                    roster_membership.insert(b.author.clone(), is_member);
+                    is_member
+                };
+                if !is_member {
+                    continue;
+                }
+            }
             let author = Some(b.author.clone());
             let items = if b.value.thread_id == thread_id {
                 b.value.entries()
@@ -305,7 +369,10 @@ impl Labyrinth {
                     }
                 };
                 let at = VouchAt::of(b.order, s.timestamp);
-                match self.open_sealed_inner(thread_id, &b.author, &s, at).await {
+                match self
+                    .open_sealed_inner(thread_id, &b.author, &s, at, receipts_required)
+                    .await
+                {
                     Ok(opened) => {
                         let (frame, archived_receipt, frame_nonce, sender) = match opened {
                             OpenedSealed::Plain(frame) => (frame, None, None, b.author.clone()),
@@ -431,9 +498,9 @@ impl Labyrinth {
         batches: Vec<Stored<OwnerBatch>>,
         keep: Keep<'_>,
         h: &mut ThreadHistory,
+        receipts_required: bool,
     ) -> Result<Vec<Tombstone>> {
         let mut tombstones = Vec::new();
-        let receipt_key = self.b.directory.sequencer_receipt_key(thread_id).await?;
         for b in batches {
             for m in b.value.to_messages()? {
                 if m.thread_id != thread_id {
@@ -446,7 +513,7 @@ impl Labyrinth {
                 };
                 match opened {
                     Ok(OwnerContent::Frame(frame)) if selected => {
-                        if m.sequencer_receipt.is_some() {
+                        if m.sequencer_receipt.is_some() || receipts_required {
                             h.undecryptable.push(Undecryptable {
                                 message_id: m.message_id,
                                 timestamp: m.timestamp,
@@ -468,7 +535,7 @@ impl Labyrinth {
                         }
                     }
                     Ok(OwnerContent::AttributedFrame { sender_did, frame }) if selected => {
-                        if m.sequencer_receipt.is_some() {
+                        if m.sequencer_receipt.is_some() || receipts_required {
                             h.undecryptable.push(Undecryptable {
                                 message_id: m.message_id,
                                 timestamp: m.timestamp,
@@ -495,43 +562,20 @@ impl Labyrinth {
                                 .sequencer_receipt
                                 .as_ref()
                                 .ok_or(Error::ReceiptCommitmentMismatch)?;
-                            if archived.signed.payload.conversation_id != thread_id {
-                                return Err(Error::Malformed("receipt conversation_id mismatch"));
-                            }
-                            let (sender_did, _) =
-                                archived.signed.payload.split_sender_device().map_err(|_| {
-                                    Error::Malformed("invalid senderDevice in receipt")
-                                })?;
-                            // The receipt issuer is trusted only now: owner AEAD
-                            // authenticated the complete receipt before this branch.
-                            let resolved = if receipt_key.is_none() {
-                                self.b
-                                    .directory
-                                    .sequencer_receipt_key_for_authority(
-                                        thread_id,
-                                        &archived.signed.payload.sequencer_did,
-                                    )
-                                    .await?
-                            } else {
-                                None
-                            };
-                            let rk = receipt_key
-                                .as_ref()
-                                .or(resolved.as_ref())
-                                .ok_or(Error::Unattested)?;
-                            labyrinth_protocol::verify_sequencer_receipt_sec1(
-                                &rk.public_key_sec1,
-                                &rk.did,
-                                &archived.signed,
-                            )
-                            .map_err(|_| Error::BadSignature)?;
+                            self.verify_and_remember_receipt(thread_id, &archived.signed)
+                                .await?;
                             labyrinth_protocol::verify_archived_item_commitment(
                                 &archived.signed,
                                 &frame_nonce,
                                 &frame,
                             )
                             .map_err(|_| Error::ReceiptCommitmentMismatch)?;
-                            Ok(sender_did.to_owned())
+                            self.verify_original_sender_attestation(
+                                thread_id,
+                                &m.message_id,
+                                archived,
+                            )
+                            .await
                         }
                         .await;
                         match verified {
@@ -585,25 +629,12 @@ impl Labyrinth {
         author: &str,
         s: &SealedMessage,
         at: VouchAt,
+        receipts_required: bool,
     ) -> Result<OpenedSealed> {
-        let receipt_key = self.b.directory.sequencer_receipt_key(thread_id).await?;
-        if let Some(ref archived) = s.sequencer_receipt {
-            let rk = receipt_key.ok_or(Error::Unattested)?;
-            if archived.signed.payload.conversation_id != thread_id {
-                return Err(Error::Malformed("receipt conversation_id mismatch"));
-            }
-            let (receipt_sender_did, _) = archived
-                .signed
-                .payload
-                .split_sender_device()
-                .map_err(|_| Error::Malformed("invalid senderDevice in receipt"))?;
-            let sender = receipt_sender_did.to_owned();
-            labyrinth_protocol::verify_sequencer_receipt_sec1(
-                &rk.public_key_sec1,
-                &rk.did,
-                &archived.signed,
-            )
-            .map_err(|_| Error::BadSignature)?;
+        if let Some(archived) = &s.sequencer_receipt {
+            self.verify_and_remember_receipt(thread_id, &archived.signed)
+                .await?;
+            let sender = archived.original_sender_attestation.sender_did.clone();
 
             let issued_ms = u64::try_from(archived.signed.payload.issued_at_ms)
                 .map_err(|_| Error::Malformed("negative receipt issuedAtMs"))?;
@@ -611,18 +642,18 @@ impl Labyrinth {
                 .b
                 .directory
                 .member_device_keys(thread_id, author)
-                .await?;
+                .await?
+                .ok_or(Error::DirectoryIncomplete {
+                    pds_present: true,
+                    ds_present: false,
+                })?;
             let receipt_at = VouchAt::Server(ServerOrder {
                 labyrinth_seq: archived.signed.payload.seq,
-                chat_seq: leaves.as_ref().map(|_| archived.signed.payload.seq),
+                chat_seq: Some(archived.signed.payload.seq),
                 received_at_ms: issued_ms,
             });
-            verify_sender_device(
-                s,
-                &self
-                    .transport_keys(author, Some(thread_id), receipt_at)
-                    .await?,
-            )?;
+            let author_keys = self.b.directory.device_transport_keys(author).await?;
+            verify_sender_device(s, &keys_valid_for(&author_keys, Some(&leaves), receipt_at))?;
             let mek = self.mek_for(thread_id, &s.mek_id, issued_ms).await?;
             let (frame_nonce, frame) = open_sender_committed(s, thread_id, &mek)?;
             labyrinth_protocol::verify_archived_item_commitment(
@@ -631,6 +662,12 @@ impl Labyrinth {
                 &frame,
             )
             .map_err(|_| Error::ReceiptCommitmentMismatch)?;
+            let verified_sender = self
+                .verify_original_sender_attestation(thread_id, &s.message_id, archived)
+                .await?;
+            if verified_sender != sender {
+                return Err(Error::BadSignature);
+            }
             return Ok(OpenedSealed::Committed {
                 frame_nonce,
                 frame,
@@ -639,13 +676,60 @@ impl Labyrinth {
             });
         }
 
-        if receipt_key.is_some() {
+        if receipts_required {
             return Err(Error::ReceiptCommitmentMismatch);
         }
 
         verify_sender_device(s, &self.transport_keys(author, Some(thread_id), at).await?)?;
         let mek = self.mek_for(thread_id, &s.mek_id, s.timestamp).await?;
         open_sender(s, thread_id, &mek).map(OpenedSealed::Plain)
+    }
+
+    async fn verify_original_sender_attestation(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        archived: &ArchivedReceipt,
+    ) -> Result<String> {
+        let (sender_did, sender_device_id) = archived
+            .signed
+            .payload
+            .split_sender_device()
+            .map_err(|_| Error::Malformed("invalid senderDevice in receipt"))?;
+        let attestation = &archived.original_sender_attestation;
+        if attestation.sender_did != sender_did || attestation.sender_device_id != sender_device_id
+        {
+            return Err(Error::BadSignature);
+        }
+        attestation.verify(
+            thread_id,
+            message_id,
+            &archived.signed.payload.archive_commitment,
+        )?;
+
+        let leaves = self
+            .b
+            .directory
+            .member_device_keys(thread_id, sender_did)
+            .await?
+            .ok_or(Error::DirectoryIncomplete {
+                pds_present: true,
+                ds_present: false,
+            })?;
+        let issued_ms = u64::try_from(archived.signed.payload.issued_at_ms)
+            .map_err(|_| Error::Malformed("negative receipt issuedAtMs"))?;
+        let at = VouchAt::Server(ServerOrder {
+            labyrinth_seq: archived.signed.payload.seq,
+            chat_seq: Some(archived.signed.payload.seq),
+            received_at_ms: issued_ms,
+        });
+        let account_keys = self.b.directory.device_transport_keys(sender_did).await?;
+        if !keys_valid_for(&account_keys, Some(&leaves), at)
+            .contains(&attestation.sender_transport_public_key)
+        {
+            return Err(Error::BadSignature);
+        }
+        Ok(sender_did.to_owned())
     }
 
     async fn mek_for(&mut self, thread_id: &str, mek_id: &[u8; 12], claim_ms: u64) -> Result<Mek> {

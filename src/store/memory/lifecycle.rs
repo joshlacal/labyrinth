@@ -4,12 +4,13 @@
 
 use super::{MemoryBackend, State};
 use crate::deletion::{Redaction, ServerRedaction};
-use crate::records::{RedactionDef, datetime_from_ms};
+use crate::records::{AuthorRedaction, RedactionDef, datetime_from_ms};
 use crate::sign::{Ed25519Transport, TransportSigner};
 use crate::{Error, Result};
 
 impl State {
-    /// Redacts every item of `did` with `message_id` in `thread_id`.
+    /// Publishes one immutable per-message author redaction. The source batch
+    /// remains untouched; readers overlay this record on every copy.
     pub(super) fn redact(
         &mut self,
         did: &str,
@@ -17,6 +18,13 @@ impl State {
         message_id: &str,
         redaction: &Redaction,
     ) -> Result<usize> {
+        if self
+            .threads
+            .get(thread_id)
+            .is_some_and(|thread| thread.no_read.contains(did))
+        {
+            return Err(Error::Forbidden);
+        }
         redaction.verify(did, thread_id, message_id)?;
         let current = self
             .chat_devices
@@ -27,27 +35,39 @@ impl State {
         }
         let mut stamped = redaction.clone();
         stamped.redacted_at = Some(datetime_from_ms(self.server_now));
-        let def = RedactionDef::from_redaction(&stamped);
-        let mut n = 0;
-        let repo = self
-            .threads
-            .get_mut(thread_id)
-            .and_then(|t| t.repos.get_mut(did));
-        for (b, _) in repo.into_iter().flat_map(|r| r.batches.values_mut()) {
-            for i in b
-                .items
-                .iter_mut()
-                .filter(|i| i.message_id == message_id && i.redaction.is_none())
+        let record = AuthorRedaction::new(
+            thread_id,
+            message_id,
+            &stamped,
+            stamped
+                .redacted_at
+                .clone()
+                .ok_or(Error::Malformed("redaction timestamp"))?,
+        );
+        let thread = self.threads.entry(thread_id.to_owned()).or_default();
+        let count = thread
+            .repos
+            .get(did)
+            .into_iter()
+            .flat_map(|repo| repo.batches.values())
+            .flat_map(|(batch, _)| &batch.items)
+            .filter(|item| item.message_id == message_id)
+            .count();
+        let key = (did.to_owned(), message_id.to_owned());
+        if let Some(existing) = thread.author_redactions.get(&key) {
+            existing
+                .to_redaction()?
+                .verify(did, thread_id, message_id)?;
+            if existing.thread_id != thread_id
+                || existing.message_id != message_id
+                || existing.rkey() != record.rkey()
             {
-                i.signed_enc_message.0.clear();
-                i.redaction = Some(def.clone());
-                n += 1;
+                return Err(Error::Conflict);
             }
+            return Ok(count);
         }
-        if n == 0 {
-            return Err(Error::NotFound("message"));
-        }
-        Ok(n)
+        thread.author_redactions.insert(key, record);
+        Ok(count)
     }
 
     /// mls-ds `deleteAccountData`: redact every live item attributed to
@@ -138,7 +158,6 @@ impl State {
             .mailboxes
             .get_mut(did)
             .and_then(|m| m.vdevices.get_mut(&hex::encode(id)))
-            .filter(|vd| !super::vdevice_expired_at(vd, now_ms))
             .ok_or(Error::NotFound("virtual device"))?;
         vd.last_used_at = Some(now);
         Ok(())

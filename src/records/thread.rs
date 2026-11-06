@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::defs::{EpochPublicDef, MekRecipientDef, SealedMessageDef};
+use super::defs::{EpochPublicDef, MekRecipientDef, RedactionDef, SealedMessageDef};
 use super::{Bytes, check_type, nsid};
 use crate::mailbox::EpochPublic;
 use crate::mek::{MekRecord, MekSender};
@@ -179,6 +179,66 @@ impl BatchEntry {
             Self::Sealed(s) => s.timestamp,
             Self::Redacted { timestamp, .. } => *timestamp,
         }
+    }
+}
+
+/// Immutable author unsend record. Its deterministic rkey gives each message
+/// an independent create-if-absent slot, so concurrent unsends cannot overwrite
+/// one another's batch state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorRedaction {
+    #[serde(rename = "$type")]
+    pub type_: String,
+    pub thread_id: String,
+    pub message_id: String,
+    pub redaction: RedactionDef,
+    pub created_at: String,
+}
+
+impl AuthorRedaction {
+    pub fn new(
+        thread_id: &str,
+        message_id: &str,
+        redaction: &crate::deletion::Redaction,
+        created_at: String,
+    ) -> Self {
+        Self {
+            type_: nsid::AUTHOR_REDACTION.into(),
+            thread_id: thread_id.to_owned(),
+            message_id: message_id.to_owned(),
+            redaction: RedactionDef::from_redaction(redaction),
+            created_at,
+        }
+    }
+
+    pub fn rkey(&self) -> String {
+        let mut transcript = Vec::with_capacity(
+            "catbird.labyrinth.author_redaction_record.v1\0".len()
+                + self.thread_id.len()
+                + self.message_id.len()
+                + 8,
+        );
+        transcript.extend_from_slice(b"catbird.labyrinth.author_redaction_record.v1\0");
+        labyrinth_protocol::transcripts::push_len_prefixed(
+            &mut transcript,
+            self.thread_id.as_bytes(),
+        );
+        labyrinth_protocol::transcripts::push_len_prefixed(
+            &mut transcript,
+            self.message_id.as_bytes(),
+        );
+        hex::encode(crate::encoding::sha256(&transcript))
+    }
+
+    pub fn to_redaction(&self) -> Result<crate::deletion::Redaction> {
+        check_type(&self.type_, nsid::AUTHOR_REDACTION)?;
+        if self.thread_id.is_empty() || self.message_id.is_empty() {
+            return Err(Error::Malformed("author redaction coordinates"));
+        }
+        self.redaction
+            .to_redaction()?
+            .ok_or(Error::Malformed("authorRedaction is not author signed"))
     }
 }
 
