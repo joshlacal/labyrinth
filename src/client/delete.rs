@@ -6,6 +6,7 @@ use super::Labyrinth;
 use crate::deletion::Redaction;
 use crate::epoch::EpochKeys as _;
 use crate::message::seal_owner_tombstone;
+use crate::records::{Batch, RedactionDef, SealedMessageDef, nsid};
 use crate::store::{KeyPublisher, MailboxStore, TimeRange};
 use crate::{Error, Result};
 
@@ -77,24 +78,60 @@ impl Labyrinth {
         Ok(())
     }
 
-    /// Unsend: drop any unflushed copy of my message `message_id` and rewrite
-    /// stored copies in-place with an author-signed redaction.
+    /// Unsend: durably publish an author-signed redaction, then remove any
+    /// matching unflushed ciphertext from the local sender queue.
     pub async fn unsend(&mut self, thread_id: &str, message_id: &str) -> Result<usize> {
-        let mut dropped = 0;
-        if let Some(q) = self.outbox.get_mut(thread_id) {
-            let before = q.len();
-            q.retain(|m| m.message_id != message_id);
-            dropped = before - q.len();
-            if q.is_empty() {
-                self.outbox_rosters.remove(thread_id);
+        let pending: Vec<_> = self
+            .outbox
+            .get(thread_id)
+            .into_iter()
+            .flatten()
+            .filter(|m| m.message_id == message_id)
+            .cloned()
+            .collect();
+        let mut redaction =
+            Redaction::sign(&self.did, thread_id, message_id, self.transport.as_ref());
+        redaction.redacted_at = Some(self.now());
+
+        let stored = match self
+            .b
+            .threads
+            .redact_item(thread_id, message_id, &redaction)
+            .await
+        {
+            Ok(n) => n,
+            Err(Error::NotFound(_)) if !pending.is_empty() => {
+                // A receiver may already have archived a witness copy even
+                // though the author's ciphertext never left this outbox.
+                // Publish a standalone tombstone before dropping that queue
+                // entry so the witness cannot resurrect it.
+                let mut item = SealedMessageDef::from_message(&pending[0]);
+                item.signed_enc_message.0.clear();
+                item.sequencer_receipt = None;
+                item.redaction = Some(RedactionDef::from_redaction(&redaction));
+                self.b
+                    .threads
+                    .append_batch(&Batch {
+                        type_: nsid::BATCH.into(),
+                        thread_id: thread_id.to_owned(),
+                        items: vec![item],
+                        created_at: self.now(),
+                    })
+                    .await?;
+                0
+            }
+            Err(e) => return Err(e),
+        };
+
+        if !pending.is_empty() {
+            if let Some(q) = self.outbox.get_mut(thread_id) {
+                q.retain(|m| m.message_id != message_id);
+                if q.is_empty() {
+                    self.outbox_rosters.remove(thread_id);
+                }
             }
         }
-        let r = Redaction::sign(&self.did, thread_id, message_id, self.transport.as_ref());
-        match self.b.threads.redact_item(thread_id, message_id, &r).await {
-            Ok(n) => Ok(dropped + n),
-            Err(Error::NotFound(_)) if dropped > 0 => Ok(dropped),
-            Err(e) => Err(e),
-        }
+        Ok(stored + pending.len())
     }
 
     /// Account deletion, client-orchestrated.

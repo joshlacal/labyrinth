@@ -175,6 +175,10 @@ impl Labyrinth {
     }
 
     /// Load and decrypt every message of `thread_id` in `range`.
+    ///
+    /// Redactions and owner tombstones are reconciled over the complete thread
+    /// before the display range is applied. Otherwise an older unsend/delete
+    /// can be omitted while a newer witness copy is returned.
     pub async fn load_thread(
         &mut self,
         thread_id: &str,
@@ -186,15 +190,28 @@ impl Labyrinth {
         };
         let batches = self.readable(
             &mut h,
-            self.b.threads.list_batches(thread_id, None, range).await,
+            self.b
+                .threads
+                .list_batches(thread_id, None, TimeRange::ALL)
+                .await,
         )?;
         let keep = |_: &str, ts: u64| range.contains(ts);
         self.open_batches(thread_id, batches, &keep, &mut h, true)
             .await?;
-        let owner = self.b.mailbox.list_owner_batches(thread_id, range).await?;
+        let owner = self
+            .b
+            .mailbox
+            .list_owner_batches(thread_id, TimeRange::ALL)
+            .await?;
         let tombstones = self
             .open_owner_batches(thread_id, owner, &keep, &mut h)
             .await?;
+        // An admitted Space is authoritative for message copies. Owner records
+        // still contribute account-private tombstones, but must not reserve a
+        // message id or sequencer receipt ahead of sender/witness copies.
+        if h.space_readable {
+            h.messages.retain(|m| m.source != MessageSource::Owner);
+        }
         finish(&mut h, &tombstones);
         Ok(h)
     }
@@ -249,11 +266,10 @@ impl Labyrinth {
                     continue;
                 }
             };
-            for (entry, raw) in items
-                .into_iter()
-                .zip(&b.value.items)
-                .filter(|(e, _)| keep(e.message_id(), e.timestamp()))
-            {
+            for (entry, raw) in items.into_iter().zip(&b.value.items) {
+                if matches!(&entry, BatchEntry::Sealed(s) if !keep(&s.message_id, s.timestamp)) {
+                    continue;
+                }
                 let s = match entry {
                     BatchEntry::Sealed(s) => s,
                     BatchEntry::Redacted {
@@ -420,15 +436,16 @@ impl Labyrinth {
         let receipt_key = self.b.directory.sequencer_receipt_key(thread_id).await?;
         for b in batches {
             for m in b.value.to_messages()? {
-                if m.thread_id != thread_id || !keep(&m.message_id, m.timestamp) {
+                if m.thread_id != thread_id {
                     continue;
                 }
+                let selected = keep(&m.message_id, m.timestamp);
                 let opened = match self.epoch_secret(m.epoch_seq).await {
                     Ok(e) => open_owner_content(e.root(), &m),
                     Err(err) => Err(err),
                 };
                 match opened {
-                    Ok(OwnerContent::Frame(frame)) => {
+                    Ok(OwnerContent::Frame(frame)) if selected => {
                         if m.sequencer_receipt.is_some() {
                             h.undecryptable.push(Undecryptable {
                                 message_id: m.message_id,
@@ -450,7 +467,7 @@ impl Labyrinth {
                             });
                         }
                     }
-                    Ok(OwnerContent::AttributedFrame { sender_did, frame }) => {
+                    Ok(OwnerContent::AttributedFrame { sender_did, frame }) if selected => {
                         if m.sequencer_receipt.is_some() {
                             h.undecryptable.push(Undecryptable {
                                 message_id: m.message_id,
@@ -472,7 +489,7 @@ impl Labyrinth {
                             });
                         }
                     }
-                    Ok(OwnerContent::CommittedFrame { frame_nonce, frame }) => {
+                    Ok(OwnerContent::CommittedFrame { frame_nonce, frame }) if selected => {
                         let verified = async {
                             let archived = m
                                 .sequencer_receipt
@@ -540,12 +557,14 @@ impl Labyrinth {
                     Ok(OwnerContent::Tombstone { author }) => {
                         tombstones.push((m.message_id, author));
                     }
-                    Err(error) => h.undecryptable.push(Undecryptable {
+                    Ok(_) => {}
+                    Err(error) if selected => h.undecryptable.push(Undecryptable {
                         message_id: m.message_id,
                         timestamp: m.timestamp,
                         sender: None,
                         error,
                     }),
+                    Err(_) => {}
                 }
             }
         }
@@ -728,11 +747,9 @@ pub(super) fn finish(h: &mut ThreadHistory, tombstones: &[Tombstone]) {
         .map(|r| (r.message_id.as_str(), r.sender.as_str()))
         .collect();
     h.messages.retain(|m| {
-        m.source == MessageSource::Sender
-            || !m
-                .sender
-                .as_deref()
-                .is_some_and(|s| gone.contains(&(m.message_id.as_str(), s)))
+        !m.sender
+            .as_deref()
+            .is_some_and(|s| gone.contains(&(m.message_id.as_str(), s)))
     });
     let hidden = |id: &str, sender: Option<&String>| {
         tombstones.iter().any(|(t, author)| {

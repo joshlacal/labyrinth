@@ -570,6 +570,29 @@ fn contradicting_witness_copies_are_rejected_not_conflicts() {
             summary(&one),
             [("m1", Some(A), MessageSource::Sender, 100, false)]
         );
+        let alias = block_on(lab.load_message(THREAD, "m9")).unwrap();
+        assert!(alias.messages.is_empty());
+        assert_eq!(rejected(&alias), [("m9", Rejection::ReceiptReused)]);
+        let mut cursor: Option<ThreadCursor> = None;
+        let mut paged_messages = Vec::new();
+        let mut paged_rejections = Vec::new();
+        loop {
+            let page = block_on(lab.load_thread_page(THREAD, cursor.as_ref(), 1)).unwrap();
+            paged_messages.extend(page.history.messages.iter().map(|m| m.message_id.clone()));
+            paged_rejections.extend(
+                page.history
+                    .rejected
+                    .iter()
+                    .map(|r| (r.message_id.clone(), r.reason)),
+            );
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        paged_messages.sort();
+        assert_eq!(paged_messages, ["m1", "m2"]);
+        assert!(paged_rejections.contains(&("m9".to_owned(), Rejection::ReceiptReused)));
     }
 
     // Re-archiving keeps exactly the accepted copies.
@@ -700,4 +723,115 @@ fn account_deletion_hides_every_copy_of_the_accounts_messages() {
         paged.sort();
         assert_eq!(paged, ["a1", "a2", "b1"]);
     }
+}
+
+#[test]
+fn queued_only_unsend_publishes_a_witness_suppressing_redaction() {
+    let w = World::new();
+    let mut alice = w.join(A, 1);
+    let mut bob = w.join(B, 2);
+    let mut carol = w.join(C, 3);
+    let all = [A, B, C];
+    let message = w.sequence(A, "queued");
+
+    archive(&mut alice, &all, &message, 100);
+    archive(&mut bob, &all, &message, 200);
+    block_on(bob.flush()).unwrap();
+    assert_eq!(alice.pending(THREAD), 1);
+
+    assert_eq!(block_on(alice.unsend(THREAD, "queued")).unwrap(), 1);
+    assert_eq!(alice.pending(THREAD), 0);
+    let h = load(&mut carol);
+    assert!(h.messages.is_empty(), "{:?}", summary(&h));
+    assert_eq!(
+        h.redacted
+            .iter()
+            .map(|r| (r.message_id.as_str(), r.sender.as_str(), r.by_author))
+            .collect::<Vec<_>>(),
+        [("queued", A, true)]
+    );
+}
+
+#[test]
+fn queued_only_unsend_keeps_the_journal_when_redaction_cannot_publish() {
+    let w = World::new();
+    let mut alice = w.join(A, 1);
+    let all = [A];
+    let message = w.sequence(A, "still-queued");
+
+    archive(&mut alice, &all, &message, 100);
+    w.net.revoke_thread_access(THREAD, A);
+    assert_eq!(
+        block_on(alice.unsend(THREAD, "still-queued")).unwrap_err(),
+        labyrinth::Error::Forbidden
+    );
+    assert_eq!(alice.pending(THREAD), 1);
+}
+
+#[test]
+fn evidence_outside_a_display_window_still_hides_selected_copies() {
+    let w = World::new();
+    let mut alice = w.join(A, 1);
+    let mut bob = w.join(B, 2);
+    let mut carol = w.join(C, 3);
+    let all = [A, B, C];
+    let unsent = w.sequence(A, "unsent");
+    let private = w.sequence(B, "private");
+
+    archive(&mut alice, &all, &unsent, 100);
+    archive(&mut bob, &all, &unsent, 200);
+    archive(&mut bob, &all, &private, 210);
+    block_on(alice.flush()).unwrap();
+    block_on(bob.flush()).unwrap();
+    assert_eq!(block_on(alice.unsend(THREAD, "unsent")).unwrap(), 1);
+    block_on(carol.delete_for_me(THREAD, "private", 90, Some(B), &[])).unwrap();
+
+    let h = block_on(carol.load_thread(
+        THREAD,
+        TimeRange {
+            from_ms: Some(150),
+            until_ms: Some(250),
+        },
+    ))
+    .unwrap();
+    assert!(h.messages.is_empty(), "{:?}", summary(&h));
+    assert_eq!(h.deleted_for_me, ["private"]);
+    assert!(
+        h.redacted
+            .iter()
+            .any(|r| r.message_id == "unsent" && r.by_author)
+    );
+}
+
+#[test]
+fn active_space_deconfliction_ignores_owner_alias_but_keeps_tombstones() {
+    let w = World::new();
+    let _alice = w.join(A, 1);
+    let mut bob = w.join(B, 2);
+    let mut carol = w.join(C, 3);
+    let all = [A, B, C];
+    let message = w.sequence(A, "m1");
+
+    relabel(&mut bob, &all, "m9", &message, 100);
+    block_on(bob.flush()).unwrap();
+    assert_eq!(
+        block_on(bob.rearchive_thread_before_leave(THREAD)).unwrap(),
+        1
+    );
+    block_on(w.net.threads(B).clear_records(THREAD)).unwrap();
+    archive(&mut carol, &all, &message, 200);
+    block_on(carol.flush()).unwrap();
+
+    let h = load(&mut bob);
+    assert!(h.space_readable);
+    assert_eq!(
+        summary(&h),
+        [("m1", Some(A), MessageSource::Witness, 200, false)]
+    );
+    assert!(h.rejected.is_empty(), "{:?}", h.rejected);
+
+    block_on(bob.delete_for_me(THREAD, "m1", 50, Some(A), &[])).unwrap();
+    let hidden = load(&mut bob);
+    assert!(hidden.messages.is_empty());
+    assert_eq!(hidden.deleted_for_me, ["m1"]);
 }

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::Labyrinth;
-use super::read::{ThreadHistory, finish};
+use super::read::ThreadHistory;
 use crate::{Error, Result};
 
 /// Where a newest-first page ended: the oldest message position
@@ -68,30 +68,28 @@ pub struct ThreadList {
     pub incomplete: Vec<String>,
 }
 
+fn project_history(h: &mut ThreadHistory, keep: impl Fn(&str) -> bool) {
+    h.messages.retain(|m| keep(&m.message_id));
+    h.undecryptable.retain(|m| keep(&m.message_id));
+    h.redacted.retain(|m| keep(&m.message_id));
+    h.deleted_for_me.retain(|id| keep(id));
+    h.rejected.retain(|m| keep(&m.message_id));
+}
+
 impl Labyrinth {
-    /// Every copy of message `message_id` in `thread_id` (sender copies,
-    /// owner copies, a redaction), with delete-for-me applied: an empty
-    /// result means it is unknown, unsent ([`ThreadHistory::redacted`]) or
-    /// deleted for me ([`ThreadHistory::deleted_for_me`]).
+    /// Every accepted copy of `message_id` in `thread_id`, with redactions,
+    /// delete-for-me and conversation-wide receipt replay admission applied.
     pub async fn load_message(
         &mut self,
         thread_id: &str,
         message_id: &str,
     ) -> Result<ThreadHistory> {
-        let mut h = ThreadHistory {
-            space_readable: true,
-            ..ThreadHistory::default()
-        };
-        let ids = [message_id];
-        let batches = self.readable(&mut h, self.b.threads.get_messages(thread_id, &ids).await)?;
-        let keep = |id: &str, _| id == message_id;
-        self.open_batches(thread_id, batches, &keep, &mut h, true)
+        // Receipt identity is conversation-wide: projecting before admission
+        // lets one receipt be accepted under a different id on each lookup.
+        let mut h = self
+            .load_thread(thread_id, crate::store::TimeRange::ALL)
             .await?;
-        let owner = self.b.mailbox.get_owner_messages(thread_id, &ids).await?;
-        let tombstones = self
-            .open_owner_batches(thread_id, owner, &keep, &mut h)
-            .await?;
-        finish(&mut h, &tombstones);
+        project_history(&mut h, |id| id == message_id);
         Ok(h)
     }
 
@@ -199,18 +197,18 @@ impl Labyrinth {
             None
         };
         let selected: BTreeSet<&str> = candidates.iter().take(limit).map(|&(_, id)| id).collect();
-        let keep = |id: &str, _| selected.contains(id);
-        self.open_batches(thread_id, batches, &keep, &mut h, true)
+        // Keep the store window for cursor positioning, but decide receipt
+        // identity, redactions and tombstones against the authenticated whole
+        // thread before projecting this page.
+        let mut history = self
+            .load_thread(thread_id, crate::store::TimeRange::ALL)
             .await?;
-        let tombstones = self
-            .open_owner_batches(thread_id, owner, &keep, &mut h)
-            .await?;
-        finish(&mut h, &tombstones);
-        h.messages.reverse();
-        h.undecryptable.reverse();
-        h.redacted.reverse();
-        h.rejected.reverse();
-        Ok(ThreadPage { history: h, next })
+        project_history(&mut history, |id| selected.contains(id));
+        history.messages.reverse();
+        history.undecryptable.reverse();
+        history.redacted.reverse();
+        history.rejected.reverse();
+        Ok(ThreadPage { history, next })
     }
 
     /// Every thread this account has history in, from its own records:

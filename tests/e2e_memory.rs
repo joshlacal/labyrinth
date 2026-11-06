@@ -1048,7 +1048,7 @@ fn passkey_restore_and_batch_limits() {
     // Owner archive round trip on the restored device.
     block_on(tablet.archive_owner(THREAD, "own-1", 5, b"note")).unwrap();
     block_on(tablet.flush()).unwrap();
-    let h = read(&mut tablet);
+    let h = block_on(tablet.load_owner_thread(THREAD)).unwrap();
     let own: Vec<_> = h
         .messages
         .iter()

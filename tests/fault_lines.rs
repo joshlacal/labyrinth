@@ -873,20 +873,18 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
     .unwrap();
     block_on(bob.flush()).unwrap();
 
-    // 2. While Alice is STILL in the Space (both `Sender` and `Owner` copies visible for `bob-committed`),
-    // `dedupe` merges `Sender` + attributed `Owner` cleanly with `conflict == false` and `sender == Some(BOB_DID)`.
+    // 2. While Alice is still in the Space, active-Space history is authoritative: owner
+    // copies cannot make an otherwise inadmissible Space record visible. The committed message
+    // remains visible without conflict; the pre-I13 message returns from the owner archive only
+    // after Space access is revoked below.
     let copied_committed = block_on(alice.rearchive_thread_before_leave(CONVO_ID)).unwrap();
     assert_eq!(copied_committed, 1);
 
     let merged_view = block_on(alice.load_thread(CONVO_ID, TimeRange::ALL)).unwrap();
-    assert_eq!(merged_view.messages.len(), 2);
-    for m in &merged_view.messages {
-        assert!(
-            !m.conflict,
-            "matching Sender + Owner copy must not flag conflict"
-        );
-        assert_eq!(m.sender.as_deref(), Some(BOB_DID));
-    }
+    assert_eq!(merged_view.messages.len(), 1);
+    assert_eq!(merged_view.messages[0].message_id, "bob-committed");
+    assert!(!merged_view.messages[0].conflict);
+    assert_eq!(merged_view.messages[0].sender.as_deref(), Some(BOB_DID));
 
     // 3. Now simulate involuntary removal / kick: revoke Alice's Space read/write membership!
     host.revoke_space_member(&convo_space, ALICE_DID);
