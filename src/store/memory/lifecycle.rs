@@ -3,9 +3,8 @@
 //! ([CB-38], [CB-39]).
 
 use super::{MemoryBackend, State};
-use crate::deletion::{Redaction, ServerRedaction};
+use crate::deletion::Redaction;
 use crate::records::{AuthorRedaction, RedactionDef, datetime_from_ms};
-use crate::sign::{Ed25519Transport, TransportSigner};
 use crate::{Error, Result};
 
 impl State {
@@ -70,49 +69,26 @@ impl State {
         Ok(count)
     }
 
-    /// mls-ds `deleteAccountData`: redact every live item attributed to
-    /// `did` with the sequencer's account-deletion redaction (signed when it
-    /// has a key; a bare `{redactedAt}` without [`MemoryBackend::set_sequencer`]),
-    /// then purge. That is `did`'s own items and every witness copy of its
-    /// messages in other members' repos (receipt sender `did`).
-    pub(super) fn delete_account_data(&mut self, did: &str) -> usize {
+    /// See [`MemoryBackend::strip_items_for_test`].
+    fn strip_items(&mut self, did: &str) -> usize {
         let at = datetime_from_ms(self.server_now);
-        let sequencer = self.sequencer.clone();
         let mut n = 0;
-        for (thread_id, t) in self.threads.iter_mut() {
-            for (repo, r) in t.repos.iter_mut() {
-                for (b, _) in r.batches.values_mut() {
-                    for i in b.items.iter_mut().filter(|i| {
-                        i.redaction.is_none()
-                            && (repo == did
-                                || i.sequencer_receipt
-                                    .as_ref()
-                                    .is_some_and(|r| r.sender_did == did))
-                    }) {
-                        let def = match &sequencer {
-                            None => RedactionDef::account_deletion(Some(at.clone())),
-                            Some((by, seed)) => {
-                                let signer = seed.map(|s| {
-                                    Ed25519Transport(ed25519_dalek::SigningKey::from_bytes(&s))
-                                });
-                                RedactionDef::from_server(&ServerRedaction::account_deletion(
-                                    by,
-                                    did,
-                                    thread_id,
-                                    &i.message_id,
-                                    &at,
-                                    signer.as_ref().map(|s| s as &dyn TransportSigner),
-                                ))
-                            }
-                        };
-                        i.signed_enc_message.0.clear();
-                        i.redaction = Some(def);
-                        n += 1;
-                    }
+        for t in self.threads.values_mut() {
+            let Some(r) = t.repos.get_mut(did) else {
+                continue;
+            };
+            for (b, _) in r.batches.values_mut() {
+                for i in b.items.iter_mut().filter(|i| i.redaction.is_none()) {
+                    i.signed_enc_message.0.clear();
+                    i.redaction = Some(RedactionDef {
+                        transport_pubkey: None,
+                        sig: None,
+                        redacted_at: Some(at.clone()),
+                    });
+                    n += 1;
                 }
             }
         }
-        self.purge(did);
         n
     }
 
@@ -181,11 +157,10 @@ impl State {
 }
 
 impl MemoryBackend {
-    /// The server-side account deletion (mls-ds `deleteAccountData`): the
-    /// sequencer's redaction of every item attributed to `did` (its own and
-    /// other members' witness copies of its messages), then a mailbox
-    /// purge. Returns how many items were redacted.
-    pub fn delete_account_data(&self, did: &str) -> usize {
-        self.lock().delete_account_data(did)
+    /// Adversarial server for tests: replaces every live item `did` wrote
+    /// with a bare `{redactedAt}` removal and returns how many. mls-ds
+    /// never writes redactions (G16); readers must refuse these.
+    pub fn strip_items_for_test(&self, did: &str) -> usize {
+        self.lock().strip_items(did)
     }
 }

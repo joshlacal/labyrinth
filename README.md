@@ -4,7 +4,7 @@ A Rust implementation of Meta's **Labyrinth 1.1** encrypted message-history stor
 
 MLS keeps chat messages end-to-end encrypted in transit, but it does not give a new or restored device the conversation's history. Labyrinth adds an encrypted per-account *mailbox* of key material (devices, epochs, recovery bundles) and an encrypted archive of messages that only the account's enrolled devices, or a recovery code, can open. Both live in atproto Spaces, which see only ciphertext: the mailbox in the account's personal Space, and history in each conversation's Space. Catbird's `mls-ds` delivery service stores no Labyrinth content. It is only the directory and sequencer (`docs/MLSDS_BACKEND.md`).
 
-**Status: pre-GA draft.** Nothing here has been audited, the wire formats and lexicons may still change, and the crate is not published. Do not rely on it to protect real data yet. The bookmark `clean-slate-2026-10-31` holds R0 (`6462096a`). The Task 4 R1 archive changes (witness copies, receipt-bound owner records) are in an unsealed, provisional commit on top of the bookmark; see `docs/SPACE_CONVERSATIONS.md`.
+**Status: pre-GA draft.** Nothing here has been audited, the wire formats and lexicons may still change, and the crate is not published. Do not rely on it to protect real data yet. The bookmark `clean-slate-2026-10-31` holds R0 (`6462096a`). The Task 4 archive work on top of it (latest reviewed cut `276c0972`) is unsealed. Its independent R3 review failed, and Fix Round 4 is in progress; see `docs/SPACE_CONVERSATIONS.md` and `docs/DECISIONS.md`.
 
 ## Catbird profile vs. Messenger
 
@@ -75,7 +75,7 @@ The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own recovery
 
 ## Security caveats and limitations
 
-- **Unaudited draft.** The profile choices ([CB-n]) are provisional until the `labyrinth-1.1` bookmark merges and atproto Spaces reach GA.
+- **Unaudited draft.** The profile choices ([CB-n]) are provisional until the `clean-slate-2026-10-31` bookmark merges and atproto Spaces reach GA.
 - **Limitations kept from the paper** (SPEC §10): a backend that controls both the mailbox and the directory can hide newer epochs, and membership can be enumerated.
 - **Epoch truncation** is detected only when the `MailboxDirectory` is independent of the mailbox store ([CB-28]). `CompositeDirectory` cross-checks the PDS and mls-ds, so truncation needs the mailbox host and the other directory to collude.
 - **Public enrollment signal.** Publishing `mailboxKeys` in the public repo reveals that an account uses Labyrinth and when it rotates epochs ([CB-19]).
@@ -84,7 +84,7 @@ The tests include the AES-256-DNDK-GCM and CPace draft vectors, our own recovery
 - **First contact.** Senders pin each peer's newest epoch and refuse rollbacks afterwards ([CB-29]). `CompositeDirectory::new` requires the peer's PDS and mls-ds to agree on the first epoch. A head in only one source fails with `DirectoryIncomplete`; trust-on-first-use requires the explicit `new_allowing_single_source`. Carrying latest heads in MLS-authenticated group state is the long-term fix.
 - **Client state is secret.** `Labyrinth::export_state()` returns the device's private keys, epoch roots, MEKs, revoked set and pins ([CB-30]). Store it only in the platform keychain or SQLCipher; flush pending batches first, since they are not included.
 - **Revocation can't be wedged by a planted row.** A rotation drops and reports invalid or unbound members instead of aborting ([CB-25], [CB-36]), and a squatted next epoch is reported as `EpochSquatted` ([CB-40]). Clearing a squat still needs the backend.
-- **Deletion is cooperative.** An unsend rewrites the author's own batch record, and readers hide other members' witness copies of it, which stay stored in those members' repos. Readers can tell an author's unsend from a server removal. Deleted data survives in Space-host backups for their retention window.
+- **Deletion is cooperative.** An unsend writes a separate immutable, author-signed `blue.catbird.labyrinth.redaction` record and never rewrites the source batch ([CB-38]). Readers hide every sender, witness and owner copy of the message; the witness copies themselves stay stored in other members' repos. Account deletion is the sequencer's signed `accountDeletedEntry`. Readers can tell an author's unsend from an account deletion. Deleted data survives in Space-host backups for their retention window.
 - **Space mailbox caveats.** In a Space, `lastUsedAt` on a recovery bundle is stamped by the owner's own device clock (no server), device revocation is a read-then-`#update` (Space writes have no `swapRecord`), and per-thread owner reads scan the owner-batch collection. The store needs no `createSpace`: the owner's PDS accepts writes to an ungoverned Space. `tests/live_space_pds.rs` runs the lifecycle against the upstream dev PDS (opt-in; see `scripts/space-pds/start.mjs`).
 - **Not yet provided:**
   - live qualification of the conversation-Space store across real OAuth, authority and foreign repository hosts; its current tests use a reference Space host and sequencer;

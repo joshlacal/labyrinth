@@ -20,8 +20,7 @@ pub mod pds;
 pub mod space;
 
 pub use keys::{
-    ChatDeviceKey, MemberDeviceKey, SequencerKey, ServerOrder, VouchAt, keys_valid_at,
-    keys_valid_for,
+    ChatDeviceKey, MemberDeviceKey, ServerOrder, VouchAt, keys_valid_at, keys_valid_for,
 };
 pub use memory::MemoryBackend;
 
@@ -429,7 +428,8 @@ pub trait ThreadStore: MaybeSend + MaybeSync {
         Ok(Vec::new())
     }
 
-    /// Purge all records authored by this caller in `thread_id`'s Space repo (`Gate 5`).
+    /// Account cleanup: purge the erasable records this caller authored in
+    /// `thread_id`'s Space repo. Leave never calls it.
     async fn clear_records(&self, thread_id: &str) -> Result<()> {
         let _ = thread_id;
         Err(Error::NotSupported("clearRecords"))
@@ -469,11 +469,6 @@ pub trait MailboxDirectory: MaybeSend + MaybeSync {
         did: &str,
     ) -> Result<Option<Vec<MemberDeviceKey>>> {
         let _ = (thread_id, did);
-        Ok(None)
-    }
-    /// The redaction signing key of the DS that sequences `thread_id` ([`SequencerKey`]).
-    async fn sequencer_key(&self, thread_id: &str) -> Result<Option<SequencerKey>> {
-        let _ = thread_id;
         Ok(None)
     }
     /// The sequencer's current ES256 receipt verification key for `thread_id` (`I13`).

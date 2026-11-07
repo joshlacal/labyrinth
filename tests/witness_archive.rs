@@ -386,9 +386,9 @@ fn redactions_and_tombstones_suppress_witness_copies() {
     let unsent: Vec<_> = h
         .redacted
         .iter()
-        .map(|r| (r.message_id.as_str(), r.sender.as_str(), r.by_author))
+        .map(|r| (r.message_id.as_str(), r.sender.as_str()))
         .collect();
-    assert_eq!(unsent, [("a1", A, true)]);
+    assert_eq!(unsent, [("a1", A)]);
     assert_eq!(h.deleted_for_me, ["a2"]);
 
     // Re-archiving before a leave keeps the same view: witness copies stay
@@ -410,28 +410,6 @@ fn redactions_and_tombstones_suppress_witness_copies() {
         [
             ("a3", Some(A), MessageSource::Owner),
             ("a4", Some(A), MessageSource::Owner),
-        ]
-    );
-
-    // Account deletion redacts every item attributed to Alice, her own and
-    // Bob's witness copies (a2 and a4 she never archived), so no copy of
-    // her messages survives; an unsend stays an unsend.
-    w.net.set_sequencer(SEQUENCER, Some([7; 32]));
-    assert_eq!(w.net.delete_account_data(A), 6);
-    let h = load(&mut bob);
-    assert!(h.messages.is_empty(), "{:?}", summary(&h));
-    let redacted: Vec<_> = h
-        .redacted
-        .iter()
-        .map(|r| (r.message_id.as_str(), r.by_author, r.account_deleted))
-        .collect();
-    assert_eq!(
-        redacted,
-        [
-            ("a1", true, false),
-            ("a3", false, true),
-            ("a2", false, true),
-            ("a4", false, true),
         ]
     );
 }
@@ -682,68 +660,6 @@ fn pages_show_each_message_once_with_all_its_copies() {
     }
 }
 
-/// The sequencer's signed account deletion reaches every copy attributed
-/// to the deleted account: its own items, witness copies of messages it
-/// never archived, and owner copies, in full loads, by id and on pages.
-#[test]
-fn account_deletion_hides_every_copy_of_the_accounts_messages() {
-    let w = World::new();
-    let mut alice = w.join(A, 1);
-    let mut bob = w.join(B, 2);
-    let mut carol = w.join(C, 3);
-    let all = [A, B, C];
-    let a1 = w.sequence(A, "a1");
-    let a2 = w.sequence(A, "a2");
-    let b1 = w.sequence(B, "b1");
-    archive(&mut alice, &all, &a1, 100);
-    block_on(alice.flush()).unwrap();
-    for m in [&a1, &a2] {
-        archive(&mut bob, &all, m, 200);
-    }
-    archive(&mut bob, &all, &b1, 210);
-    block_on(bob.flush()).unwrap();
-    archive(&mut carol, &all, &a2, 300);
-    block_on(carol.flush()).unwrap();
-    // Carol's owner archive also holds a1, a2 and b1.
-    assert_eq!(
-        block_on(carol.rearchive_thread_before_leave(THREAD)).unwrap(),
-        3
-    );
-
-    w.net.set_sequencer(SEQUENCER, Some([7; 32]));
-    assert_eq!(w.net.delete_account_data(A), 4);
-    for lab in [&mut bob, &mut carol] {
-        let h = load(lab);
-        assert!(h.undecryptable.is_empty(), "{:?}", h.undecryptable);
-        assert_eq!(
-            summary(&h),
-            [("b1", Some(B), MessageSource::Sender, 210, false)]
-        );
-        let deleted: Vec<_> = h
-            .redacted
-            .iter()
-            .map(|r| (r.message_id.as_str(), r.sender.as_str(), r.account_deleted))
-            .collect();
-        assert_eq!(deleted, [("a1", A, true), ("a2", A, true)]);
-        let one = block_on(lab.load_message(THREAD, "a2")).unwrap();
-        assert!(one.messages.is_empty());
-        assert_eq!(one.redacted.len(), 1);
-        let mut paged = Vec::new();
-        let mut cursor: Option<ThreadCursor> = None;
-        loop {
-            let page = block_on(lab.load_thread_page(THREAD, cursor.as_ref(), 1)).unwrap();
-            paged.extend(page.history.messages.iter().map(|m| m.message_id.clone()));
-            paged.extend(page.history.redacted.iter().map(|r| r.message_id.clone()));
-            match page.next {
-                Some(c) => cursor = Some(c),
-                None => break,
-            }
-        }
-        paged.sort();
-        assert_eq!(paged, ["a1", "a2", "b1"]);
-    }
-}
-
 #[test]
 fn queued_only_unsend_publishes_a_witness_suppressing_redaction() {
     let w = World::new();
@@ -765,9 +681,9 @@ fn queued_only_unsend_publishes_a_witness_suppressing_redaction() {
     assert_eq!(
         h.redacted
             .iter()
-            .map(|r| (r.message_id.as_str(), r.sender.as_str(), r.by_author))
+            .map(|r| (r.message_id.as_str(), r.sender.as_str()))
             .collect::<Vec<_>>(),
-        [("queued", A, true)]
+        [("queued", A)]
     );
 }
 
@@ -815,11 +731,7 @@ fn evidence_outside_a_display_window_still_hides_selected_copies() {
     .unwrap();
     assert!(h.messages.is_empty(), "{:?}", summary(&h));
     assert_eq!(h.deleted_for_me, ["private"]);
-    assert!(
-        h.redacted
-            .iter()
-            .any(|r| r.message_id == "unsent" && r.by_author)
-    );
+    assert!(h.redacted.iter().any(|r| r.message_id == "unsent"));
 }
 
 #[test]

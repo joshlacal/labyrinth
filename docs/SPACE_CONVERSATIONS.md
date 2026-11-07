@@ -2,7 +2,7 @@
 
 Labyrinth encrypts chat history before storage. Each conversation has one atproto Space, and every member writes its MEK distributions, immutable sender batches, redactions and attachment manifests into **its own repo** in that Space. mls-ds stores no history and no index of it. It sequences MLS entries and signs the `I13` receipts that order archived frames; the original sender separately attests archive identity ([MLSDS_BACKEND.md](MLSDS_BACKEND.md)). The decisions behind this file are in [DECISIONS.md](DECISIONS.md).
 
-**Status (2026-11-06).** Stress Fix Round 3 is provisional on `clean-slate-2026-10-31`; Task 4 is not sealed. G1–G16 are **pending execution**. Source review and deterministic tests are useful evidence but do not mark a gate done. The opt-in G5 live fault fixture is defined below and remains pending until its production-gateway run is recorded.
+**Status (2026-11-07).** Stress Fix Round 3 is provisional on `clean-slate-2026-10-31`; Task 4 is not sealed. Its independent R3 review failed, and Fix Round 4 is in progress. G1–G16 are not complete (see "Stress-gate status" below). Source review and deterministic tests are useful evidence but do not mark a gate done. The opt-in G5 live fault fixture is defined below and remains pending until its production-gateway run is recorded.
 
 ## Storage and identity
 
@@ -74,8 +74,8 @@ The rules in catbird-mls (`src/client/native_archive.rs`):
 | Operation | Behavior |
 |---|---|
 | `flush_labyrinth_queue` | For each conversation, a `getConversationState` read with the local roster still holding this account writes sender copies. If the sender write returns `Forbidden`, that chunk is sealed into owner batches instead. The flush goes owner-only when the state read is `Forbidden`, or when the local roster lacks this account (on a successful read, or on `ConversationNotFound`). `ConversationNotFound` while the local roster still holds this account, or any other error, fails that conversation and keeps its rows. |
-| `rescue_conversation_on_kick` | Seals every local message of the conversation from its retained evidence, plus any queued rows, into owner batches. A message without evidence fails the rescue. Live sync calls it after a verified Commit removed this device, and platforms can also call it. |
-| `restore_conversation_from_owner_mailbox` | Despite its name, an active member restores from the conversation Space. Owner copies are dropped whenever the Space was readable. It reads only the owner archive when the local roster lacks this account, or when there is no local group and `getConversationState` returns `ConversationNotFound`. |
+| `rescue_conversation_on_kick` | Seals each local message of the conversation from its retained evidence, plus any queued rows, into owner batches. A message whose own evidence fails validation (missing or malformed evidence, a frame or receipt commitment mismatch, a bad attestation or signature) is skipped; its ID is recorded in `native.rescue-report:{cid}` (`skippedEvidenceIds`), and the other messages are still rescued. A transport, directory or Space failure is not invalid evidence: it fails the rescue and keeps the rows for retry. Live sync calls it after a verified Commit removed this device, and platforms can also call it. |
+| `restore_conversation_from_owner_mailbox` | Despite its name, an active member restores from the conversation Space. Owner copies are dropped whenever the Space was readable. It reads only the owner archive when the verified local roster lacks this account, or when the authenticated Space authority denies access. A fresh device with no local group treats a home-DS `NotEntitled` or `ConversationNotFound` only as a lead. It must open authenticated owner evidence, derive the receipt-pinned Space, and get the denial from that Space. An unsigned home-DS 4xx is never denial evidence. |
 
 Owner batches always use the same canonical frame bytes and `I13` evidence as sender batches. Open a whole owner batch before applying its delete-for-me tombstones; finalizing each item separately can resurrect an earlier tombstoned message.
 
@@ -102,7 +102,7 @@ Sender and owner copies are accepted first. Witness copies follow in determinist
 
 ## Account deletion
 
-A verified unsend or account-deletion redaction for `(messageId, original sender)` hides every sender, witness and owner copy carrying that authenticated sender identity. A delete-for-me tombstone also hides them.
+A verified author redaction (unsend) for `(messageId, original sender)` hides every sender, witness and owner copy carrying that authenticated sender identity. So does a verified `accountDeletedEntry` for that sender (below). A delete-for-me tombstone also hides them. mls-ds writes no DS redaction records; the sequenced `accountDeletedEntry` is the only account-deletion authority.
 
 The sequencer's account-deletion evidence names its exact `{sequencerDid}#mls-receipt-N` method. The conversation's durable authority/P-256 SEC1 history survives current-method removal; canonical key IDs are immutable and never reused.
 
@@ -117,13 +117,13 @@ Peer epoch pins are per-device, not recovered account state. A restored device r
 ## Deletion and cleanup
 
 - **Unsend** writes a separate immutable `blue.catbird.labyrinth.redaction` record under the author's deterministic message key. It never rewrites or empties the source batch. Listing, leave and account-cleanup inventory retain the redaction, so concurrent writes and retries cannot resurrect the ciphertext.
-- **Leave** (`rearchive_and_clear_before_leave`) copies what reading accepts, including the original-sender attestation and applied redactions, into owner batches. It copies the account's attachments, retains its durable redaction records, then deletes its own MEK, batch and attachment-manifest records.
+- **Leave** (`rearchive_before_leave`) copies what reading accepts, including the original-sender attestation and applied redactions, into owner batches, and copies the account's attachment manifests into the personal mailbox Space. For each message already in the account's owner archive that a verified author redaction now hides, it writes an owner tombstone. Leave deletes nothing from the conversation Space: the account's MEK, batch, redaction and attachment-manifest records stay, because they may be the only copy that remaining members can restore from.
 - **Account cleanup** inventories conversation Spaces from saved pins and the owner's paginated `listSpaces`, including more than one page, records written by other devices and conversations already left. It deletes only the signed-in account's erasable records and retains redaction evidence required by peers. Before local erasure, the app saves placement, pins and required cleanup in a durable deletion journal. An unreachable required host leaves cleanup pending.
 - **Close.** catbird-mls's terminal close erases the conversation's archive queue, retained evidence and staged C33 opening with its MLS state. Nothing is archived or rescued afterwards; local message rows stay unsendable.
 
 ## Stress-gate status and live boundary
 
-All Stress Fix Round 3 gates G1–G16 are **pending execution**. No source review, deterministic unit test or earlier dated run changes that status.
+Stress Fix Round 3 gates G1–G16 are **not complete**. The independent R3 review (2026-11-07) failed, and Fix Round 4 is in progress. The per-finding status (confirmed fixed, partially fixed or open, with the covering test) is the authoritative table in `Labyrinth doc review — handoff for MLS stress testing.md` at the workspace root. No source review, deterministic unit test or earlier dated run closes a gate by itself.
 
 G5's opt-in live fault test is `catbird-mls/tests/live_native_archive_g5.rs`. It uses the production `CatbirdMlsClient` path that constructs `NativeArchiveGateway`, plus an explicitly provisioned real conversation Space named by `LABYRINTH_G5_LIVE_FIXTURE`. Its loopback fault proxy keeps fixture credentials away from accidental direct-host requests. The fixture must exercise:
 - expiry after one verified record but before the next read;

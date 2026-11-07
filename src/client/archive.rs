@@ -1,12 +1,14 @@
 //! Owner-mode archiving into this account's mailbox (SPEC §7.1, [CB-22],
 //! [CB-37]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use super::Labyrinth;
 use super::read::{ThreadHistory, finish};
 use crate::epoch::EpochKeys as _;
-use crate::message::{ArchivedReceipt, seal_owner, seal_owner_attributed, seal_owner_committed};
+use crate::message::{
+    ArchivedReceipt, seal_owner, seal_owner_attributed, seal_owner_committed, seal_owner_tombstone,
+};
 use crate::records::{BATCH_BYTE_BUDGET, MAX_BATCH_ITEMS};
 use crate::store::{LeaveArchiveReport, TimeRange};
 use crate::{Error, Result};
@@ -163,12 +165,11 @@ impl Labyrinth {
     /// `Gate 5`: before leaving a conversation Space, flush pending writes,
     /// re-archive all readable messages (preserving `I13` committed frames
     /// and sequencer receipts) and own encrypted attachments into the
-    /// personal mailbox Space, then call `clear_records` to purge this
-    /// caller's repo in the conversation Space.
-    pub async fn rearchive_and_clear_before_leave(
-        &mut self,
-        thread_id: &str,
-    ) -> Result<LeaveArchiveReport> {
+    /// personal mailbox Space. Nothing in the conversation Space is deleted:
+    /// my batches, MEKs and attachment manifests may be the only copy the
+    /// remaining members can restore from (a witness flush may never have
+    /// run).
+    pub async fn rearchive_before_leave(&mut self, thread_id: &str) -> Result<LeaveArchiveReport> {
         self.flush_thread(thread_id).await?;
         let messages_archived = self
             .rearchive_messages_before_leave_inner(thread_id)
@@ -196,8 +197,6 @@ impl Labyrinth {
             rearchived_blob_cids.push(new_cid);
             attachments_archived += 1;
         }
-
-        self.b.threads.clear_records(thread_id).await?;
 
         Ok(LeaveArchiveReport {
             messages_archived,
@@ -269,6 +268,27 @@ impl Labyrinth {
                 receipts_required,
             )
             .await?;
+        // A verified author redaction in the Space hides my earlier owner
+        // copies only while I can read the Space. After leaving, only my
+        // mailbox remains, so those copies need their own tombstones.
+        let mut unsent: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for m in &owner.messages {
+            let Some(sender) = m.sender.as_deref() else {
+                continue;
+            };
+            let redacted = h
+                .redacted
+                .iter()
+                .any(|r| r.message_id == m.message_id && r.sender == sender);
+            let tombstoned = tombstones.iter().any(|(id, author)| {
+                *id == m.message_id && author.as_deref().is_none_or(|a| a == sender)
+            });
+            if redacted && !tombstoned {
+                unsent
+                    .entry((m.message_id.clone(), sender.to_owned()))
+                    .or_insert(m.timestamp);
+            }
+        }
         let mut archived: HashSet<(String, Vec<u8>)> = owner
             .messages
             .iter()
@@ -278,6 +298,17 @@ impl Labyrinth {
         finish(&mut h, &tombstones);
 
         let epoch = self.epoch_secret(self.latest).await?;
+        for ((message_id, sender), timestamp) in &unsent {
+            let tombstone = seal_owner_tombstone(
+                epoch.root(),
+                epoch.seq,
+                thread_id,
+                message_id,
+                *timestamp,
+                Some(sender),
+            )?;
+            self.queue_owner(thread_id, tombstone).await?;
+        }
         let mut n = 0;
         for m in h.messages {
             let key = (m.message_id, m.frame);

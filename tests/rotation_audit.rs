@@ -232,7 +232,7 @@ fn revoking_a_chat_device_revokes_the_labyrinth_device_it_bound() {
     net.remove_chat_device(A, tpub(2), 1);
     let reports = block_on(phone.revoke_chat_device(&tpub(2))).unwrap();
     assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].revoked, laptop_key);
+    assert_eq!(reports[0].revoked, Some(laptop_key));
     assert!(
         block_on(phone.devices_bound_to(&tpub(2)))
             .unwrap()

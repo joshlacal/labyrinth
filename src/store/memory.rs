@@ -88,8 +88,6 @@ struct State {
     ds_floors: HashMap<String, u64>,
     /// Adversarial override for `floor_seq` (`Gate 6` test injection).
     ds_floor_overrides: HashMap<String, u64>,
-    /// The DS that sequences every thread here: its DID and optional Ed25519 seed ([CB-38]).
-    sequencer: Option<(String, Option<[u8; 32]>)>,
     /// Per-thread `I13` ES256 receipt verification keys (`Gate 1`).
     receipt_keys: HashMap<String, SequencerReceiptKey>,
     /// Exact verification-method history, retained across current-key rotation.
@@ -323,11 +321,6 @@ impl MemoryBackend {
             .insert(did.to_owned(), keys);
     }
 
-    /// Configures the sequencer DS DID and optional Ed25519 redaction signing seed.
-    pub fn set_sequencer(&self, did: &str, signing_seed: Option<[u8; 32]>) {
-        self.lock().sequencer = Some((did.to_owned(), signing_seed));
-    }
-
     /// Registers the first receipt key for `thread_id`.
     pub fn set_sequencer_receipt_key(&self, thread_id: &str, key: SequencerReceiptKey) {
         let key_id = labyrinth_protocol::expected_receipt_key_id(&key.did);
@@ -412,18 +405,6 @@ impl MemoryBackend {
         self.lock()
             .ds_floor_overrides
             .insert(did.to_owned(), floor_seq);
-    }
-
-    fn sequencer_key(&self) -> Option<super::SequencerKey> {
-        let s = self.lock();
-        let (did, seed) = s.sequencer.as_ref()?;
-        let key = ed25519_dalek::SigningKey::from_bytes(seed.as_ref()?)
-            .verifying_key()
-            .to_bytes();
-        Some(super::SequencerKey {
-            did: did.clone(),
-            key,
-        })
     }
 
     /// The server clock (ms).

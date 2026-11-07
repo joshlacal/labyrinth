@@ -3,9 +3,7 @@
 use super::MemoryBackend;
 use crate::Result;
 use crate::mailbox::EpochPublic;
-use crate::store::{
-    ChatDeviceKey, MailboxDirectory, MemberDeviceKey, SequencerKey, SequencerReceiptKey,
-};
+use crate::store::{ChatDeviceKey, MailboxDirectory, MemberDeviceKey, SequencerReceiptKey};
 
 /// [`MailboxDirectory`] over the backend's public `mailboxKeys` records
 /// (the PDS view) and its MLS device view.
@@ -51,10 +49,6 @@ impl MailboxDirectory for MemoryDirectory {
         did: &str,
     ) -> Result<Option<Vec<MemberDeviceKey>>> {
         Ok(self.backend.member_keys(thread_id, did))
-    }
-
-    async fn sequencer_key(&self, _thread_id: &str) -> Result<Option<SequencerKey>> {
-        Ok(self.backend.sequencer_key())
     }
 
     async fn sequencer_receipt_key(&self, thread_id: &str) -> Result<Option<SequencerReceiptKey>> {

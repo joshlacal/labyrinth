@@ -4,7 +4,7 @@
 
 The client side is catbird-mls `src/labyrinth/transport.rs` (`GatewayXrpcTransport`, `DsDirectoryStore`). The server side is mls-ds `server/src/handlers/labyrinth/` and `server/src/labyrinth/`.
 
-**Status (2026-11-06).** Stress Fix Round 3 is provisional on `clean-slate-2026-10-31`. G1–G16, including the G5 production-gateway live faults, are pending execution; none is marked complete by source review alone.
+**Status (2026-11-07).** Stress Fix Round 3 is provisional on `clean-slate-2026-10-31`. Its independent R3 review failed, and Fix Round 4 is in progress. G1–G16 are not complete, including the G5 production-gateway live faults; none is marked complete by source review alone.
 
 **Retired design.** This file used to hold the 2026-10-04 design that made mls-ds a full Labyrinth storage backend (`createDevice`, `createEpoch`, `getEpoch`, `appendOwnerBatch`, `createMek`, `appendBatch`, `listBatches`, `registerOrfState`, `putAttachmentRef`, the `labyrinthRelay` federation relay) and the October 23 Space-reference endpoints (`getThreadStorage`, `appendSpaceBatch`, `listSpaceBatches`). mls-ds serves none of them. Their lexicons are still in `lexicons/blue/catbird/labyrinth/`, but they are not a contract. The old design is in VCS history, and [DECISIONS.md](DECISIONS.md) records why it was chosen.
 

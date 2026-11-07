@@ -28,9 +28,7 @@
 
 use super::pins::MAX_PIN_ADVANCE;
 use crate::mailbox::EpochPublic;
-use crate::store::{
-    ChatDeviceKey, MailboxDirectory, MemberDeviceKey, SequencerKey, SequencerReceiptKey,
-};
+use crate::store::{ChatDeviceKey, MailboxDirectory, MemberDeviceKey, SequencerReceiptKey};
 use crate::{Error, Result};
 
 fn map_protocol_error(err: labyrinth_protocol::ProtocolError) -> Error {
@@ -265,14 +263,6 @@ impl MailboxDirectory for CompositeDirectory {
         did: &str,
     ) -> Result<Option<Vec<MemberDeviceKey>>> {
         self.ds.member_device_keys(thread_id, did).await
-    }
-
-    /// The DS's own answer first; the PDS side only if the DS has none.
-    async fn sequencer_key(&self, thread_id: &str) -> Result<Option<SequencerKey>> {
-        match self.ds.sequencer_key(thread_id).await? {
-            Some(k) => Ok(Some(k)),
-            None => self.pds.sequencer_key(thread_id).await,
-        }
     }
 
     async fn sequencer_receipt_key(&self, thread_id: &str) -> Result<Option<SequencerReceiptKey>> {

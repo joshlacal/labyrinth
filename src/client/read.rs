@@ -85,23 +85,13 @@ pub struct Undecryptable {
     pub error: Error,
 }
 
-/// A redacted message ([CB-38]): render it as removed.
+/// A message its author unsent ([CB-38]): its redaction is signed by one
+/// of the author's chat devices. Render it as removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RedactedMessage {
     pub message_id: String,
     pub timestamp: u64,
     pub sender: String,
-    /// The redaction is signed by one of the author's chat devices:
-    /// "unsent".
-    pub by_author: bool,
-    /// The conversation's sequencer DS redacted it because the author's
-    /// account was deleted, and its signature verifies under the
-    /// sequencer's key ([`crate::store::MailboxDirectory::sequencer_key`]):
-    /// "deleted (account removed)".
-    pub account_deleted: bool,
-    /// Neither of the above: the server removed it, and nothing proves
-    /// why: "removed by server". Exactly one of the three flags is set.
-    pub removed_by_server: bool,
 }
 
 /// Result of [`Labyrinth::load_thread`], ordered by `(timestamp, messageId)`.
@@ -330,7 +320,7 @@ impl Labyrinth {
                     continue;
                 }
             };
-            for (entry, raw) in items.into_iter().zip(&b.value.items) {
+            for entry in items {
                 if matches!(&entry, BatchEntry::Sealed(s) if !keep(&s.message_id, s.timestamp)) {
                     continue;
                 }
@@ -341,29 +331,17 @@ impl Labyrinth {
                         timestamp,
                         redaction,
                     } => {
-                        let receipt_sender = raw.sequencer_receipt.as_ref().map(|r| &*r.sender_did);
-                        match self
-                            .verify_redaction(
-                                thread_id,
-                                &b.author,
-                                receipt_sender,
-                                &message_id,
-                                &redaction,
-                            )
+                        if self
+                            .verify_redaction(thread_id, &b.author, &message_id, &redaction)
                             .await
                         {
-                            Some((sender, by_author, account_deleted)) => {
-                                h.redacted.push(RedactedMessage {
-                                    message_id,
-                                    timestamp,
-                                    sender,
-                                    by_author,
-                                    account_deleted,
-                                    removed_by_server: false,
-                                })
-                            }
-                            None if strict => return Err(Error::BadSignature),
-                            None => {}
+                            h.redacted.push(RedactedMessage {
+                                message_id,
+                                timestamp,
+                                sender: b.author.clone(),
+                            });
+                        } else if strict {
+                            return Err(Error::BadSignature);
                         }
                         continue;
                     }
@@ -412,41 +390,22 @@ impl Labyrinth {
         Ok(())
     }
 
-    /// The attributed sender and `(by_author, account_deleted)` of a
-    /// verified redaction of `message_id` on `author`'s item ([CB-38]);
-    /// `None` otherwise. A witness copy of a deleted account's message
-    /// (`receipt_sender` ≠ `author`) carries the sequencer's
-    /// account-deletion redaction for the receipt's sender.
+    /// Whether `redaction` is a verified unsend of `message_id` on
+    /// `author`'s item ([CB-38]). Only the author's own signed redaction
+    /// counts; a server removal never does (G16).
     async fn verify_redaction(
         &self,
         thread_id: &str,
         author: &str,
-        receipt_sender: Option<&str>,
         message_id: &str,
         redaction: &StoredRedaction,
-    ) -> Option<(String, bool, bool)> {
+    ) -> bool {
         match redaction {
-            StoredRedaction::Author(r)
-                if self
-                    .redaction_by_author(thread_id, author, message_id, r)
-                    .await =>
-            {
-                Some((author.to_owned(), true, false))
+            StoredRedaction::Author(r) => {
+                self.redaction_by_author(thread_id, author, message_id, r)
+                    .await
             }
-            StoredRedaction::Server(r) => {
-                for sender in
-                    core::iter::once(author).chain(receipt_sender.filter(|s| *s != author))
-                {
-                    if self
-                        .redaction_by_sequencer(thread_id, sender, message_id, r)
-                        .await
-                    {
-                        return Some((sender.to_owned(), false, true));
-                    }
-                }
-                None
-            }
-            _ => None,
+            StoredRedaction::Unsigned { .. } => false,
         }
     }
 
@@ -469,25 +428,6 @@ impl Labyrinth {
                 .transport_keys(author, None, at)
                 .await
                 .is_ok_and(|k| k.contains(&r.transport_public_key))
-    }
-
-    /// [CB-38]: an account-deletion redaction signed by the DS that
-    /// sequences `thread_id`, under the key the directory reports for it.
-    async fn redaction_by_sequencer(
-        &self,
-        thread_id: &str,
-        author: &str,
-        message_id: &str,
-        r: &crate::deletion::ServerRedaction,
-    ) -> bool {
-        match self.b.directory.sequencer_key(thread_id).await {
-            Ok(Some(k)) => {
-                k.did == r.by
-                    && r.verify_account_deletion(author, thread_id, message_id, &k.key)
-                        .is_ok()
-            }
-            _ => false,
-        }
     }
 
     /// Opens my owner batches into `h`; returns the delete-for-me
@@ -812,16 +752,11 @@ impl Labyrinth {
 
 /// Applies redactions and delete-for-me tombstones, merges copies and sorts.
 pub(super) fn finish(h: &mut ThreadHistory, tombstones: &[Tombstone]) {
-    // A verified unsend or account-deletion redaction ([CB-38]) replaces the
-    // author's own item. Wherever it is stored, it also hides every other
-    // copy attributed to that author: witness copies and owner copies.
+    // A verified unsend ([CB-38]) replaces the author's own item. Wherever
+    // it is stored, it also hides every other copy attributed to that
+    // author: witness copies and owner copies.
     h.redacted.sort_by(|a, b| {
-        (&a.message_id, &a.sender, !a.by_author, a.timestamp).cmp(&(
-            &b.message_id,
-            &b.sender,
-            !b.by_author,
-            b.timestamp,
-        ))
+        (&a.message_id, &a.sender, a.timestamp).cmp(&(&b.message_id, &b.sender, b.timestamp))
     });
     h.redacted
         .dedup_by(|later, kept| later.message_id == kept.message_id && later.sender == kept.sender);

@@ -164,7 +164,6 @@ fn unsend_redacts_for_everyone_and_is_author_only() {
         .find(|redaction| redaction.sender == A)
         .expect("Alice's author-scoped redaction");
     assert_eq!((r.message_id.as_str(), r.timestamp), ("m2", 20));
-    assert!(r.by_author, "signed by one of Alice's chat devices");
     assert!(h.undecryptable.is_empty());
     // By id, too.
     let one = block_on(bob.load_message(T, "m2")).unwrap();
@@ -275,74 +274,27 @@ fn purge_account_redacts_authored_items_and_erases_the_mailbox() {
     assert_eq!((report.threads, report.redacted), (2, 2));
     let h = read(&mut bob, T);
     assert_eq!(ids(&h), ["b1"]);
-    assert!(h.redacted.iter().all(|r| r.sender == A && r.by_author));
+    assert!(h.redacted.iter().all(|r| r.sender == A));
     // The mailbox and its public keys are gone.
     assert!(block_on(net.directory().latest(A)).unwrap().is_none());
     assert!(net.mailbox(A).list_epochs_for_test().is_empty());
 }
 
 #[test]
-fn unsigned_server_redaction_is_rejected_fail_closed() {
-    // Unverified/unsigned redactions must never be laundered into
-    // `removed_by_server = true`; `load_thread` fails closed with `BadSignature`.
-    for sequencer in [None, Some("did:web:ds.example")] {
-        let net = MemoryBackend::new();
-        let clock = TestClock::default();
-        let mut alice = init(&net, &clock, A, 1);
-        let mut bob = init(&net, &clock, B, 2);
-        if let Some(by) = sequencer {
-            net.set_sequencer(by, None);
-        }
-        send(&mut alice, T, &[A, B], "m1", 10);
-        block_on(alice.flush()).unwrap();
-        assert_eq!(net.delete_account_data(A), 1);
-        assert_eq!(
-            block_on(bob.load_thread(T, TimeRange::ALL)).unwrap_err(),
-            Error::BadSignature
-        );
-    }
-}
-
-#[test]
-fn server_account_deletion_reads_as_removed_not_unsent() {
+fn server_removals_never_read_as_unsends() {
+    // G16: no server-written redaction is evidence of anything. A bare
+    // `{redactedAt}` removal fails closed instead of reading as removed.
     let net = MemoryBackend::new();
     let clock = TestClock::default();
     let mut alice = init(&net, &clock, A, 1);
     let mut bob = init(&net, &clock, B, 2);
     send(&mut alice, T, &[A, B], "m1", 10);
     block_on(alice.flush()).unwrap();
-    send(&mut bob, T, &[A, B], "b1", 20);
-    block_on(bob.flush()).unwrap();
-    // mls-ds deleteAccountData: redactions signed by the sequencer DS,
-    // then a purge.
-    net.set_sequencer("did:web:ds.example", Some([0x5e; 32]));
-    assert_eq!(net.delete_account_data(A), 1);
-    let h = read(&mut bob, T);
-    assert_eq!(ids(&h), ["b1"]);
-    assert_eq!(h.redacted.len(), 1);
-    let r = &h.redacted[0];
-    assert!(
-        r.account_deleted && !r.by_author && !r.removed_by_server,
-        "{r:?}"
-    );
-    // The sequencer's key changes (or another DS claims it): the unverified
-    // redaction is rejected fail-closed rather than laundered as server-removed.
-    net.set_sequencer("did:web:ds.example", Some([0x5f; 32]));
+    assert_eq!(net.strip_items_for_test(A), 1);
     assert_eq!(
         block_on(bob.load_thread(T, TimeRange::ALL)).unwrap_err(),
         Error::BadSignature
     );
-    net.set_sequencer("did:web:other.example", Some([0x5e; 32]));
-    assert_eq!(
-        block_on(bob.load_thread(T, TimeRange::ALL)).unwrap_err(),
-        Error::BadSignature
-    );
-    net.set_sequencer("did:web:ds.example", Some([0x5e; 32]));
-    // An author's own unsend is the opposite.
-    block_on(bob.unsend(T, "b1")).unwrap();
-    let h = read(&mut bob, T);
-    let mine = h.redacted.iter().find(|r| r.message_id == "b1").unwrap();
-    assert!(mine.by_author && !mine.account_deleted);
 }
 
 trait ListEpochs {

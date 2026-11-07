@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Bytes;
-use crate::deletion::{Redaction, ServerRedaction, StoredRedaction};
+use crate::deletion::{Redaction, StoredRedaction};
 use crate::hpke::X25519Public;
 use crate::hpke::hawk::HawkEncPublic;
 use crate::mailbox::{EpochPublic, MailboxPublicKeys, TransportAttestation};
@@ -275,9 +275,9 @@ impl EpochPublicDef {
 }
 
 /// `defs#redaction` ([CB-38]): an author's signed unsend request
-/// (`transportPubkey` + `sig`), a sequencer DS's account-deletion
-/// redaction (`by` + `reason` + `redactedAt`, `sig` when the DS signs), or
-/// a bare `{redactedAt}` server removal. See [`StoredRedaction`].
+/// (`transportPubkey` + `sig`), or a bare `{redactedAt}` server removal.
+/// The lexicon's sequencer-DS variant (`by`, `reason`) is retired (G16):
+/// a record carrying it does not parse. See [`StoredRedaction`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactionDef {
@@ -287,10 +287,6 @@ pub struct RedactionDef {
     pub sig: Option<Bytes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redacted_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub by: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 impl RedactionDef {
@@ -299,71 +295,22 @@ impl RedactionDef {
             transport_pubkey: Some(Bytes::from_slice(&r.transport_public_key)),
             sig: Some(Bytes::from_slice(&r.sig)),
             redacted_at: r.redacted_at.clone(),
-            by: None,
-            reason: None,
         }
     }
 
-    /// A bare server removal: `{redactedAt}` alone, no signature, no `by`.
-    pub fn account_deletion(redacted_at: Option<String>) -> Self {
-        Self {
-            transport_pubkey: None,
-            sig: None,
-            redacted_at,
-            by: None,
-            reason: None,
-        }
-    }
-
-    /// A sequencer DS's redaction ([`ServerRedaction`]).
-    pub fn from_server(r: &ServerRedaction) -> Self {
-        Self {
-            transport_pubkey: None,
-            sig: r.sig.as_ref().map(|s| Bytes::from_slice(s)),
-            redacted_at: Some(r.redacted_at.clone()),
-            by: Some(r.by.clone()),
-            reason: Some(r.reason.clone()),
-        }
-    }
-
-    /// What kind of redaction this is. Any other field combination
-    /// (an author key without a signature, `by` with an author key, …)
-    /// is malformed.
+    /// What kind of redaction this is. An author key without a signature,
+    /// or a signature without an author key, is malformed.
     pub fn to_stored(&self) -> Result<StoredRedaction> {
-        match (&self.transport_pubkey, &self.by) {
-            (Some(k), None) if self.reason.is_none() => {
-                let s = self
-                    .sig
-                    .as_ref()
-                    .ok_or(Error::Malformed("redaction key and sig must come together"))?;
-                Ok(StoredRedaction::Author(Redaction {
-                    transport_public_key: k.array("redaction key length")?,
-                    sig: s.array("redaction sig length")?,
-                    redacted_at: self.redacted_at.clone(),
-                }))
-            }
-            (None, Some(by)) => Ok(StoredRedaction::Server(ServerRedaction {
-                by: by.clone(),
-                reason: self
-                    .reason
-                    .clone()
-                    .ok_or(Error::Malformed("server redaction without reason"))?,
-                redacted_at: self
-                    .redacted_at
-                    .clone()
-                    .ok_or(Error::Malformed("server redaction without redactedAt"))?,
-                sig: self
-                    .sig
-                    .as_ref()
-                    .map(|s| s.array("redaction sig length"))
-                    .transpose()?,
+        match (&self.transport_pubkey, &self.sig) {
+            (Some(k), Some(s)) => Ok(StoredRedaction::Author(Redaction {
+                transport_public_key: k.array("redaction key length")?,
+                sig: s.array("redaction sig length")?,
+                redacted_at: self.redacted_at.clone(),
             })),
-            (None, None) if self.sig.is_none() && self.reason.is_none() => {
-                Ok(StoredRedaction::Unsigned {
-                    redacted_at: self.redacted_at.clone(),
-                })
-            }
-            _ => Err(Error::Malformed("redaction fields do not form one kind")),
+            (None, None) => Ok(StoredRedaction::Unsigned {
+                redacted_at: self.redacted_at.clone(),
+            }),
+            _ => Err(Error::Malformed("redaction key and sig must come together")),
         }
     }
 

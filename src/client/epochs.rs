@@ -34,16 +34,18 @@ pub struct SyncReport {
     pub invalid_members: Vec<ExcludedMember>,
 }
 
-/// Result of [`Labyrinth::revoke_device`].
+/// Result of a rotation ([`Labyrinth::revoke_device`],
+/// [`Labyrinth::rotate_epoch`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RotationReport {
-    /// The epoch opened without the revoked device.
+    /// The epoch the rotation opened.
     pub new_epoch: u64,
-    /// The revoked device.
-    pub revoked: XVerifyingKey,
+    /// The revoked device; `None` for an ordinary rotation.
+    pub revoked: Option<XVerifyingKey>,
     /// Members of the previous epoch the rotation dropped because they
-    /// failed verification or are not bound to a current chat device
-    /// ([CB-25] as amended, [CB-36]). Never silent: show these.
+    /// failed verification, are not bound to a current chat device
+    /// ([CB-25] as amended, [CB-36]), or are recovery bundles past their
+    /// TTL ([CB-39]). Never silent: show these.
     pub excluded: Vec<ExcludedMember>,
 }
 
@@ -1105,7 +1107,7 @@ impl Labyrinth {
                 Ok((new_epoch, excluded)) => {
                     return Ok(RotationReport {
                         new_epoch,
-                        revoked: *target,
+                        revoked: Some(*target),
                         excluded,
                     });
                 }
@@ -1121,8 +1123,9 @@ impl Labyrinth {
         self.revoked.iter().map(|k| XVerifyingKey(*k))
     }
 
-    /// Rotate the mailbox to the next epoch while carrying over unrevoked members.
-    pub async fn rotate_epoch(&mut self) -> Result<u64> {
+    /// Rotate the mailbox to the next epoch while carrying over unrevoked
+    /// members, and report every member the rotation dropped.
+    pub async fn rotate_epoch(&mut self) -> Result<RotationReport> {
         if self.outbox.values().any(|items| !items.is_empty())
             || self.owner_outbox.values().any(|items| !items.is_empty())
         {
@@ -1135,17 +1138,44 @@ impl Labyrinth {
                 Err(Error::Conflict) => {
                     self.sync_epochs().await?;
                 }
-                Ok((epoch, _)) => return Ok(epoch),
+                Ok((new_epoch, excluded)) => {
+                    return Ok(RotationReport {
+                        new_epoch,
+                        revoked: None,
+                        excluded,
+                    });
+                }
                 Err(error) => return Err(error),
             }
         }
         Err(Error::Conflict)
     }
 
+    /// [CB-39] Virtual devices of automatically stored recovery bundles
+    /// (keychain, passkey) unused past their TTL. A bundle that does not
+    /// parse opens nothing and never blocks a rotation.
+    async fn expired_recovery_devices(&self) -> Result<BTreeSet<[u8; 32]>> {
+        let now = self.b.clock.now_ms();
+        let mut expired = BTreeSet::new();
+        for vdev in self.b.mailbox.list_virtual_devices().await? {
+            let Ok((record, _)) = vdev.to_bundle() else {
+                continue;
+            };
+            if super::enroll::vdevice_stale_at_ms(record.mechanism, &vdev)
+                .ok()
+                .flatten()
+                .is_some_and(|stale_at| now >= stale_at)
+            {
+                expired.insert(record.public.device_key_pub.0);
+            }
+        }
+        Ok(expired)
+    }
+
     /// Open the epoch after `self.latest`, carrying over every member of
     /// the previous epoch except this device (the opener is added by
-    /// [`open_next`]), the devices in `exclude`, and devices the store
-    /// reports as revoked.
+    /// [`open_next`]), the devices in `exclude`, devices the store reports
+    /// as revoked, and expired recovery bundles ([CB-39]).
     async fn rotate(&mut self, exclude: &BTreeSet<[u8; 32]>) -> Result<(u64, Vec<ExcludedMember>)> {
         let prev = self.epoch_secret(self.latest).await?;
         let mine = self.transport.transport_public_key();
@@ -1157,17 +1187,30 @@ impl Labyrinth {
         }
         let audit = self.audit_epoch(&prev).await?;
         self.check_not_tampered(prev.seq, &audit)?;
+        let expired = self.expired_recovery_devices().await?;
         let mb = self.b.mailbox.as_ref();
         let (_, prev_record) = epoch_record(mb, prev.seq).await?;
         let me = self.device.public().device_key_pub;
+        let carried = |v: &&super::members::ValidMember| {
+            let k = v.record.device_key_pub;
+            k != me && !exclude.contains(&k.0) && !v.revoked
+        };
         let continuing: Vec<DevicePublic> = audit
             .valid
             .iter()
-            .filter(|v| {
-                let k = v.record.device_key_pub;
-                k != me && !exclude.contains(&k.0) && !v.revoked
-            })
+            .filter(carried)
+            .filter(|v| !expired.contains(&v.record.device_key_pub.0))
             .map(|v| v.public.clone())
+            .collect();
+        let expired_members: Vec<ExcludedMember> = audit
+            .valid
+            .iter()
+            .filter(carried)
+            .filter(|v| expired.contains(&v.record.device_key_pub.0))
+            .map(|v| ExcludedMember {
+                device_key: Some(v.record.device_key_pub),
+                reason: ExclusionReason::RecoveryExpired,
+            })
             .collect();
         let prev_members: Vec<EpochMemberRecord> =
             audit.valid.iter().map(|v| v.record.clone()).collect();
@@ -1208,6 +1251,7 @@ impl Labyrinth {
             .excluded
             .into_iter()
             .filter(|x| x.device_key.is_none_or(|k| !exclude.contains(&k.0)))
+            .chain(expired_members)
             .collect();
         Ok((self.latest, excluded))
     }

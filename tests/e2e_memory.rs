@@ -17,7 +17,7 @@ use labyrinth::sign::{Ed25519Transport, XVerifyingKey};
 use labyrinth::store::memory::{MemoryBackend, MemoryDirectory, MemoryMailbox};
 use labyrinth::store::{
     AtomicEnrollBundle, ChatDeviceKey, MailboxDirectory, MailboxStore, MemberDeviceKey,
-    SequencerKey, SequencerReceiptKey, Stored, TimeRange,
+    SequencerReceiptKey, Stored, TimeRange,
 };
 use labyrinth::virtual_device::Mechanism;
 
@@ -366,9 +366,6 @@ impl MailboxDirectory for Substituting {
         did: &str,
     ) -> labyrinth::Result<Option<Vec<MemberDeviceKey>>> {
         self.inner.member_device_keys(thread_id, did).await
-    }
-    async fn sequencer_key(&self, thread_id: &str) -> labyrinth::Result<Option<SequencerKey>> {
-        self.inner.sequencer_key(thread_id).await
     }
     async fn sequencer_receipt_key(
         &self,

@@ -43,6 +43,9 @@ pub enum ExclusionReason {
     Unbound,
     /// The binding names a chat device that is no longer current.
     ChatDeviceNotCurrent,
+    /// An automatically stored recovery bundle (keychain, passkey) unused
+    /// past its TTL ([CB-39]); rotation drops its virtual device.
+    RecoveryExpired,
 }
 
 /// A member left out of a rotation (or flagged by an audit), loudly.

@@ -199,20 +199,33 @@ fn gate5_attachments_redact_siblings_intact_and_rearchive_before_leave() {
     assert_eq!(bob_view.messages[1].frame, b"third message");
     assert_eq!(bob_view.redacted.len(), 1);
     assert_eq!(bob_view.redacted[0].message_id, "m-11");
-    assert!(bob_view.redacted[0].by_author);
+    assert_eq!(bob_view.redacted[0].sender, ALICE_DID);
     assert!(bob_view.undecryptable.is_empty());
 
     // 3. Alice leaves conversation: readable messages and attachments reach
-    // Alice's personal mailbox before cleanup. Ciphertext is purged, but the
-    // immutable author-redaction record remains durable.
-    let leave_report = block_on(alice.rearchive_and_clear_before_leave(CONVO_ID))
-        .expect("rearchive_and_clear_before_leave");
+    // Alice's personal mailbox. Nothing in the conversation Space is deleted:
+    // her batch, MEK and attachment manifest may be the only copies remaining
+    // members can restore from (G11).
+    let leave_report =
+        block_on(alice.rearchive_before_leave(CONVO_ID)).expect("rearchive_before_leave");
     assert_eq!(leave_report.messages_archived, 2);
     assert_eq!(leave_report.attachments_archived, 1);
+    for collection in [
+        labyrinth::records::nsid::BATCH,
+        labyrinth::records::nsid::MEK,
+        labyrinth::records::nsid::ATTACHMENT_MANIFEST,
+        labyrinth::records::nsid::AUTHOR_REDACTION,
+    ] {
+        assert_eq!(
+            host.record_count(&convo_space, ALICE_DID, Some(collection)),
+            1,
+            "leave must retain the leaver's {collection} records"
+        );
+    }
     assert_eq!(
-        host.record_count(&convo_space, ALICE_DID, None),
-        1,
-        "leave cleanup must retain the durable redaction"
+        block_on(bob_threads.get_attachment_verified(CONVO_ID, ALICE_DID, &manifest_rkey))
+            .expect("remaining member still reads the leaver's attachment"),
+        encrypted_blob
     );
 
     // Revoke Alice's read membership on the conversation Space and confirm she still reads
@@ -307,8 +320,8 @@ fn concurrent_unsends_are_independent_and_cleanup_retains_durable_redactions() {
         ["race-a", "race-b"].into_iter().collect()
     );
 
-    // Leave/account cleanup may remove ciphertext batches, but never the
-    // separate immutable author-redaction records.
+    // Account cleanup removes ciphertext batches, but never the separate
+    // immutable author-redaction records.
     let mut cleanup = SpaceThreadStore::new(host.client(ALICE_DID), ALICE_DID.to_owned());
     cleanup.register_thread_space(CONVO_ID, convo_space);
     block_on(cleanup.clear_records(CONVO_ID)).unwrap();
@@ -321,5 +334,97 @@ fn concurrent_unsends_are_independent_and_cleanup_retains_durable_redactions() {
             .map(|message| message.message_id.as_str())
             .collect::<std::collections::BTreeSet<_>>(),
         ["race-a", "race-b"].into_iter().collect()
+    );
+}
+
+/// G10: a member owner-archived Alice's messages (an earlier kick rescue)
+/// before Alice unsent one. Once that member leaves and can read only its own
+/// mailbox, the unsent message must stay hidden.
+#[test]
+fn leave_tombstones_owner_copies_of_messages_unsent_in_the_space() {
+    let net = MemoryBackend::new();
+    let host = MemorySpaceHost::new();
+    let (seq_sk, seq_rk) = sequencer_keys();
+    net.set_sequencer_receipt_key(CONVO_ID, seq_rk);
+    let convo_space = SpaceRef::parse(&format!(
+        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+    ))
+    .unwrap();
+    host.grant_space_member(&convo_space, ALICE_DID);
+    host.grant_space_member(&convo_space, BOB_DID);
+    let mut alice = make_client(ALICE_DID, 1, &net, &host, &convo_space);
+    let mut bob = make_client(BOB_DID, 2, &net, &host, &convo_space);
+
+    let roster = block_on(alice.resolve_roster(&[ALICE_DID, BOB_DID])).unwrap();
+    let mut sent = Vec::new();
+    for (seq, message_id) in [(20u64, "kept"), (21u64, "unsent")] {
+        let nonce = [seq as u8; 32];
+        let commitment = compute_archive_commitment(&nonce, message_id.as_bytes());
+        let payload = SequencerReceiptPayload {
+            sequencer_did: SEQUENCER_DID.to_owned(),
+            conversation_id: CONVO_ID.to_owned(),
+            group_id: vec![0x44u8; 32],
+            epoch: 1,
+            sender_device_did_url: format!("{ALICE_DID}#{ALICE_DEV_ID}"),
+            entry_id: format!("00000000-0000-0000-0000-{seq:012}"),
+            archive_commitment: commitment,
+            seq,
+            issued_at_ms: 1_791_181_720_000 + seq as i64,
+        };
+        let receipt = labyrinth::message::ArchivedReceipt::new(
+            sign_sequencer_receipt(&seq_sk, &expected_receipt_key_id(SEQUENCER_DID), &payload)
+                .unwrap(),
+            OriginalSenderArchiveAttestation::sign(
+                ALICE_DID.to_owned(),
+                ALICE_DEV_ID.to_owned(),
+                CONVO_ID,
+                message_id,
+                &commitment,
+                &transport(1),
+            ),
+        );
+        let timestamp = 1_791_181_720_000 + seq;
+        block_on(alice.archive_outgoing_committed(
+            CONVO_ID,
+            &roster,
+            message_id,
+            timestamp,
+            &nonce,
+            message_id.as_bytes(),
+            &receipt,
+        ))
+        .unwrap();
+        sent.push((message_id, timestamp, nonce, receipt));
+    }
+    block_on(alice.flush()).unwrap();
+    for (message_id, timestamp, nonce, receipt) in &sent {
+        block_on(bob.archive_owner_committed(
+            CONVO_ID,
+            message_id,
+            *timestamp,
+            nonce,
+            message_id.as_bytes(),
+            receipt,
+        ))
+        .unwrap();
+    }
+    block_on(bob.flush_owner(CONVO_ID)).unwrap();
+    assert_eq!(block_on(alice.unsend(CONVO_ID, "unsent")).unwrap(), 1);
+
+    block_on(bob.rearchive_before_leave(CONVO_ID)).expect("bob leaves");
+    host.revoke_space_member(&convo_space, BOB_DID);
+    let ids = |h: labyrinth::client::ThreadHistory| {
+        assert!(h.undecryptable.is_empty(), "{:?}", h.undecryptable);
+        h.messages
+            .into_iter()
+            .map(|m| m.message_id)
+            .collect::<Vec<_>>()
+    };
+    let after_leave = block_on(bob.load_thread(CONVO_ID, TimeRange::ALL)).unwrap();
+    assert!(!after_leave.space_readable);
+    assert_eq!(ids(after_leave), ["kept"]);
+    assert_eq!(
+        ids(block_on(bob.load_owner_thread(CONVO_ID)).unwrap()),
+        ["kept"]
     );
 }

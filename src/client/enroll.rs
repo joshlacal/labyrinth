@@ -37,6 +37,10 @@ pub struct Enrollment {
     /// The restoring device's local clock considers this automatically
     /// stored recovery method stale. Advisory only; rotation is authoritative.
     pub stale_recovery_method: bool,
+    /// The first error publishing the enrolled epoch head. The head then
+    /// stays durably pending ([`Labyrinth::pending_directory_epoch`]): save
+    /// the returned state, and opening it retries the publication.
+    pub unfinished: Option<Error>,
 }
 
 /// What the enrolled device sends back in a one-time-code transfer.
@@ -51,6 +55,7 @@ impl core::fmt::Debug for Enrollment {
         f.debug_struct("Enrollment")
             .field("device_key", &self.device_key)
             .field("stale_recovery_method", &self.stale_recovery_method)
+            .field("unfinished", &self.unfinished)
             .finish_non_exhaustive()
     }
 }
@@ -82,7 +87,10 @@ fn prefer_passkey_error(current: &mut Option<Error>, candidate: Error) {
     }
 }
 
-fn vdevice_stale_at_ms(mechanism: Mechanism, vdev: &VirtualDevice) -> Result<Option<u64>> {
+pub(super) fn vdevice_stale_at_ms(
+    mechanism: Mechanism,
+    vdev: &VirtualDevice,
+) -> Result<Option<u64>> {
     let created_ms = crate::records::ms_from_datetime(&vdev.created_at)?;
     let last_used_ms = vdev
         .last_used_at
@@ -429,12 +437,15 @@ impl Labyrinth {
             next_seq,
             new_next.members.iter().map(|m| m.device_key_pub.0),
         );
-        me.publish_keys(&new_next.record.public).await?;
+        // The new epoch exists and only `me` holds its keys: a refused
+        // publication stays durably pending for retry, never discards them.
+        let unfinished = me.publish_latest_keys().await.err();
         Ok((
             me,
             Enrollment {
                 device_key: public.device_key_pub,
                 stale_recovery_method,
+                unfinished,
             },
         ))
     }
@@ -565,12 +576,14 @@ impl Labyrinth {
             next_seq,
             new_next.members.iter().map(|m| m.device_key_pub.0),
         );
-        me.publish_keys(&new_next.record.public).await?;
+        // As for a restore: a refused publication stays durably pending.
+        let unfinished = me.publish_latest_keys().await.err();
         Ok((
             me,
             Enrollment {
                 device_key: public.device_key_pub,
                 stale_recovery_method: false,
+                unfinished,
             },
         ))
     }

@@ -630,8 +630,9 @@ impl ThreadStore for SpaceThreadStore {
             .await
     }
 
-    /// Deletes mutable ciphertext and key material only. Immutable
-    /// `authorRedaction` records intentionally survive leave/account cleanup.
+    /// Account cleanup: deletes this account's ciphertext and key material.
+    /// Immutable `authorRedaction` records survive. Leaving a conversation
+    /// never calls this: remaining members may hold no other copy.
     async fn clear_records(&self, thread_id: &str) -> Result<()> {
         let space = self.space_for(thread_id)?;
         for collection in THREAD_COLLECTIONS {

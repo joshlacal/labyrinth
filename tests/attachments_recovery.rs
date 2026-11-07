@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use futures::executor::block_on;
 use labyrinth::Error;
 use labyrinth::attachment::{AttachmentCiphertextMeta, verify_attachment_ciphertext};
-use labyrinth::client::{AUTO_RECOVERY_TTL_MS, Labyrinth};
+use labyrinth::client::{AUTO_RECOVERY_TTL_MS, ExcludedMember, ExclusionReason, Labyrinth};
 use labyrinth::records::MailboxKeysRecord;
 use labyrinth::store::memory::MemoryBackend;
 use labyrinth::store::space::host::MemorySpaceHost;
@@ -48,8 +48,8 @@ fn space_attachment_manifests_verify_integrity_and_rearchive_before_leave() {
     assert_eq!(fetched, ciphertext);
 
     // Re-archive before leave copies Alice's message history and verified attachments
-    // into Alice's personal mailbox Space and clears Alice's conversation Space repo.
-    let report = block_on(alice.rearchive_and_clear_before_leave(T)).unwrap();
+    // into Alice's personal mailbox Space; her conversation Space records stay.
+    let report = block_on(alice.rearchive_before_leave(T)).unwrap();
     assert_eq!(report.messages_archived, 1);
     assert_eq!(report.attachments_archived, 1);
     let owner_copy = block_on(net.mailbox(A).get_owner_attachment_verified(&rkey)).unwrap();
@@ -152,6 +152,53 @@ fn recovery_methods_become_stale_are_touched_and_require_explicit_rotation() {
     assert_eq!(restore(code.code.as_str()), Err(Error::BadRecoveryCode));
 }
 
+/// [CB-39] G7: an ordinary rotation drops a keychain bundle unused past its
+/// TTL and reports it; a code the user holds never expires.
+#[test]
+fn ordinary_rotation_excludes_expired_recovery_bundles_and_reports_them() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut phone = init(&net, &clock, A, 1);
+    let keychain = block_on(phone.create_recovery_code(Mechanism::Keychain)).unwrap();
+    let code = block_on(phone.create_recovery_code(Mechanism::Code)).unwrap();
+    let keychain_key = block_on(phone.list_recovery_methods())
+        .unwrap()
+        .into_iter()
+        .find(|m| m.vdevice_id == keychain.vdevice_id)
+        .unwrap()
+        .device_key;
+
+    let fresh = block_on(phone.rotate_epoch()).unwrap();
+    assert_eq!(fresh.revoked, None);
+    assert!(fresh.excluded.is_empty(), "{:?}", fresh.excluded);
+
+    clock.advance(AUTO_RECOVERY_TTL_MS + 1);
+    let report = block_on(phone.rotate_epoch()).unwrap();
+    assert_eq!(report.new_epoch, fresh.new_epoch + 1);
+    assert_eq!(
+        report.excluded,
+        vec![ExcludedMember {
+            device_key: Some(keychain_key),
+            reason: ExclusionReason::RecoveryExpired,
+        }]
+    );
+    net.register_chat_device(A, tpub(6));
+    let restore = |c: &str| {
+        block_on(Labyrinth::restore_with_recovery_code(
+            A,
+            c,
+            Box::new(signer(6)),
+            backends(&net, &clock, A),
+        ))
+        .map(|_| ())
+    };
+    assert!(
+        restore(keychain.code.as_str()).is_err(),
+        "an expired bundle opens no new epoch"
+    );
+    restore(code.code.as_str()).expect("a user-held code never expires");
+}
+
 /// Records every epoch number it is asked to publish; fails while `fail`.
 #[derive(Clone, Default)]
 struct Recorder {
@@ -247,6 +294,85 @@ fn every_epoch_is_published_by_its_attesting_device() {
         &rec.seen.lock().unwrap()[replay_start..],
         &[0, 3, 4, 5],
         "a retry must skip intermediate epochs attested by sibling devices"
+    );
+}
+
+/// G15: recovery-code and one-time-code enrollment create the new epoch
+/// before publishing its head. A directory that refuses the head must not
+/// cost the enrolled keys: the head stays durably pending in the saved
+/// state, and the reopened device retries it.
+#[test]
+fn enrollment_keeps_a_refused_epoch_head_pending_for_retry() {
+    let net = MemoryBackend::new();
+    let clock = TestClock::default();
+    let mut phone = init(&net, &clock, A, 1);
+    let code = block_on(phone.create_recovery_code(Mechanism::Code)).unwrap();
+    let rec = Recorder::default();
+    let with_rec = || {
+        backends_with(
+            &net,
+            &clock,
+            A,
+            Box::new(net.mailbox(A)),
+            vec![Box::new(rec.clone())],
+        )
+    };
+
+    *rec.fail.lock().unwrap() = true;
+    net.register_chat_device(A, tpub(6));
+    let (tablet, enrollment) = block_on(Labyrinth::restore_with_recovery_code(
+        A,
+        code.code.as_str(),
+        Box::new(signer(6)),
+        with_rec(),
+    ))
+    .expect("a refused publication must not discard the restored device");
+    assert!(enrollment.unfinished.is_some());
+    assert_eq!(
+        tablet.pending_directory_epoch(),
+        Some(tablet.latest_epoch())
+    );
+    let saved = tablet.export_state().unwrap();
+    drop(tablet);
+
+    *rec.fail.lock().unwrap() = false;
+    let mut reopened = block_on(Labyrinth::from_state(
+        &saved,
+        A,
+        Box::new(signer(6)),
+        with_rec(),
+    ))
+    .unwrap();
+    assert_eq!(
+        reopened.pending_directory_epoch(),
+        Some(reopened.latest_epoch())
+    );
+    assert!(block_on(reopened.retry_pending_directory_publication()).unwrap());
+    assert_eq!(reopened.pending_directory_epoch(), None);
+    assert_eq!(
+        rec.seen.lock().unwrap().last(),
+        Some(&reopened.latest_epoch())
+    );
+
+    *rec.fail.lock().unwrap() = true;
+    let mut offer = phone.otc_offer().unwrap();
+    let typed = offer.code().as_str().to_owned();
+    let (initiator, hello) = Labyrinth::otc_start(A, &typed).unwrap();
+    let reply = block_on(phone.otc_respond(&mut offer, &hello)).unwrap();
+    net.register_chat_device(A, tpub(7));
+    let (laptop, enrollment) = block_on(Labyrinth::enroll_via_otc(
+        A,
+        initiator,
+        &reply.message,
+        &reply.sealed_payload,
+        Box::new(signer(7)),
+        with_rec(),
+    ))
+    .expect("a refused publication must not discard the OTC-enrolled device");
+    assert!(enrollment.unfinished.is_some());
+    assert_eq!(
+        laptop.pending_directory_epoch(),
+        Some(laptop.latest_epoch())
     );
 }
 
