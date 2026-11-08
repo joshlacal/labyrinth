@@ -18,7 +18,7 @@ use super::{
     ApplyWritesIn, ApplyWritesOut, GetRecordOut, LIST_LIMIT, ListRecordsOut,
     MAX_SPACE_CURSOR_BYTES, MAX_SPACE_LIST_ITEMS, MAX_SPACE_LIST_RESPONSE_BYTES, MAX_SPACE_PAGES,
     MAX_SPACE_RESPONSE_BYTES, MAX_WRITES, SpaceRef, SpaceRpc, WriteOp, decode, decode_body, encode,
-    endpoint, map_space_error, uri_rkey,
+    endpoint, map_member_repo_space_error, map_space_error, uri_rkey,
 };
 use crate::attachment::{AttachmentCiphertextMeta, verify_attachment_ciphertext};
 use crate::deletion::Redaction;
@@ -209,7 +209,7 @@ impl SpaceThreadStore {
             .t
             .procedure(endpoint::APPLY_WRITES, &payload)
             .await
-            .map_err(map_space_error)?;
+            .map_err(map_member_repo_space_error)?;
         let out: ApplyWritesOut = decode_body(&body)?;
         Ok(out.results.into_iter().map(|r| r.uri).collect())
     }
@@ -231,7 +231,7 @@ impl SpaceThreadStore {
             .t
             .query(endpoint::GET_RECORD, &p)
             .await
-            .map_err(map_space_error)
+            .map_err(map_member_repo_space_error)
         {
             Ok(body) => decode(decode_body::<GetRecordOut>(&body)?.value).map(Some),
             Err(Error::NotFound("record" | "repo")) => Ok(None),
@@ -245,7 +245,7 @@ impl SpaceThreadStore {
             .t
             .query(endpoint::LIST_REPOS, &p)
             .await
-            .map_err(map_space_error)?;
+            .map_err(map_member_repo_space_error)?;
         let out: ListReposOut = decode_body(&body)?;
         let mut dids: Vec<String> = out.repos.into_iter().map(|r| r.did).collect();
         dids.sort();
@@ -282,7 +282,7 @@ impl SpaceThreadStore {
                 .t
                 .query(endpoint::LIST_RECORDS, &p)
                 .await
-                .map_err(map_space_error)
+                .map_err(map_member_repo_space_error)
             {
                 Ok(body) => body,
                 Err(Error::NotFound("repo")) => return Ok(out),
@@ -616,7 +616,7 @@ impl ThreadStore for SpaceThreadStore {
             .t
             .get_blob(&space.to_string(), author_did, &cid)
             .await
-            .map_err(map_space_error)?;
+            .map_err(map_member_repo_space_error)?;
         verify_attachment_ciphertext(&bytes, &meta)?;
         Ok(bytes)
     }
@@ -654,5 +654,69 @@ impl ThreadStore for SpaceThreadStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::executor::block_on;
+
+    use super::*;
+    use crate::store::space::SpaceError;
+
+    struct GrantedRelay(u16);
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl SpaceRpc for GrantedRelay {
+        async fn query(
+            &self,
+            nsid: &str,
+            _: &[(&str, String)],
+        ) -> core::result::Result<Vec<u8>, SpaceError> {
+            assert_eq!(nsid, endpoint::LIST_REPOS);
+            Err(SpaceError::named(
+                self.0,
+                "SpaceNotFound",
+                "unsigned refusal after credential grant",
+            ))
+        }
+
+        async fn procedure(
+            &self,
+            nsid: &str,
+            _: &[u8],
+        ) -> core::result::Result<Vec<u8>, SpaceError> {
+            assert_eq!(nsid, endpoint::APPLY_WRITES);
+            Err(SpaceError::named(
+                self.0,
+                "SpaceNotFound",
+                "unsigned refusal after credential grant",
+            ))
+        }
+    }
+
+    #[test]
+    fn unsigned_space_not_found_is_not_member_repo_denial_at_read_or_write_boundary() {
+        let space = SpaceRef::conversation("did:web:ds.example", "thread");
+        for status in [400, 404] {
+            let rpc: Arc<dyn SpaceRpc> = Arc::new(GrantedRelay(status));
+            let store = SpaceThreadStore::new(rpc, "did:plc:alice");
+            assert_eq!(
+                block_on(store.list_repos(&space)).unwrap_err(),
+                Error::NotFound("space")
+            );
+            assert_eq!(
+                block_on(store.apply(
+                    &space,
+                    &[WriteOp::Delete {
+                        collection: nsid::BATCH,
+                        rkey: "pending".into(),
+                    }],
+                ))
+                .unwrap_err(),
+                Error::NotFound("space")
+            );
+        }
     }
 }

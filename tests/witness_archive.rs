@@ -19,8 +19,9 @@ use labyrinth::protocol::receipt::{
     SequencerReceiptPayload, compute_archive_commitment, expected_receipt_key_id,
     sign_sequencer_receipt,
 };
-use labyrinth::store::memory::MemoryBackend;
-use labyrinth::store::{SequencerReceiptKey, ThreadStore as _, TimeRange};
+use labyrinth::records::{Batch, MekDistribution};
+use labyrinth::store::memory::{MemoryBackend, MemoryThreads};
+use labyrinth::store::{SequencerReceiptKey, Stored, ThreadStore as _, TimeRange};
 use labyrinth::virtual_device::Mechanism;
 use net::{A, B, TestClock, backends, init, signer, tpub};
 use p256::ecdsa::SigningKey;
@@ -43,6 +44,51 @@ struct Sent {
     frame: Vec<u8>,
     nonce: [u8; 32],
     receipt: ArchivedReceipt,
+}
+
+/// A hostile conversation store that changes only the original sender's
+/// attestation signature after a valid batch has been committed.
+struct SignatureBitFlipThreads(MemoryThreads);
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl labyrinth::store::ThreadStore for SignatureBitFlipThreads {
+    fn author(&self) -> &str {
+        self.0.author()
+    }
+
+    async fn create_mek(&self, mek: &MekDistribution) -> labyrinth::Result<()> {
+        self.0.create_mek(mek).await
+    }
+
+    async fn find_meks(
+        &self,
+        thread_id: &str,
+        mek_id: &[u8; 12],
+    ) -> labyrinth::Result<Vec<Stored<MekDistribution>>> {
+        self.0.find_meks(thread_id, mek_id).await
+    }
+
+    async fn append_batch(&self, batch: &Batch) -> labyrinth::Result<String> {
+        self.0.append_batch(batch).await
+    }
+
+    async fn list_batches(
+        &self,
+        thread_id: &str,
+        sender: Option<&str>,
+        range: TimeRange,
+    ) -> labyrinth::Result<Vec<Stored<Batch>>> {
+        let mut batches = self.0.list_batches(thread_id, sender, range).await?;
+        for batch in &mut batches {
+            for item in &mut batch.value.items {
+                if let Some(receipt) = &mut item.sequencer_receipt {
+                    receipt.original_sender_attestation.signature.0[0] ^= 1;
+                }
+            }
+        }
+        Ok(batches)
+    }
 }
 
 impl World {
@@ -348,6 +394,44 @@ fn tampered_witness_copies_are_never_attributed() {
         errors,
         ["ReceiptCommitmentMismatch", "ReceiptCommitmentMismatch"]
     );
+}
+
+#[test]
+fn original_sender_attestation_signature_bit_flip_is_rejected_on_read() {
+    let w = World::new();
+    let mut alice = w.join(A, 1);
+    let mut bob = w.join(B, 2);
+
+    w.net.register_chat_device(C, tpub(3));
+    let mut reader_backends = backends(&w.net, &w.clock, C);
+    reader_backends.threads = Box::new(SignatureBitFlipThreads(w.net.threads(C)));
+    let mut carol = block_on(Labyrinth::initialize(
+        C,
+        Box::new(signer(3)),
+        reader_backends,
+    ))
+    .unwrap();
+    w.net.add_leaf(THREAD, C, tpub(3));
+
+    let m = w.sequence(A, "m1");
+    archive(&mut bob, &[A, B, C], &m, 100);
+    block_on(bob.flush()).unwrap();
+
+    let intact = load(&mut alice);
+    assert_eq!(
+        summary(&intact),
+        [("m1", Some(A), MessageSource::Witness, 100, false)]
+    );
+    assert_exact(&intact.messages[0], &m);
+
+    let tampered = load(&mut carol);
+    assert!(
+        tampered.messages.is_empty(),
+        "a signature-bit-flipped attestation must never attribute a message"
+    );
+    assert_eq!(tampered.undecryptable.len(), 1);
+    assert_eq!(tampered.undecryptable[0].message_id, "m1");
+    assert_eq!(tampered.undecryptable[0].error, Error::BadSignature);
 }
 
 #[test]

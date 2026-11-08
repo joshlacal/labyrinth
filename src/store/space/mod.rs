@@ -187,6 +187,54 @@ impl core::fmt::Display for SpaceRef {
     }
 }
 
+#[cfg(feature = "sim")]
+thread_local! {
+    static FORBID_MEMBER_REPO_SPACE_NOT_FOUND: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Set the simulation-only P16 regression and return its previous scoped value.
+#[doc(hidden)]
+#[inline]
+pub fn set_sim_member_repo_space_not_found_as_forbidden(enabled: bool) -> bool {
+    #[cfg(feature = "sim")]
+    {
+        FORBID_MEMBER_REPO_SPACE_NOT_FOUND.with(|active| active.replace(enabled))
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        let _ = enabled;
+        false
+    }
+}
+
+#[inline(always)]
+fn forbid_member_repo_space_not_found() -> bool {
+    #[cfg(feature = "sim")]
+    {
+        FORBID_MEMBER_REPO_SPACE_NOT_FOUND.with(std::cell::Cell::get)
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        false
+    }
+}
+
+/// Map a member-repository response without treating an unsigned missing Space as removal proof.
+///
+/// Only an authenticated denial reaches this boundary as `401`/`403`. A relay's unsigned
+/// `400`/`404 SpaceNotFound` remains `NotFound`, so read callers cannot enter owner-history
+/// fallback and write callers cannot mistake it for permission to dequeue shared-archive work.
+pub fn map_member_repo_space_error(e: SpaceError) -> Error {
+    let missing_space =
+        matches!(e.status, 400 | 404) && e.error.as_deref() == Some("SpaceNotFound");
+    if missing_space && forbid_member_repo_space_not_found() {
+        Error::Forbidden
+    } else {
+        map_space_error(e)
+    }
+}
+
 /// Maps a `com.atproto.space.*` error to the store error.
 pub fn map_space_error(e: SpaceError) -> Error {
     let is_not_found_status = e.status == 404 || e.status == 400;
@@ -960,6 +1008,29 @@ mod bounded_tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn unsigned_member_repo_space_not_found_remains_not_found() {
+        for status in [400, 404] {
+            let missing = || SpaceError::named(status, "SpaceNotFound", "gone");
+            assert_eq!(
+                map_member_repo_space_error(missing()),
+                Error::NotFound("space")
+            );
+            assert_eq!(map_space_error(missing()), Error::NotFound("space"));
+        }
+    }
+
+    #[cfg(feature = "sim")]
+    #[test]
+    fn p16_restores_the_unsigned_member_repo_denial_bug() {
+        let previous = set_sim_member_repo_space_not_found_as_forbidden(true);
+        assert_eq!(
+            map_member_repo_space_error(SpaceError::named(404, "SpaceNotFound", "gone")),
+            Error::Forbidden
+        );
+        set_sim_member_repo_space_not_found_as_forbidden(previous);
+    }
 
     struct Scripted {
         replies: Mutex<VecDeque<Vec<u8>>>,

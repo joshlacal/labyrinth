@@ -48,6 +48,8 @@ default = ["space"]
 # Retained as an unconditional no-op alias for downstream feature flags;
 # Spaces-only storage is always enabled in clean-slate Labyrinth.
 space = []
+sim = []
+plant_p16 = ["sim"]
 
 [dev-dependencies]
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
