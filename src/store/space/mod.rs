@@ -7,7 +7,7 @@
 //! ([`SpaceRef::mailbox`]: authority = the owner's DID, `spaceType` =
 //! `blue.catbird.labyrinth.mailbox`, `skey` = `self`). Only the owner
 //! writes (OAuth, `repo == auth.did`) and only the owner reads
-//! (`read_self`), so the Space needs no notifyWrite, syncer or member list.
+//! (`read_self`), so the Space needs no notification syncer or member list.
 //!
 //! The store reuses [`XrpcTransport`]: the embedding app supplies one
 //! bound to the user's PDS with the account's OAuth session (no service
@@ -375,7 +375,6 @@ impl SpaceMailboxStore {
                 ("repo", self.did.clone()),
                 ("collection", collection.to_owned()),
                 ("limit", self.page.to_string()),
-                ("reverse", "true".to_owned()),
             ];
             if !values {
                 p.push(("excludeValues", "true".to_owned()));
@@ -401,7 +400,12 @@ impl SpaceMailboxStore {
             match page.cursor {
                 Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
                 Some(_) => return Err(Error::Backend("space cursor did not advance".into())),
-                None => return Ok(out),
+                None => {
+                    // The wire order is newest first; preserve the store's
+                    // ascending-rkey behavior after `reverse` was removed.
+                    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    return Ok(out);
+                }
             }
         }
         Err(Error::Backend("space listing too long".into()))

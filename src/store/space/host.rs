@@ -2,8 +2,8 @@
 //! endpoints the Space store calls, for tests and as an executable
 //! statement of the semantics it relies on (reference implementation
 //! `packages/pds/src/api/com/atproto/space/*` and
-//! `actor-store/space/{reader,transactor}.ts`, branch `permissioned-data`
-//! at `5b95b2f2`, 2026-10-01).
+//! `actor-store/space/{reader,transactor}.ts` at
+//! `d4def6e9` (2026-11-12).
 //!
 //! What it enforces:
 //!
@@ -18,11 +18,12 @@
 //! - no Space has to be created first: a member's PDS accepts writes to a
 //!   Space no authority governs, and reads them back (checked against the
 //!   live dev PDS, `tests/live_space_pds.rs`);
-//! - `listRecords` orders by record URI, descending unless `reverse`,
-//!   with the last URI as the cursor only when the page is full.
+//! - `listRecords` orders by record URI descending, with the last URI as
+//!   the cursor only when the page is full;
+//! - `listSpaces` accepts `spaceDid` and returns `{ space, ... }`.
 //!
-//! It does not model space credentials, notifyWrite, rate limits, record
-//! CIDs for mailbox records (a digest stands in), or lexicon validation.
+//! It does not model space credentials, `notifyRepoUpdate`, rate limits,
+//! record CIDs for mailbox records (a digest stands in), or lexicon validation.
 //! Conversation batches use canonical DRISL CIDs.
 
 use std::collections::BTreeMap;
@@ -200,6 +201,9 @@ impl SpaceClient {
     fn list_spaces(&self, p: &[(&str, String)]) -> Reply {
         let state = self.host.s.lock().unwrap();
         let cursor = param(p, "cursor");
+        if cursor.is_some_and(|c| SpaceRef::parse(c).is_err()) {
+            return Err(err(400, "InvalidCursor", "cursor"));
+        }
         let limit: usize = param(p, "limit")
             .unwrap_or("50")
             .parse()
@@ -212,8 +216,10 @@ impl SpaceClient {
             .filter(|(uri, did)| {
                 did == &self.did
                     && cursor.is_none_or(|c| uri.as_str() > c)
-                    && SpaceRef::parse(uri)
-                        .is_ok_and(|s| param(p, "spaceType").is_none_or(|t| s.space_type == t))
+                    && SpaceRef::parse(uri).is_ok_and(|s| {
+                        param(p, "spaceDid").is_none_or(|d| s.space_did == d)
+                            && param(p, "spaceType").is_none_or(|t| s.space_type == t)
+                    })
             })
             .map(|(uri, _)| uri.clone())
             .take(limit)
@@ -221,9 +227,13 @@ impl SpaceClient {
         let cursor = (matching.len() == limit)
             .then(|| matching.last().cloned())
             .flatten();
-        ok(
-            json!({"spaces": matching.iter().map(|uri| json!({"uri": uri})).collect::<Vec<_>>(), "cursor": cursor}),
-        )
+        let mut out = json!({
+            "spaces": matching.iter().map(|space| json!({"space": space})).collect::<Vec<_>>()
+        });
+        if let Some(cursor) = cursor {
+            out["cursor"] = Value::from(cursor);
+        }
+        ok(out)
     }
     fn read_repo(
         &self,
@@ -263,27 +273,18 @@ impl SpaceClient {
                 .filter(|l| (1..=1000).contains(l))
                 .ok_or_else(|| err(400, "InvalidRequest", "limit"))?,
         };
-        let reverse = param(p, "reverse") == Some("true");
         let exclude = param(p, "excludeValues") == Some("true");
         let collection = param(p, "collection");
         let cursor = param(p, "cursor");
         let s = self.host.s.lock().unwrap();
         let r = self.read_repo(&s, space, repo)?;
-        let matching = r
+        let page: Vec<(&String, &(String, String, Value))> = r
             .iter()
-            .filter(|(_, (c, ..))| collection.is_none_or(|x| x == c));
-        let page: Vec<(&String, &(String, String, Value))> = if reverse {
-            matching
-                .filter(|(u, _)| cursor.is_none_or(|c| u.as_str() > c))
-                .take(limit)
-                .collect()
-        } else {
-            matching
-                .rev()
-                .filter(|(u, _)| cursor.is_none_or(|c| u.as_str() < c))
-                .take(limit)
-                .collect()
-        };
+            .rev()
+            .filter(|(_, (c, ..))| collection.is_none_or(|x| x == c))
+            .filter(|(u, _)| cursor.is_none_or(|c| u.as_str() < c))
+            .take(limit)
+            .collect();
         let next = (page.len() == limit).then(|| page.last().map(|(u, _)| (*u).clone()));
         let records: Vec<Value> = page
             .iter()

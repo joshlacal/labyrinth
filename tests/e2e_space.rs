@@ -2,7 +2,7 @@
 //! Space (`--features space`), against the reference Space host, with
 //! every `com.atproto.space.*` request and response validated against the
 //! vendored lexicons (`tests/vectors/atproto-space/`, upstream
-//! `permissioned-data` at `5b95b2f2`) and every record value against ours.
+//! `d4def6e9`) and every record value against ours.
 //! Threads, the ORF and the mls-ds head directory stay on the memory
 //! backend, as they stay on mls-ds in production; the directory is the
 //! production composition: PDS `mailboxKeys` × mls-ds heads ([CB-28]).
@@ -24,7 +24,8 @@ use labyrinth::recovery_code::ALPHABET;
 use labyrinth::sign::Ed25519Transport;
 use labyrinth::store::memory::MemoryBackend;
 use labyrinth::store::space::host::MemorySpaceHost;
-use labyrinth::store::space::{SpaceMailboxStore, SpaceRef};
+use labyrinth::store::space::thread::SequencedSpaceThreadStore;
+use labyrinth::store::space::{SpaceMailboxStore, SpaceRef, endpoint};
 use labyrinth::store::xrpc::{XrpcError, XrpcTransport};
 use labyrinth::store::{MailboxDirectory, MailboxStore, TimeRange};
 use labyrinth::virtual_device::Mechanism;
@@ -478,6 +479,41 @@ fn space_store_semantics() {
     assert!(fresh.list_devices().unwrap().is_empty());
     assert!(fresh.get_virtual_device(&[0; 16]).unwrap().is_none());
     assert_eq!(fresh.list_owner_threads().unwrap(), Vec::<String>::new());
+
+    // listSpaces uses the November 12 `space` entry and `spaceDid` filter.
+    let conversation = SpaceRef {
+        space_did: "did:plc:authority".into(),
+        space_type: "blue.catbird.labyrinth.conversation".into(),
+        skey: "11111111-1111-4111-8111-111111111111".into(),
+    };
+    w.host.tamper(
+        &conversation,
+        ALICE,
+        nsid::BATCH,
+        "batch",
+        serde_json::json!({"$type": nsid::BATCH}),
+    );
+    let transport = w.transport(ALICE);
+    assert_eq!(
+        SequencedSpaceThreadStore::owned_spaces(transport.as_ref()).unwrap(),
+        vec![conversation.to_string()]
+    );
+    let filtered: Value = serde_json::from_slice(
+        &transport
+            .query(
+                endpoint::LIST_SPACES,
+                &[("spaceDid", "did:plc:authority".into())],
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(filtered["spaces"][0]["space"], conversation.to_string());
+    assert!(
+        w.seen
+            .lock()
+            .unwrap()
+            .contains(&format!("{SPACE_PREFIX}listSpaces"))
+    );
 }
 
 #[test]

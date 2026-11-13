@@ -1,6 +1,6 @@
 // Starts the upstream atproto dev network (PLC + one PDS, no AppView) from a
-// built checkout of bluesky-social/atproto (the October 29, 2026 Spaces
-// alpha, 5d88b414, or later: `createSpace` takes a `policy` union),
+// built checkout of bluesky-social/atproto (the November 12, 2026 Spaces
+// alpha, d4def6e9, or later),
 // creates test accounts with a personal Labyrinth mailbox Space each, and
 // writes their sessions to a JSON file for `tests/live_space_pds.rs`.
 //
@@ -60,7 +60,7 @@ for (const name of NAMES) {
     },
     s.accessJwt,
   )
-  accounts[name] = { did: s.did, accessJwt: s.accessJwt, space: space.uri }
+  accounts[name] = { did: s.did, accessJwt: s.accessJwt, space: space.space }
 }
 
 writeFileSync(out, JSON.stringify({ pds: pdsUrl, accounts }, null, 2))

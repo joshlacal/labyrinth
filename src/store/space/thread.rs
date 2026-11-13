@@ -1,10 +1,11 @@
 //! Sender-owned conversation ciphertext, indexed and ordered by mls-ds.
 //!
 //! The Space transport must verify credential-authenticated `getRecord`
-//! responses using the October 22 MAC protocol before returning success.
-//! Owner OAuth writes and reads need no MAC. This store additionally binds
-//! each returned record to the sequencer's immutable generation, repo and CID;
-//! only then can its authenticated server order be used for removed-key checks.
+//! responses using the November 12 HPKE-exported RFC 9421 MAC protocol
+//! before returning success. Owner OAuth writes and reads need no MAC. This
+//! store additionally binds each returned record to the sequencer's immutable
+//! generation, repo and CID; only then can its authenticated server order be
+//! used for removed-key checks.
 
 use std::sync::Arc;
 
@@ -140,7 +141,7 @@ impl SequencedSpaceThreadStore {
     pub fn owned_spaces(transport: &dyn XrpcTransport) -> Result<Vec<String>> {
         #[derive(Deserialize)]
         struct View {
-            uri: String,
+            space: String,
         }
         #[derive(Deserialize)]
         struct Page {
@@ -164,14 +165,14 @@ impl SequencedSpaceThreadStore {
             let page: Page = serde_json::from_slice(&body)
                 .map_err(|_| Error::Malformed("owned conversation Space inventory"))?;
             for view in page.spaces {
-                let space = SpaceRef::parse(&view.uri)?;
+                let space = SpaceRef::parse(&view.space)?;
                 ThreadPlacement {
                     placement: "space".into(),
                     generation: space.skey.clone(),
-                    space: Some(view.uri.clone()),
+                    space: Some(view.space.clone()),
                 }
                 .validate()?;
-                spaces.insert(view.uri);
+                spaces.insert(view.space);
             }
             let Some(next) = page.cursor else {
                 return Ok(spaces.into_iter().collect());
