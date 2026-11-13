@@ -10,7 +10,7 @@ The October 23 integration extends the earlier personal-mailbox Space backend. T
 
 On append, the store serializes the batch as canonical DAG-CBOR with native byte strings and computes its CID. It creates an owner-OAuth record whose key is the SHA-256 of that CID string. A lost acknowledgement is retried at the same key; an existing record must match the computed CID. `appendSpaceBatch` then sends the typed record and reference for admission. The service validates it but stores only reference metadata and tombstones for a Space placement. MEK distribution remains on the delivery service.
 
-On read, `listSpaceBatches` supplies references and server order. The platform Space adapter must authenticate foreign `getRecord` responses through the October 22 credential, fresh KEM and MAC protocol. This crate additionally checks exact URI, repository, generation, CID, thread and item count before attaching server order. Owner OAuth reads do not need a foreign-access MAC. A raw record listing never becomes authoritative conversation history.
+On read, `listSpaceBatches` supplies references and server order. The platform Space adapter must authenticate foreign `getRecord` responses through `authorizeSpaceSync` and the November 12 `Accept-Signature` / RFC 9421 HMAC protocol, using a fresh HPKE-exported secret for each request. This crate additionally checks exact URI, repository, generation, CID, thread and item count before attaching server order. Owner OAuth reads do not need a foreign-access MAC. A raw record listing never becomes authoritative conversation history.
 
 ## Deletion and retry
 
