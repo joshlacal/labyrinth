@@ -4,9 +4,11 @@
 pub mod host;
 pub mod thread;
 
-pub use thread::{SpaceThreadStore, batch_cid};
+pub use atproto_spaces;
+pub use thread::{SequencedSpaceThreadStore, SpaceThreadStore, batch_cid};
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -19,8 +21,9 @@ use super::{
 use crate::attachment::{AttachmentCiphertextMeta, verify_attachment_ciphertext};
 use crate::epoch::space_epoch_id;
 use crate::records::{
-    AttachmentManifest, Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch,
-    VirtualDevice, datetime_from_ms, nsid,
+    AttachmentManifest, Bytes, CircleOwnerStateRecord, Device, Epoch, EpochMember,
+    MailboxKeysRecord, OtcSession, OwnerBatch, ReadStateRecord, VirtualDevice, datetime_from_ms,
+    nsid,
 };
 use crate::sign::XVerifyingKey;
 use crate::{Error, Result};
@@ -51,23 +54,170 @@ pub mod endpoint {
     pub const APPLY_WRITES: &str = "com.atproto.space.applyWrites";
     pub const GET_RECORD: &str = "com.atproto.space.getRecord";
     pub const LIST_RECORDS: &str = "com.atproto.space.listRecords";
-    pub const LIST_REPOS: &str = "com.atproto.space.listRepos";
+    pub const LIST_WRITERS: &str = "com.atproto.space.listWriters";
+    pub const LIST_REPOS: &str = LIST_WRITERS;
     pub const LIST_SPACES: &str = "com.atproto.space.listSpaces";
     pub const DELETE_RECORD: &str = "com.atproto.space.deleteRecord";
+    pub const AUTHORIZE_SPACE_SYNC: &str = "com.atproto.space.authorizeSpaceSync";
+    pub const GET_REPO: &str = "com.atproto.space.getRepo";
     pub const GET_BLOB: &str = "com.atproto.space.getBlob";
     pub const UPLOAD_BLOB: &str = "com.atproto.repo.uploadBlob";
+    pub const PUT_MEMBERS: &str = "com.atproto.memberspace.putMembers";
+    pub const REMOVE_MEMBERS: &str = "com.atproto.memberspace.removeMembers";
+    pub const LIST_MEMBERS: &str = "com.atproto.memberspace.listMembers";
 }
 
 /// Every collection the personal mailbox Space holds, for purge.
-pub const MAILBOX_COLLECTIONS: [&str; 7] = [
+pub const MAILBOX_COLLECTIONS: [&str; 9] = [
     nsid::DEVICE,
     nsid::EPOCH,
     nsid::EPOCH_MEMBER,
     nsid::VIRTUAL_DEVICE,
     nsid::OTC_SESSION,
+    nsid::READ_STATE,
+    nsid::CIRCLE_OWNER_STATE,
     nsid::OWNER_BATCH,
     nsid::ATTACHMENT_MANIFEST,
 ];
+
+/// Monotonic per-`(space_uri, author_did)` repository commit revision floors.
+///
+/// Tracks the highest observed commit revision (`repoRev` / `Atproto-Space-Commit`
+/// `rev`) per `(space_uri, author_did)` and refuses any rollback (`offered < pinned`)
+/// with [`Error::WriterRollback`].
+#[derive(Clone, Default, Debug)]
+pub struct WriterRevFloors {
+    inner: Arc<Mutex<BTreeMap<(String, String), String>>>,
+}
+
+impl WriterRevFloors {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_map(floors: BTreeMap<(String, String), String>) -> Self {
+        let out = Self::new();
+        out.replace(&floors);
+        out
+    }
+
+    pub fn observe(&self, space: &str, author: &str, offered_rev: &str) -> Result<()> {
+        crate::store::validate_writer_rev_floor(space, author, offered_rev)?;
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (space.to_owned(), author.to_owned());
+        if let Some(pinned) = guard.get(&key) {
+            if offered_rev < pinned.as_str() {
+                return Err(Error::WriterRollback {
+                    space: space.to_owned(),
+                    author: author.to_owned(),
+                    pinned_rev: pinned.clone(),
+                    offered_rev: offered_rev.to_owned(),
+                });
+            }
+            if offered_rev == pinned.as_str() {
+                return Ok(());
+            }
+            guard.insert(key, offered_rev.to_owned());
+            return Ok(());
+        }
+        if guard.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES {
+            return Err(Error::Malformed("writer revision floor table full"));
+        }
+        guard.insert(key, offered_rev.to_owned());
+        Ok(())
+    }
+
+    pub fn seed(&self, floors: &BTreeMap<(String, String), String>) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for ((space, author), rev) in floors {
+            if crate::store::validate_writer_rev_floor(space, author, rev).is_err() {
+                continue;
+            }
+            let key = (space.clone(), author.clone());
+            match guard.get(&key) {
+                Some(cur) if cur.as_str() >= rev.as_str() => {}
+                Some(_) => {
+                    guard.insert(key, rev.clone());
+                }
+                None if guard.len() < crate::store::MAX_WRITER_FLOOR_ENTRIES => {
+                    guard.insert(key, rev.clone());
+                }
+                None => {}
+            }
+        }
+    }
+
+    pub fn replace(&self, floors: &BTreeMap<(String, String), String>) {
+        let mut next = BTreeMap::new();
+        for ((space, author), rev) in floors {
+            if crate::store::validate_writer_rev_floor(space, author, rev).is_err() {
+                continue;
+            }
+            let key = (space.clone(), author.clone());
+            if next.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES && !next.contains_key(&key) {
+                continue;
+            }
+            next.insert(key, rev.clone());
+        }
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = next;
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<(String, String), String> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn get(&self, space: &str, author: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(space.to_owned(), author.to_owned()))
+            .cloned()
+    }
+}
+
+/// Member access entry in `com.atproto.memberspace.{putMembers,listMembers}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemberAccess {
+    pub did: String,
+    pub read: bool,
+    pub write: bool,
+}
+
+/// Output of `com.atproto.space.authorizeSpaceSync`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorizeSpaceSyncOut {
+    pub credential: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_rev: Option<String>,
+}
+
+/// Union item of `com.atproto.space.listWriters` (`#repoWrite` / `#repoRemoved`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "$type")]
+pub enum WriterUpdate {
+    #[serde(rename = "com.atproto.space.defs#repoWrite", rename_all = "camelCase")]
+    RepoWrite {
+        repo: String,
+        repo_rev: String,
+        data: Bytes,
+        space_rev: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prev_space_rev: Option<String>,
+    },
+    #[serde(
+        rename = "com.atproto.space.defs#repoRemoved",
+        rename_all = "camelCase"
+    )]
+    RepoRemoved {
+        repo: String,
+        space_rev: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prev_space_rev: Option<String>,
+    },
+}
 
 /// Transport-level error from a `com.atproto.space.*` or blob endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +246,18 @@ pub trait SpaceRpc: MaybeSend + MaybeSync {
         nsid: &str,
         params: &[(&str, String)],
     ) -> core::result::Result<Vec<u8>, SpaceError>;
+
+    /// Query carrying request headers (such as `Accept-Signature` for RFC 9421 + HPKE
+    /// `0xFFFF` Export MAC negotiation) and returning `(response_headers, body)`.
+    async fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        _headers: &[(String, String)],
+    ) -> core::result::Result<(Vec<(String, String)>, Vec<u8>), SpaceError> {
+        let body = self.query(nsid, params).await?;
+        Ok((Vec::new(), body))
+    }
 
     async fn procedure(
         &self,
@@ -175,6 +337,31 @@ impl SpaceRef {
             _ => Err(Error::Malformed("space ref")),
         }
     }
+
+    /// Parses canonical `at://{did}/space/{type}/{skey}` or hedged
+    /// `at:space/{did}/{type}/{skey}` / `at://space/{did}/{type}/{skey}` via
+    /// [`atproto_spaces::SpaceUri::parse_hedged`].
+    pub fn parse_hedged(s: &str) -> Result<Self> {
+        let uri =
+            atproto_spaces::SpaceUri::parse_hedged(s).map_err(|_| Error::Malformed("space ref"))?;
+        Ok(Self::from(uri))
+    }
+
+    /// Converts to a validated [`atproto_spaces::SpaceUri`].
+    pub fn to_space_uri(&self) -> Result<atproto_spaces::SpaceUri> {
+        atproto_spaces::SpaceUri::new(&self.space_did, &self.space_type, &self.skey)
+            .map_err(|_| Error::Malformed("space ref"))
+    }
+}
+
+impl From<atproto_spaces::SpaceUri> for SpaceRef {
+    fn from(uri: atproto_spaces::SpaceUri) -> Self {
+        Self {
+            space_did: uri.authority,
+            space_type: uri.space_type,
+            skey: uri.rkey,
+        }
+    }
 }
 
 impl core::fmt::Display for SpaceRef {
@@ -240,10 +427,13 @@ pub fn map_space_error(e: SpaceError) -> Error {
     let is_not_found_status = e.status == 404 || e.status == 400;
     match e.error.as_deref() {
         Some("MethodNotImplemented") if e.status == 501 => Error::NotSupported("Space endpoint"),
-        Some("RecordAlreadyExists" | "InvalidSwap") => Error::Conflict,
+        Some("RecordAlreadyExists" | "InvalidSwap" | "ConcurrentWrite") => Error::Conflict,
+        _ if e.status == 409 => Error::Conflict,
         Some("RecordNotFound" | "BlobNotFound") if is_not_found_status => Error::NotFound("record"),
         Some("SpaceNotFound") if is_not_found_status => Error::NotFound("space"),
-        Some("SpaceDeleted") => Error::Forbidden,
+        Some("SpaceDeleted" | "AccountNotAuthorized" | "NotAuthorized" | "CredentialRevoked") => {
+            Error::Forbidden
+        }
         Some("RepoNotFound") if is_not_found_status => Error::NotFound("repo"),
         _ if e.status == 403 || e.status == 401 => Error::Forbidden,
         name => Error::Backend(format!(
@@ -297,6 +487,8 @@ pub(super) struct ApplyWritesOut {
 #[derive(Deserialize)]
 pub(super) struct WriteResult {
     pub uri: Option<String>,
+    #[serde(default)]
+    pub cid: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -309,6 +501,10 @@ struct DeleteRecordIn<'a> {
 
 #[derive(Deserialize)]
 pub(super) struct GetRecordOut {
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub cid: Option<String>,
     pub value: Value,
 }
 
@@ -321,6 +517,8 @@ pub(super) struct ListRecordsOut {
 #[derive(Deserialize)]
 pub(super) struct ListedRecord {
     pub rkey: String,
+    #[serde(default)]
+    pub cid: Option<String>,
     pub value: Option<Value>,
 }
 
@@ -374,6 +572,7 @@ pub struct SpaceMailboxStore {
     keys: Box<dyn KeyPublisher>,
     now_ms: crate::store::ClockFn,
     page: usize,
+    floors: WriterRevFloors,
 }
 
 impl SpaceMailboxStore {
@@ -391,6 +590,7 @@ impl SpaceMailboxStore {
             keys: Box::new(NoopKeyPublisher),
             now_ms: Arc::new(system_now_ms),
             page: LIST_LIMIT,
+            floors: WriterRevFloors::new(),
         }
     }
 
@@ -436,9 +636,9 @@ impl SpaceMailboxStore {
         self
     }
 
-    /// Records per `listRecords` page (`1..=100`; default [`LIST_LIMIT`]).
+    /// Records per `listRecords` page (`1..=1000`; default [`LIST_LIMIT`]).
     pub fn with_page_size(mut self, n: usize) -> Self {
-        self.page = n.clamp(1, 100);
+        self.page = n.clamp(1, 1_000);
         self
     }
 
@@ -448,11 +648,60 @@ impl SpaceMailboxStore {
         self
     }
 
+    /// Attaches a shared [`WriterRevFloors`] tracker.
+    pub fn with_writer_rev_floors(mut self, floors: WriterRevFloors) -> Self {
+        self.floors = floors;
+        self
+    }
+
+    /// Returns the attached [`WriterRevFloors`] tracker.
+    pub fn writer_rev_floors(&self) -> &WriterRevFloors {
+        &self.floors
+    }
+
+    /// Queries `listSpaces` for this mailbox's authority and checks/advances
+    /// the owner's `(space_uri, owner_did)` commit revision floor.
+    pub async fn observe_space_revision(&self) -> Result<Option<String>> {
+        let p = [
+            ("spaceDid", self.space.space_did.clone()),
+            ("spaceType", self.space.space_type.clone()),
+            ("limit", "100".to_owned()),
+        ];
+        let body = self
+            .t
+            .query(endpoint::LIST_SPACES, &p)
+            .await
+            .map_err(map_space_error)?;
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SpaceView {
+            space: String,
+            #[serde(default)]
+            repo_rev: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Out {
+            #[serde(default)]
+            spaces: Vec<SpaceView>,
+        }
+        let out: Out = decode_body(&body)?;
+        let target = self.space.to_string();
+        for s in out.spaces {
+            if s.space == target
+                && let Some(rev) = s.repo_rev
+            {
+                self.floors.observe(&target, &self.did, &rev)?;
+                return Ok(Some(rev));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn space(&self) -> &SpaceRef {
         &self.space
     }
 
-    async fn apply(&self, writes: &[WriteOp]) -> Result<Vec<Option<String>>> {
+    async fn apply_results(&self, writes: &[WriteOp]) -> Result<Vec<WriteResult>> {
         if writes.is_empty() {
             return Ok(Vec::new());
         }
@@ -476,10 +725,23 @@ impl SpaceMailboxStore {
             .await
             .map_err(map_space_error)?;
         let out: ApplyWritesOut = decode_body(&body)?;
-        Ok(out.results.into_iter().map(|r| r.uri).collect())
+        Ok(out.results)
     }
 
-    async fn get<T: DeserializeOwned>(&self, collection: &str, rkey: &str) -> Result<Option<T>> {
+    async fn apply(&self, writes: &[WriteOp]) -> Result<Vec<Option<String>>> {
+        Ok(self
+            .apply_results(writes)
+            .await?
+            .into_iter()
+            .map(|r| r.uri)
+            .collect())
+    }
+
+    async fn get_with_cid<T: DeserializeOwned>(
+        &self,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Option<(T, Option<String>)>> {
         let p = [
             ("space", self.space.to_string()),
             ("repo", self.did.clone()),
@@ -494,11 +756,18 @@ impl SpaceMailboxStore {
         {
             Ok(body) => {
                 let out: GetRecordOut = decode_body(&body)?;
-                Ok(Some(decode(out.value)?))
+                Ok(Some((decode(out.value)?, out.cid)))
             }
             Err(Error::NotFound("record" | "repo")) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    async fn get<T: DeserializeOwned>(&self, collection: &str, rkey: &str) -> Result<Option<T>> {
+        Ok(self
+            .get_with_cid(collection, rkey)
+            .await?
+            .map(|(value, _)| value))
     }
 
     async fn delete_record_idempotent(&self, collection: &'static str, rkey: &str) -> Result<()> {
@@ -521,8 +790,12 @@ impl SpaceMailboxStore {
         }
     }
 
-    /// Every `(rkey, value)` of `collection`, ascending by `rkey`.
-    async fn list_raw(&self, collection: &str, values: bool) -> Result<Vec<(String, Value)>> {
+    /// Every `(rkey, cid, value)` of `collection`, ascending by `rkey`.
+    async fn list_raw_with_cid(
+        &self,
+        collection: &str,
+        values: bool,
+    ) -> Result<Vec<(String, Option<String>, Value)>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = std::collections::BTreeSet::new();
@@ -533,7 +806,6 @@ impl SpaceMailboxStore {
                 ("repo", self.did.clone()),
                 ("collection", collection.to_owned()),
                 ("limit", self.page.to_string()),
-                ("reverse", "true".to_owned()),
             ];
             if !values {
                 p.push(("excludeValues", "true".to_owned()));
@@ -583,7 +855,7 @@ impl SpaceMailboxStore {
             out.extend(
                 page.records
                     .into_iter()
-                    .map(|r| (r.rkey, r.value.unwrap_or(Value::Null))),
+                    .map(|r| (r.rkey, r.cid, r.value.unwrap_or(Value::Null))),
             );
             match page.cursor {
                 Some(c) if c.len() > MAX_SPACE_CURSOR_BYTES => {
@@ -600,6 +872,27 @@ impl SpaceMailboxStore {
             }
         }
         Err(Error::Backend("space listing too long".into()))
+    }
+
+    /// Every `(rkey, value)` of `collection`, ascending by `rkey`.
+    async fn list_raw(&self, collection: &str, values: bool) -> Result<Vec<(String, Value)>> {
+        Ok(self
+            .list_raw_with_cid(collection, values)
+            .await?
+            .into_iter()
+            .map(|(k, _, v)| (k, v))
+            .collect())
+    }
+
+    async fn list_with_cid<T: DeserializeOwned>(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<(String, T, Option<String>)>> {
+        self.list_raw_with_cid(collection, true)
+            .await?
+            .into_iter()
+            .map(|(k, cid, v)| Ok((k, decode(v)?, cid)))
+            .collect()
     }
 
     async fn list<T: DeserializeOwned>(&self, collection: &str) -> Result<Vec<(String, T)>> {
@@ -638,6 +931,60 @@ impl SpaceMailboxStore {
         }])
         .await?;
         Ok(())
+    }
+
+    async fn put_cas(
+        &self,
+        collection: &'static str,
+        rkey: &str,
+        value: &impl Serialize,
+        expected_cid: Option<&str>,
+    ) -> Result<String> {
+        let encoded = encode(value)?;
+        match expected_cid {
+            None => {
+                let results = self
+                    .apply_results(&[WriteOp::Create {
+                        collection,
+                        rkey: Some(rkey.to_owned()),
+                        value: encoded,
+                    }])
+                    .await?;
+                results
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.cid)
+                    .ok_or_else(|| Error::Backend("space create result missing cid".into()))
+            }
+            Some(expected) => {
+                let Some((_, cur_cid)) = self.get_with_cid::<Value>(collection, rkey).await? else {
+                    return Err(Error::Conflict);
+                };
+                if cur_cid.as_deref() != Some(expected) {
+                    return Err(Error::Conflict);
+                }
+                let results = self
+                    .apply_results(&[WriteOp::Update {
+                        collection,
+                        rkey: rkey.to_owned(),
+                        value: encoded,
+                    }])
+                    .await?;
+                let written_cid = results
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.cid)
+                    .ok_or_else(|| Error::Backend("space update result missing cid".into()))?;
+                let Some((_, after_cid)) = self.get_with_cid::<Value>(collection, rkey).await?
+                else {
+                    return Err(Error::Conflict);
+                };
+                if after_cid.as_deref() != Some(written_cid.as_str()) {
+                    return Err(Error::Conflict);
+                }
+                Ok(written_cid)
+            }
+        }
     }
 
     fn stored<T>(&self, rkey: String, value: T) -> Stored<T> {
@@ -1059,6 +1406,90 @@ impl MailboxStore for SpaceMailboxStore {
             }
         }
         self.keys.retract().await
+    }
+
+    async fn get_read_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(ReadStateRecord, Option<String>)>> {
+        let Some((rec, cid)) = self
+            .get_with_cid::<ReadStateRecord>(nsid::READ_STATE, conversation_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        rec.check()?;
+        Ok(Some((rec, cid)))
+    }
+
+    async fn put_read_state(
+        &self,
+        conversation_id: &str,
+        record: &ReadStateRecord,
+        expected_cid: Option<&str>,
+    ) -> Result<String> {
+        record.check()?;
+        self.put_cas(nsid::READ_STATE, conversation_id, record, expected_cid)
+            .await
+    }
+
+    async fn list_read_states(&self) -> Result<Vec<(String, ReadStateRecord, Option<String>)>> {
+        let rows = self
+            .list_with_cid::<ReadStateRecord>(nsid::READ_STATE)
+            .await?;
+        for (_, rec, _) in &rows {
+            rec.check()?;
+        }
+        Ok(rows)
+    }
+
+    async fn get_circle_owner_state(
+        &self,
+        circle_id: &str,
+    ) -> Result<Option<(CircleOwnerStateRecord, Option<String>)>> {
+        let Some((rec, cid)) = self
+            .get_with_cid::<CircleOwnerStateRecord>(nsid::CIRCLE_OWNER_STATE, circle_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        rec.check()?;
+        Ok(Some((rec, cid)))
+    }
+
+    async fn put_circle_owner_state(
+        &self,
+        circle_id: &str,
+        record: &CircleOwnerStateRecord,
+        expected_cid: Option<&str>,
+    ) -> Result<String> {
+        record.check()?;
+        self.put_cas(nsid::CIRCLE_OWNER_STATE, circle_id, record, expected_cid)
+            .await
+    }
+
+    async fn list_circle_owner_states(
+        &self,
+    ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>)>> {
+        let rows = self
+            .list_with_cid::<CircleOwnerStateRecord>(nsid::CIRCLE_OWNER_STATE)
+            .await?;
+        for (_, rec, _) in &rows {
+            rec.check()?;
+        }
+        Ok(rows)
+    }
+
+    fn seed_writer_rev_floors(&self, floors: &BTreeMap<(String, String), String>) {
+        self.floors.seed(floors);
+    }
+
+    fn replace_writer_rev_floors(&self, floors: &BTreeMap<(String, String), String>) {
+        self.floors.replace(floors);
+    }
+
+    fn export_writer_rev_floors(&self) -> BTreeMap<(String, String), String> {
+        self.floors.snapshot()
     }
 }
 

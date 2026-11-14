@@ -13,8 +13,8 @@ use labyrinth::mek::{self, Mek};
 use labyrinth::message::{seal_owner, seal_sender};
 use labyrinth::records::mailbox::PasskeyWrap;
 use labyrinth::records::{
-    Batch, Device, Epoch, EpochMember, MailboxKeysRecord, MekDistribution, OwnerBatch,
-    VirtualDevice, datetime_from_ms, nsid,
+    AuthorRedaction, Batch, CircleOwnerStateRecord, Device, Epoch, EpochMember, MailboxKeysRecord,
+    MekDistribution, OwnerBatch, ReadStateRecord, VirtualDevice, datetime_from_ms, nsid,
 };
 use labyrinth::recovery_code::RecoveryCode;
 use labyrinth::sign::Ed25519Transport;
@@ -52,7 +52,7 @@ fn check<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
 #[test]
 fn lexicons_are_well_formed() {
     let lex = lexicons();
-    assert_eq!(lex.docs().count(), 57);
+    assert_eq!(lex.docs().count(), 60);
     for (id, doc) in lex.docs() {
         let main = &doc["defs"]["main"];
         if let Some(t @ ("query" | "procedure")) = main["type"].as_str() {
@@ -424,4 +424,33 @@ fn gap_fields_validate() {
     let mut vd = VirtualDevice::from_bundle(&vrec, None, ts.clone());
     vd.last_used_at = Some(datetime_from_ms(10));
     check(&lex, nsid::VIRTUAL_DEVICE, &vd);
+
+    let read_state = ReadStateRecord::new(vec![0xaa; 64], 0, ts.clone()).unwrap();
+    check(&lex, nsid::READ_STATE, &read_state);
+    assert!(ReadStateRecord::new(vec![], 0, ts.clone()).is_err());
+    assert!(ReadStateRecord::new(vec![0xaa; 16_385], 0, ts.clone()).is_err());
+    assert!(
+        ReadStateRecord::new(
+            vec![0xaa; 32],
+            labyrinth::records::MAX_EPOCH_NUMBER + 1,
+            ts.clone()
+        )
+        .is_err()
+    );
+
+    let circle_state = CircleOwnerStateRecord::new(vec![0xbb; 128], 0, ts.clone()).unwrap();
+    check(&lex, nsid::CIRCLE_OWNER_STATE, &circle_state);
+    assert!(CircleOwnerStateRecord::new(vec![], 0, ts.clone()).is_err());
+    assert!(CircleOwnerStateRecord::new(vec![0xbb; 262_145], 0, ts.clone()).is_err());
+    assert!(
+        CircleOwnerStateRecord::new(
+            vec![0xbb; 32],
+            labyrinth::records::MAX_EPOCH_NUMBER + 1,
+            ts.clone()
+        )
+        .is_err()
+    );
+
+    let ar = AuthorRedaction::new(THREAD, "m1", &r, ts);
+    check(&lex, nsid::AUTHOR_REDACTION, &ar);
 }

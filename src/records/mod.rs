@@ -3,8 +3,9 @@
 //!
 //! These types serialize (with `serde_json`) to the exact atproto JSON data
 //! model: camelCase field names, `$type` set to the record NSID, byte
-//! fields as `{"$bytes": "<base64, no padding>"}`, datetimes as RFC 3339
-//! strings. Non-human-readable serializers (DAG-CBOR) get raw bytes.
+//! fields as `{"$bytes": "<base64>"}` (emitted unpadded; padded input is
+//! accepted on decode), datetimes as RFC 3339 strings. Non-human-readable
+//! serializers (DAG-CBOR) get raw bytes.
 //!
 //! Each record type has a `from_*` constructor that takes the protocol
 //! struct plus the record-only fields (`createdAt`, …) and a `to_*`
@@ -22,7 +23,8 @@ pub use defs::{
 };
 pub(crate) use mailbox::should_replace_device_revocation;
 pub use mailbox::{
-    Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch, VirtualDevice,
+    CircleOwnerStateRecord, Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch,
+    ReadStateRecord, VirtualDevice,
 };
 pub use thread::{
     AttachmentManifest, AuthorRedaction, Batch, BatchEntry, LabyrinthSenderDef, MekDistribution,
@@ -48,6 +50,8 @@ pub mod nsid {
     pub const BATCH: &str = "blue.catbird.labyrinth.batch";
     pub const AUTHOR_REDACTION: &str = "blue.catbird.labyrinth.authorRedaction";
     pub const ATTACHMENT_MANIFEST: &str = "blue.catbird.labyrinth.attachmentManifest";
+    pub const READ_STATE: &str = "blue.catbird.labyrinth.readState";
+    pub const CIRCLE_OWNER_STATE: &str = "blue.catbird.labyrinth.circleOwnerState";
 }
 
 /// Most messages per `batch` / `ownerBatch` record ([CB-20]).
@@ -71,7 +75,8 @@ pub fn check_epoch_number(n: u64) -> Result<u64> {
     Ok(n)
 }
 
-/// An atproto `bytes` value: `{"$bytes": "<base64 no padding>"}` in JSON.
+/// An atproto `bytes` value: `{"$bytes": "<base64>"}` in JSON. Emitted
+/// unpadded; decoding accepts padded or unpadded.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Bytes(pub Vec<u8>);
 
@@ -115,10 +120,12 @@ impl<'de> serde::Deserialize<'de> for Bytes {
             bytes: String,
         }
         let w = Wire::deserialize(d)?;
+        // Petrel (Swift) and Kotlin emit padded base64; accept both forms by
+        // stripping all trailing '=' (lenient about padding count).
         STANDARD_NO_PAD
-            .decode(w.bytes.as_bytes())
+            .decode(w.bytes.trim_end_matches('=').as_bytes())
             .map(Self)
-            .map_err(|_| D::Error::custom("$bytes is not unpadded base64"))
+            .map_err(|_| D::Error::custom("$bytes is not valid base64 (padded or unpadded)"))
     }
 }
 
@@ -297,13 +304,54 @@ mod tests {
         }
     }
 
+    fn parse_bytes(s: &str) -> core::result::Result<Bytes, serde_json::Error> {
+        serde_json::from_str(&format!(r#"{{"$bytes":"{s}"}}"#))
+    }
+
+    #[test]
+    fn bytes_accepts_padded_base64() {
+        assert_eq!(parse_bytes("AAEC").unwrap().0, vec![0, 1, 2]);
+        assert_eq!(parse_bytes("AAE=").unwrap().0, vec![0, 1]);
+        assert_eq!(parse_bytes("AA==").unwrap().0, vec![0]);
+    }
+
+    #[test]
+    fn bytes_accepts_unpadded_base64() {
+        assert_eq!(parse_bytes("AAE").unwrap().0, vec![0, 1]);
+        assert_eq!(parse_bytes("AA").unwrap().0, vec![0]);
+    }
+
+    #[test]
+    fn bytes_rejects_invalid_base64() {
+        assert!(parse_bytes("AA?A").is_err());
+        assert!(parse_bytes("A").is_err());
+        assert!(parse_bytes("AA=A").is_err());
+    }
+
+    #[test]
+    fn bytes_is_lenient_about_padding_count() {
+        // All trailing '=' are stripped before decoding, so the padding
+        // count is not validated.
+        assert_eq!(parse_bytes("AAE==").unwrap().0, vec![0, 1]);
+    }
+
+    #[test]
+    fn bytes_serializes_unpadded() {
+        let j = serde_json::to_string(&Bytes(vec![0, 1])).unwrap();
+        assert_eq!(j, r#"{"$bytes":"AAE"}"#);
+        assert!(!j.contains('='));
+    }
+
     #[test]
     fn bytes_json_shape() {
         let b = Bytes(vec![1, 2, 3, 4]);
         let j = serde_json::to_string(&b).unwrap();
         assert_eq!(j, r#"{"$bytes":"AQIDBA"}"#);
         assert_eq!(serde_json::from_str::<Bytes>(&j).unwrap(), b);
-        assert!(serde_json::from_str::<Bytes>(r#"{"$bytes":"AQIDBA=="}"#).is_err());
+        assert_eq!(
+            serde_json::from_str::<Bytes>(r#"{"$bytes":"AQIDBA=="}"#).unwrap(),
+            b
+        );
         assert!(serde_json::from_str::<Bytes>(r#"{"$bytes":"AQ","x":1}"#).is_err());
         assert_eq!(b.array::<4>("x").unwrap(), [1, 2, 3, 4]);
         assert!(b.array::<3>("x").is_err());

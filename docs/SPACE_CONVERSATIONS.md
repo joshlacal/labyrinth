@@ -16,11 +16,17 @@ Writes go through the account's PDS OAuth session as `com.atproto.space.applyWri
 | Record | rkey |
 |---|---|
 | `blue.catbird.labyrinth.mek` | `hex(mekId)` ([CB-21]) |
-| `blue.catbird.labyrinth.batch` | `<16-hex first receipt seq>-<TID>` |
+| `blue.catbird.labyrinth.batch` | `<16-hex first receipt seq>-<8-hex device tag>-<TID>` |
 | `blue.catbird.labyrinth.redaction` | deterministic original-sender/message key |
 | `blue.catbird.labyrinth.attachmentManifest` | deterministic manifest key (SPEC §8) |
 
-Readers list the Space's repos (`listRepos`) and each repo's records. The production store attaches no server order, so the history merge sees batches in listing order: by writer DID, then by rkey.
+Readers list the Space's writers via paginated `com.atproto.space.listWriters` (`#repoWrite` active entries, `#repoRemoved` tombstones) and each active repo's records (`com.atproto.space.listRecords`, sorted ascending by `rkey` client-side). Each device also pins the highest observed `repoRev` per `(spaceUri, authorDid)` in `LBYS` v4 state and fails closed with `Error::WriterRollback` if a Space host ever serves an older writer revision on `listWriters`, `listSpaces`, or `getRepo`. The production store attaches no server order, so the history merge sees batches in listing order: by writer DID, then by rkey.
+
+### Personal mailbox Space state records
+
+In addition to `device`, `epoch`, `epochMember`, `virtualDevice`, `otcSession`, `ownerBatch`, and `attachmentManifest`, the personal mailbox Space (`at://<did>/space/blue.catbird.labyrinth.mailbox/self`) stores two encrypted multi-device state collections sealed with PADMÉ + `AES-256-DNDK-GCM` under domain-separated keys derived from the mailbox epoch root and AAD-bound to `(did, collection, rkey, epoch)`:
+- `blue.catbird.labyrinth.readState` (`rkey = <conversationId>`): `{ conversationId, readThroughSeq, updatedAt }`, synchronized monotonically across sibling devices via `MAX(readThroughSeq)` CRDT + optimistic CAS (`Labyrinth::advance_read_state`).
+- `blue.catbird.labyrinth.circleOwnerState` (`rkey = <circleId>`): `{ circleId, spaceUri, currentKeyVersion, joinedAtVersionByDid, pendingOps, updatedAt }`, updated via `#create` / CID-checked CAS (`Labyrinth::merge_circle_owner_state`), enforcing `joinedAtVersion = MAX` and `__acl__:<did>` removal-tombstone dominance until ACL removal completes (`Labyrinth::clear_circle_acl_tombstone`).
 
 ## Reading a conversation Space
 

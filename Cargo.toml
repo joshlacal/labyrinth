@@ -13,7 +13,7 @@ repository = "https://github.com/joshlacal/labyrinth"
 
 [dependencies]
 labyrinth-protocol = { path = "labyrinth-protocol" }
-atproto-spaces = { path = "../catbird-atproto/atproto-spaces", default-features = false }
+atproto-spaces = { path = "../../dec1-w0/wave1-catbird-atproto/atproto-spaces", default-features = false }
 async-trait = "0.1"
 web-time = "1.1"
 aes = "0.9"

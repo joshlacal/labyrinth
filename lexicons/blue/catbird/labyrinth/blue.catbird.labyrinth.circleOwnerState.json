@@ -1,0 +1,38 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.labyrinth.circleOwnerState",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Encrypted Circle owner membership, joinedAtVersion map, and pending ACL state in the personal mailbox Space for multi-device Circle owners. rkey = circleId. Ciphertext is DNDK-GCM sealed under the epoch root key and AAD-bound to account DID, collection, and rkey.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": [
+          "ciphertext",
+          "epoch",
+          "updatedAt"
+        ],
+        "properties": {
+          "ciphertext": {
+            "type": "bytes",
+            "description": "DNDK-GCM sealed Circle owner state payload under the personal mailbox epoch root key.",
+            "minLength": 1,
+            "maxLength": 262144
+          },
+          "epoch": {
+            "type": "integer",
+            "description": "Mailbox epoch sequence number whose root key derived the DNDK-GCM key.",
+            "minimum": 0,
+            "maximum": 1099511627776
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "Timestamp when this encrypted Circle owner state was written.",
+            "format": "datetime"
+          }
+        }
+      }
+    }
+  }
+}

@@ -12,8 +12,8 @@ use super::{
 use crate::attachment::{AttachmentCiphertextMeta, verify_attachment_ciphertext};
 use crate::epoch::space_epoch_id;
 use crate::records::{
-    AttachmentManifest, Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch,
-    VirtualDevice,
+    AttachmentManifest, CircleOwnerStateRecord, Device, Epoch, EpochMember, MailboxKeysRecord,
+    OtcSession, OwnerBatch, ReadStateRecord, VirtualDevice,
 };
 use crate::sign::XVerifyingKey;
 use crate::{Error, Result};
@@ -34,6 +34,8 @@ struct Mailbox {
     members: BTreeMap<String, EpochMember>,
     vdevices: BTreeMap<String, VirtualDevice>,
     otc_sessions: BTreeMap<String, OtcSession>,
+    read_states: BTreeMap<String, (ReadStateRecord, String)>,
+    circle_owner_states: BTreeMap<String, (CircleOwnerStateRecord, String)>,
     owner_batches: BTreeMap<String, (OwnerBatch, Option<ServerOrder>)>,
     attachments: BTreeMap<String, AttachmentManifest>,
     next_seq: u64,
@@ -830,10 +832,101 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
+    async fn get_read_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(ReadStateRecord, Option<String>)>> {
+        self.with(|m| {
+            Ok(m.read_states
+                .get(conversation_id)
+                .map(|(rec, cid)| (rec.clone(), Some(cid.clone()))))
+        })
+    }
+
+    async fn put_read_state(
+        &self,
+        conversation_id: &str,
+        record: &ReadStateRecord,
+        expected_cid: Option<&str>,
+    ) -> Result<String> {
+        record.check()?;
+        let cid = record_cid_json(record)?;
+        self.with(|m| {
+            match (m.read_states.get(conversation_id), expected_cid) {
+                (Some(_), None) => return Err(Error::Conflict),
+                (None, Some(_)) => return Err(Error::Conflict),
+                (Some((_, cur_cid)), Some(exp)) if cur_cid != exp => return Err(Error::Conflict),
+                _ => {}
+            }
+            m.read_states
+                .insert(conversation_id.to_owned(), (record.clone(), cid.clone()));
+            Ok(cid)
+        })
+    }
+
+    async fn list_read_states(&self) -> Result<Vec<(String, ReadStateRecord, Option<String>)>> {
+        self.with(|m| {
+            Ok(m.read_states
+                .iter()
+                .map(|(k, (rec, cid))| (k.clone(), rec.clone(), Some(cid.clone())))
+                .collect())
+        })
+    }
+
+    async fn get_circle_owner_state(
+        &self,
+        circle_id: &str,
+    ) -> Result<Option<(CircleOwnerStateRecord, Option<String>)>> {
+        self.with(|m| {
+            Ok(m.circle_owner_states
+                .get(circle_id)
+                .map(|(rec, cid)| (rec.clone(), Some(cid.clone()))))
+        })
+    }
+
+    async fn put_circle_owner_state(
+        &self,
+        circle_id: &str,
+        record: &CircleOwnerStateRecord,
+        expected_cid: Option<&str>,
+    ) -> Result<String> {
+        record.check()?;
+        let cid = record_cid_json(record)?;
+        self.with(|m| {
+            match (m.circle_owner_states.get(circle_id), expected_cid) {
+                (Some(_), None) => return Err(Error::Conflict),
+                (None, Some(_)) => return Err(Error::Conflict),
+                (Some((_, cur_cid)), Some(exp)) if cur_cid != exp => return Err(Error::Conflict),
+                _ => {}
+            }
+            m.circle_owner_states
+                .insert(circle_id.to_owned(), (record.clone(), cid.clone()));
+            Ok(cid)
+        })
+    }
+
+    async fn list_circle_owner_states(
+        &self,
+    ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>)>> {
+        self.with(|m| {
+            Ok(m.circle_owner_states
+                .iter()
+                .map(|(k, (rec, cid))| (k.clone(), rec.clone(), Some(cid.clone())))
+                .collect())
+        })
+    }
+
     async fn purge_mailbox(&self) -> Result<()> {
         self.backend.lock().purge(&self.did);
         Ok(())
     }
+}
+
+fn record_cid_json<T: serde::Serialize>(record: &T) -> Result<String> {
+    let json = serde_json::to_vec(record).map_err(|e| Error::Backend(e.to_string()))?;
+    let mut h = Sha256::new();
+    h.update(&json);
+    Ok(format!("bafyreimem{}", hex::encode(&h.finalize()[..16])))
 }
 
 #[cfg(test)]

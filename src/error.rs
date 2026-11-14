@@ -80,6 +80,17 @@ pub enum Error {
     /// receipt does not match `receipt.payload.archive_commitment`.
     #[error("archived item commitment does not match sequencer receipt")]
     ReceiptCommitmentMismatch,
+    /// Space host offered a writer commit revision older than the highest
+    /// revision this client already observed for `(space, author)`.
+    #[error(
+        "space writer revision rolled back for {author} in {space}: pinned {pinned_rev}, offered {offered_rev}"
+    )]
+    WriterRollback {
+        space: String,
+        author: String,
+        pinned_rev: String,
+        offered_rev: String,
+    },
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

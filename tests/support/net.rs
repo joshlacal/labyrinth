@@ -245,4 +245,53 @@ impl MailboxStore for Faulty {
     async fn delete_squatted_epoch(&self, seq: u64) -> labyrinth::Result<()> {
         self.inner.delete_squatted_epoch(seq).await
     }
+    async fn get_read_state(
+        &self,
+        conversation_id: &str,
+    ) -> labyrinth::Result<Option<(labyrinth::records::ReadStateRecord, Option<String>)>> {
+        self.inner.get_read_state(conversation_id).await
+    }
+    async fn put_read_state(
+        &self,
+        conversation_id: &str,
+        record: &labyrinth::records::ReadStateRecord,
+        expected_cid: Option<&str>,
+    ) -> labyrinth::Result<String> {
+        self.inner
+            .put_read_state(conversation_id, record, expected_cid)
+            .await
+    }
+    async fn list_read_states(
+        &self,
+    ) -> labyrinth::Result<Vec<(String, labyrinth::records::ReadStateRecord, Option<String>)>> {
+        self.inner.list_read_states().await
+    }
+    async fn get_circle_owner_state(
+        &self,
+        circle_id: &str,
+    ) -> labyrinth::Result<Option<(labyrinth::records::CircleOwnerStateRecord, Option<String>)>>
+    {
+        self.inner.get_circle_owner_state(circle_id).await
+    }
+    async fn put_circle_owner_state(
+        &self,
+        circle_id: &str,
+        record: &labyrinth::records::CircleOwnerStateRecord,
+        expected_cid: Option<&str>,
+    ) -> labyrinth::Result<String> {
+        self.inner
+            .put_circle_owner_state(circle_id, record, expected_cid)
+            .await
+    }
+    async fn list_circle_owner_states(
+        &self,
+    ) -> labyrinth::Result<
+        Vec<(
+            String,
+            labyrinth::records::CircleOwnerStateRecord,
+            Option<String>,
+        )>,
+    > {
+        self.inner.list_circle_owner_states().await
+    }
 }

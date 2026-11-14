@@ -2,23 +2,25 @@
 //!
 //! Each conversation maps to a single ATProto Space
 //! (`at://{authorityDid}/space/blue.catbird.labyrinth.conversation/{skey}`).
-//! Members write MEK distributions, sender batches (`<16-hex-first-seq>-<tid>`),
-//! and encrypted attachment manifests directly into their own Space repo.
-//! `mls-ds` holds zero long-term history or ciphertext index (`G6`, `I14`).
+//! Members write MEK distributions, sender batches
+//! (`<16-hex-first-seq>-<8-hex-device-tag>-<tid>`), and encrypted attachment
+//! manifests directly into their own Space repo. `mls-ds` holds zero long-term
+//! history or ciphertext index (`G6`, `I14`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    ApplyWritesIn, ApplyWritesOut, GetRecordOut, LIST_LIMIT, ListRecordsOut,
+    ApplyWritesIn, ApplyWritesOut, AuthorizeSpaceSyncOut, GetRecordOut, LIST_LIMIT, ListRecordsOut,
     MAX_SPACE_CURSOR_BYTES, MAX_SPACE_LIST_ITEMS, MAX_SPACE_LIST_RESPONSE_BYTES, MAX_SPACE_PAGES,
-    MAX_SPACE_RESPONSE_BYTES, MAX_WRITES, SpaceRef, SpaceRpc, WriteOp, decode, decode_body, encode,
-    endpoint, map_member_repo_space_error, map_space_error, uri_rkey,
+    MAX_SPACE_RESPONSE_BYTES, MAX_WRITES, MemberAccess, SpaceRef, SpaceRpc, WriteOp,
+    WriterRevFloors, WriterUpdate, decode, decode_body, encode, endpoint,
+    map_member_repo_space_error, map_space_error, uri_rkey,
 };
 use crate::attachment::{AttachmentCiphertextMeta, verify_attachment_ciphertext};
 use crate::deletion::Redaction;
@@ -103,15 +105,93 @@ fn system_now_ms() -> u64 {
 }
 
 #[derive(Deserialize)]
-struct ListReposOut {
+struct ListWritersOut {
     #[serde(default)]
-    repos: Vec<RepoView>,
+    repos: Vec<WriterUpdate>,
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct RepoView {
-    did: String,
+#[serde(rename_all = "camelCase")]
+struct SpaceView {
+    space: String,
+    #[serde(default)]
+    repo_rev: Option<String>,
 }
+
+#[derive(Deserialize)]
+struct ListSpacesOut {
+    #[serde(default)]
+    spaces: Vec<SpaceView>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorizeSpaceSyncIn<'a> {
+    space: String,
+    credential_key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delegation_token: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct PutMembersIn<'a> {
+    space: String,
+    members: &'a [MemberAccess],
+}
+
+#[derive(Serialize)]
+struct RemoveMembersIn<'a> {
+    space: String,
+    dids: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct ListMembersOut {
+    #[serde(default)]
+    members: Vec<MemberAccess>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+fn extract_single_header<'a>(
+    headers: &'a [(String, String)],
+    target_lower: &str,
+) -> Result<&'a str> {
+    let mut found: Option<&'a str> = None;
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case(target_lower) {
+            if found.is_some() {
+                return Err(Error::BadSignature);
+            }
+            found = Some(v.as_str());
+        }
+    }
+    found.ok_or(Error::BadSignature)
+}
+
+fn build_mac_headers(
+    profile: atproto_spaces::mac::MacProfile,
+    headers: &[(String, String)],
+) -> Result<atproto_spaces::mac::SpaceMacResponseHeaders> {
+    let covered_header = extract_single_header(headers, profile.response_header())?.to_owned();
+    let signature_input =
+        extract_single_header(headers, atproto_spaces::mac::SIGNATURE_INPUT_HEADER)?.to_owned();
+    let signature =
+        extract_single_header(headers, atproto_spaces::mac::SIGNATURE_HEADER)?.to_owned();
+    Ok(atproto_spaces::mac::SpaceMacResponseHeaders {
+        covered_header_name: profile.response_header(),
+        covered_header,
+        signature_input,
+        signature,
+    })
+}
+
+/// Alias retained for sequenced conversation Space thread store callers.
+pub type SequencedSpaceThreadStore = SpaceThreadStore;
 
 /// Spaces-only [`ThreadStore`] reading and writing directly against conversation Spaces.
 pub struct SpaceThreadStore {
@@ -122,18 +202,27 @@ pub struct SpaceThreadStore {
     tid_counter: AtomicU64,
     now_ms: crate::store::ClockFn,
     page: usize,
+    device_tag: [u8; 4],
+    floors: WriterRevFloors,
 }
 
 impl SpaceThreadStore {
     pub fn new(transport: impl Into<Arc<dyn SpaceRpc>>, did: impl Into<String>) -> Self {
+        let did_str = did.into();
+        let mut device_tag = [0u8; 4];
+        if crate::encoding::random(&mut device_tag).is_err() {
+            device_tag.copy_from_slice(&sha256(did_str.as_bytes())[..4]);
+        }
         Self {
-            did: did.into(),
+            did: did_str,
             t: transport.into(),
             spaces: Mutex::new(HashMap::new()),
             default_authority_did: None,
             tid_counter: AtomicU64::new(1),
             now_ms: Arc::new(system_now_ms),
             page: LIST_LIMIT,
+            device_tag,
+            floors: WriterRevFloors::new(),
         }
     }
 
@@ -143,13 +232,305 @@ impl SpaceThreadStore {
     }
 
     pub fn with_page_size(mut self, n: usize) -> Self {
-        self.page = n.clamp(1, 100);
+        self.page = n.clamp(1, 1_000);
         self
     }
 
     pub fn with_clock(mut self, now_ms: crate::store::ClockFn) -> Self {
         self.now_ms = now_ms;
         self
+    }
+
+    /// Sets an explicit 4-byte device tag (`<dev8>`) used in `<seq:016x>-<dev8>-<tid>` batch keys.
+    pub fn with_device_tag(mut self, tag: [u8; 4]) -> Self {
+        self.device_tag = tag;
+        self
+    }
+
+    /// Derives the 4-byte `<dev8>` tag deterministically from a device public key.
+    pub fn with_device_pubkey(mut self, pubkey: &[u8]) -> Self {
+        let digest = sha256(pubkey);
+        let mut tag = [0u8; 4];
+        tag.copy_from_slice(&digest[..4]);
+        self.device_tag = tag;
+        self
+    }
+
+    /// Attaches a shared [`WriterRevFloors`] tracker.
+    pub fn with_writer_rev_floors(mut self, floors: WriterRevFloors) -> Self {
+        self.floors = floors;
+        self
+    }
+
+    pub fn writer_rev_floors(&self) -> &WriterRevFloors {
+        &self.floors
+    }
+
+    /// Lists every conversation Space (`com.atproto.space.listSpaces`) the caller owns or wrote to.
+    pub async fn owned_spaces(transport: &dyn SpaceRpc) -> Result<Vec<String>> {
+        Self::owned_spaces_inner(transport, None).await
+    }
+
+    /// Lists every conversation Space via this store while enforcing `(space_uri, did)` `repoRev` floors.
+    pub async fn list_owned_spaces(&self) -> Result<Vec<String>> {
+        Self::owned_spaces_inner(self.t.as_ref(), Some((&self.did, &self.floors))).await
+    }
+
+    async fn owned_spaces_inner(
+        transport: &dyn SpaceRpc,
+        floor_ctx: Option<(&str, &WriterRevFloors)>,
+    ) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        for _ in 0..MAX_SPACE_PAGES {
+            let mut p = vec![
+                ("spaceType", super::CONVERSATION_SPACE_TYPE.to_owned()),
+                ("limit", "100".to_owned()),
+            ];
+            if let Some(c) = &cursor {
+                p.push(("cursor", c.clone()));
+            }
+            let body = transport
+                .query(endpoint::LIST_SPACES, &p)
+                .await
+                .map_err(map_space_error)?;
+            let page: ListSpacesOut = decode_body(&body)?;
+            for entry in page.spaces {
+                if let (Some((did, floors)), Some(rev)) = (floor_ctx, entry.repo_rev.as_deref()) {
+                    floors.observe(&entry.space, did, rev)?;
+                }
+                out.push(entry.space);
+            }
+            match page.cursor {
+                Some(c) if c.len() > MAX_SPACE_CURSOR_BYTES => {
+                    return Err(Error::Backend(format!(
+                        "space cursor exceeds {MAX_SPACE_CURSOR_BYTES} bytes"
+                    )));
+                }
+                Some(c) if seen_cursors.insert(c.clone()) => cursor = Some(c),
+                Some(_) => return Err(Error::Backend("space cursor cycle".into())),
+                None => return Ok(out),
+            }
+        }
+        Err(Error::Backend("space listing too long".into()))
+    }
+
+    /// Calls `com.atproto.space.authorizeSpaceSync` on the thread's Space host.
+    pub async fn authorize_space_sync(
+        &self,
+        thread_id: &str,
+        credential_key: &str,
+        delegation_token: Option<&str>,
+    ) -> Result<AuthorizeSpaceSyncOut> {
+        let space = self.space_for(thread_id)?;
+        let input = AuthorizeSpaceSyncIn {
+            space: space.to_string(),
+            credential_key,
+            delegation_token,
+        };
+        let payload =
+            serde_json::to_vec(&input).map_err(|e| Error::Backend(format!("encode: {e}")))?;
+        let body = self
+            .t
+            .procedure(endpoint::AUTHORIZE_SPACE_SYNC, &payload)
+            .await
+            .map_err(map_space_error)?;
+        decode_body(&body)
+    }
+
+    /// Batched `com.atproto.memberspace.putMembers` (`<= 100` members per commit).
+    pub async fn put_members(&self, thread_id: &str, members: &[MemberAccess]) -> Result<()> {
+        if members.is_empty() {
+            return Ok(());
+        }
+        let space = self.space_for(thread_id)?;
+        for chunk in members.chunks(100) {
+            let input = PutMembersIn {
+                space: space.to_string(),
+                members: chunk,
+            };
+            let payload =
+                serde_json::to_vec(&input).map_err(|e| Error::Backend(format!("encode: {e}")))?;
+            self.t
+                .procedure(endpoint::PUT_MEMBERS, &payload)
+                .await
+                .map_err(map_space_error)?;
+        }
+        Ok(())
+    }
+
+    /// Batched `com.atproto.memberspace.removeMembers` (`<= 100` DIDs per commit).
+    pub async fn remove_members(&self, thread_id: &str, dids: &[String]) -> Result<()> {
+        if dids.is_empty() {
+            return Ok(());
+        }
+        let space = self.space_for(thread_id)?;
+        for chunk in dids.chunks(100) {
+            let input = RemoveMembersIn {
+                space: space.to_string(),
+                dids: chunk,
+            };
+            let payload =
+                serde_json::to_vec(&input).map_err(|e| Error::Backend(format!("encode: {e}")))?;
+            self.t
+                .procedure(endpoint::REMOVE_MEMBERS, &payload)
+                .await
+                .map_err(map_space_error)?;
+        }
+        Ok(())
+    }
+
+    /// Paginated `com.atproto.memberspace.listMembers`.
+    pub async fn list_members(&self, thread_id: &str) -> Result<Vec<MemberAccess>> {
+        let space = self.space_for(thread_id)?;
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        for _ in 0..MAX_SPACE_PAGES {
+            let mut p = vec![("space", space.to_string()), ("limit", "100".to_owned())];
+            if let Some(c) = &cursor {
+                p.push(("cursor", c.clone()));
+            }
+            let body = self
+                .t
+                .query(endpoint::LIST_MEMBERS, &p)
+                .await
+                .map_err(map_space_error)?;
+            let page: ListMembersOut = decode_body(&body)?;
+            out.extend(page.members);
+            match page.cursor {
+                Some(c) if c.len() > MAX_SPACE_CURSOR_BYTES => {
+                    return Err(Error::Backend(format!(
+                        "space cursor exceeds {MAX_SPACE_CURSOR_BYTES} bytes"
+                    )));
+                }
+                Some(c) if seen_cursors.insert(c.clone()) => cursor = Some(c),
+                Some(_) => return Err(Error::Backend("space cursor cycle".into())),
+                None => return Ok(out),
+            }
+        }
+        Err(Error::Backend("space listing too long".into()))
+    }
+
+    /// Fetches a foreign Space record and authenticates `(uri, cid)` via Nov-12 RFC 9421 +
+    /// HPKE `0xFFFF` Export MAC (`Atproto-Space-Record`).
+    pub async fn get_record_authenticated<T: DeserializeOwned>(
+        &self,
+        thread_id: &str,
+        repo: &str,
+        collection: &str,
+        rkey: &str,
+        host_kem_did_key: &str,
+    ) -> Result<Option<(String, T)>> {
+        let space = self.space_for(thread_id)?;
+        let space_str = space.to_string();
+        let enc = atproto_spaces::kem::encapsulate_p256(host_kem_did_key)
+            .map_err(|_| Error::BadPublicKey)?;
+        let accept = atproto_spaces::mac::format_accept_signature(
+            atproto_spaces::mac::MacProfile::Record,
+            &enc.key_share_did_key,
+        )
+        .map_err(|_| Error::Malformed("accept-signature"))?;
+        let p = [
+            ("space", space_str.clone()),
+            ("repo", repo.to_owned()),
+            ("collection", collection.to_owned()),
+            ("rkey", rkey.to_owned()),
+        ];
+        let req_headers = [(
+            atproto_spaces::mac::ACCEPT_SIGNATURE_HEADER.to_owned(),
+            accept,
+        )];
+        match self
+            .t
+            .query_with_headers(endpoint::GET_RECORD, &p, &req_headers)
+            .await
+            .map_err(map_member_repo_space_error)
+        {
+            Ok((resp_headers, body)) => {
+                let out: GetRecordOut = decode_body(&body)?;
+                let expected_uri = format!("{space_str}/{repo}/{collection}/{rkey}");
+                if out.uri.as_deref() != Some(expected_uri.as_str()) {
+                    return Err(Error::BadSignature);
+                }
+                let cid = out.cid.ok_or(Error::BadSignature)?;
+                let header_map =
+                    build_mac_headers(atproto_spaces::mac::MacProfile::Record, &resp_headers)?
+                        .to_header_map()
+                        .map_err(|_| Error::BadSignature)?;
+                atproto_spaces::mac::verify_record_mac(
+                    &enc.shared_secret,
+                    &enc.key_share_did_key,
+                    &header_map,
+                    &expected_uri,
+                    &cid,
+                )
+                .map_err(|_| Error::BadSignature)?;
+                Ok(Some((cid, decode(out.value)?)))
+            }
+            Err(Error::NotFound("record" | "repo")) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Downloads a writer's repository as a Nov-12 `STAR` v0.2 archive (`com.atproto.space.getRepo`),
+    /// verifying the RFC 9421 + HPKE `0xFFFF` `Atproto-Space-Commit` MAC and `WriterRevFloors`
+    /// BEFORE parsing any record frames, then verifying canonical DAG-CBOR + `LtHash`.
+    pub async fn get_repo_star_authenticated(
+        &self,
+        thread_id: &str,
+        repo: &str,
+        host_kem_did_key: &str,
+    ) -> Result<atproto_spaces::star::ParsedStarRepo> {
+        let space = self.space_for(thread_id)?;
+        let space_str = space.to_string();
+        let enc = atproto_spaces::kem::encapsulate_p256(host_kem_did_key)
+            .map_err(|_| Error::BadPublicKey)?;
+        let accept = atproto_spaces::mac::format_accept_signature(
+            atproto_spaces::mac::MacProfile::Commit,
+            &enc.key_share_did_key,
+        )
+        .map_err(|_| Error::Malformed("accept-signature"))?;
+        let p = [("space", space_str.clone()), ("repo", repo.to_owned())];
+        let req_headers = [(
+            atproto_spaces::mac::ACCEPT_SIGNATURE_HEADER.to_owned(),
+            accept,
+        )];
+        let (resp_headers, body) = self
+            .t
+            .query_with_headers(endpoint::GET_REPO, &p, &req_headers)
+            .await
+            .map_err(map_member_repo_space_error)?;
+        let header_map = build_mac_headers(atproto_spaces::mac::MacProfile::Commit, &resp_headers)?
+            .to_header_map()
+            .map_err(|_| Error::BadSignature)?;
+        let mut rollback_err: Option<Error> = None;
+        let parsed =
+            atproto_spaces::star::read_star_repo_authenticated(&body, &space_str, repo, |meta| {
+                atproto_spaces::mac::verify_commit_mac(
+                    &enc.shared_secret,
+                    &enc.key_share_did_key,
+                    &header_map,
+                    &meta.space,
+                    &meta.repo,
+                    &meta.rev,
+                    &meta.data,
+                )?;
+                if let Err(e) = self.floors.observe(&meta.space, &meta.repo, &meta.rev) {
+                    rollback_err = Some(e);
+                    return Err(atproto_spaces::SpacesError::FutureRev(meta.rev.clone()));
+                }
+                Ok(())
+            });
+        if let Some(err) = rollback_err {
+            return Err(err);
+        }
+        parsed.map_err(|e| match e {
+            atproto_spaces::SpacesError::MacMismatch(_)
+            | atproto_spaces::SpacesError::BadSpaceSignature(_) => Error::BadSignature,
+            _ => Error::Malformed("STAR repository archive"),
+        })
     }
 
     pub fn register_thread_space(&mut self, thread_id: &str, space: SpaceRef) {
@@ -239,18 +620,85 @@ impl SpaceThreadStore {
         }
     }
 
+    /// Paginated `com.atproto.space.listWriters` (`#repoWrite` / `#repoRemoved`).
+    pub async fn list_writers(&self, space: &SpaceRef) -> Result<Vec<WriterUpdate>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::BTreeSet::new();
+        let mut response_bytes = 0usize;
+        for _ in 0..MAX_SPACE_PAGES {
+            let mut p = vec![
+                ("space", space.to_string()),
+                ("limit", self.page.to_string()),
+            ];
+            if let Some(c) = &cursor {
+                p.push(("cursor", c.clone()));
+            }
+            let body = self
+                .t
+                .query(endpoint::LIST_WRITERS, &p)
+                .await
+                .map_err(map_member_repo_space_error)?;
+            if body.len() > MAX_SPACE_RESPONSE_BYTES {
+                return Err(Error::Backend(format!(
+                    "space response exceeds {MAX_SPACE_RESPONSE_BYTES} bytes"
+                )));
+            }
+            response_bytes = response_bytes.checked_add(body.len()).ok_or_else(|| {
+                Error::Backend("space listing response byte count overflow".into())
+            })?;
+            if response_bytes > MAX_SPACE_LIST_RESPONSE_BYTES {
+                return Err(Error::Backend(format!(
+                    "space listing responses exceed {MAX_SPACE_LIST_RESPONSE_BYTES} bytes"
+                )));
+            }
+            let page: ListWritersOut = decode_body(&body)?;
+            if page.repos.len() > self.page {
+                return Err(Error::Backend(format!(
+                    "space page exceeds {} records",
+                    self.page
+                )));
+            }
+            let total = out
+                .len()
+                .checked_add(page.repos.len())
+                .ok_or_else(|| Error::Backend("space listing item count overflow".into()))?;
+            if total > MAX_SPACE_LIST_ITEMS {
+                return Err(Error::Backend(format!(
+                    "space listing exceeds {MAX_SPACE_LIST_ITEMS} records"
+                )));
+            }
+            out.extend(page.repos);
+            match page.cursor {
+                Some(c) if c.len() > MAX_SPACE_CURSOR_BYTES => {
+                    return Err(Error::Backend(format!(
+                        "space cursor exceeds {MAX_SPACE_CURSOR_BYTES} bytes"
+                    )));
+                }
+                Some(c) if seen_cursors.insert(c.clone()) => cursor = Some(c),
+                Some(_) => return Err(Error::Backend("space cursor cycle".into())),
+                None => return Ok(out),
+            }
+        }
+        Err(Error::Backend("space listing too long".into()))
+    }
+
     async fn list_repos(&self, space: &SpaceRef) -> Result<Vec<String>> {
-        let p = [("space", space.to_string())];
-        let body = self
-            .t
-            .query(endpoint::LIST_REPOS, &p)
-            .await
-            .map_err(map_member_repo_space_error)?;
-        let out: ListReposOut = decode_body(&body)?;
-        let mut dids: Vec<String> = out.repos.into_iter().map(|r| r.did).collect();
-        dids.sort();
-        dids.dedup();
-        Ok(dids)
+        let updates = self.list_writers(space).await?;
+        let space_str = space.to_string();
+        let mut active = std::collections::BTreeSet::new();
+        for update in updates {
+            match update {
+                WriterUpdate::RepoWrite { repo, repo_rev, .. } => {
+                    self.floors.observe(&space_str, &repo, &repo_rev)?;
+                    active.insert(repo);
+                }
+                WriterUpdate::RepoRemoved { repo, .. } => {
+                    active.remove(&repo);
+                }
+            }
+        }
+        Ok(active.into_iter().collect())
     }
 
     async fn list_repo_raw(
@@ -270,7 +718,6 @@ impl SpaceThreadStore {
                 ("repo", repo.to_owned()),
                 ("collection", collection.to_owned()),
                 ("limit", self.page.to_string()),
-                ("reverse", "true".to_owned()),
             ];
             if !values {
                 p.push(("excludeValues", "true".to_owned()));
@@ -403,11 +850,16 @@ impl ThreadStore for SpaceThreadStore {
 
     async fn append_batch(&self, batch: &Batch) -> Result<String> {
         let space = self.space_for(&batch.thread_id)?;
-        let explicit_rkey = batch
+        let dev8 = hex::encode(self.device_tag);
+        let first_seq = batch
             .items
             .first()
-            .and_then(|i| i.seq)
-            .map(|seq| format!("{seq:016x}-{}", self.next_tid()));
+            .and_then(|i| {
+                i.seq
+                    .or_else(|| i.sequencer_receipt.as_ref().map(|r| r.seq))
+            })
+            .unwrap_or(0);
+        let explicit_rkey = Some(format!("{first_seq:016x}-{dev8}-{}", self.next_tid()));
         let uris = self
             .apply(
                 &space,
@@ -763,6 +1215,18 @@ impl ThreadStore for SpaceThreadStore {
             }
         }
         Ok(())
+    }
+
+    fn seed_writer_rev_floors(&self, floors: &BTreeMap<(String, String), String>) {
+        self.floors.seed(floors);
+    }
+
+    fn replace_writer_rev_floors(&self, floors: &BTreeMap<(String, String), String>) {
+        self.floors.replace(floors);
+    }
+
+    fn export_writer_rev_floors(&self) -> BTreeMap<(String, String), String> {
+        self.floors.snapshot()
     }
 }
 

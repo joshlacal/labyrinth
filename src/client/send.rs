@@ -15,6 +15,10 @@ use crate::{Error, Result};
 /// session before requiring a fresh directory check.
 const FLUSH_DIRECTORY_CACHE_TTL_MS: u64 = 30_000;
 
+/// Maximum attempts for batch and MEK writes on transient multi-device Space
+/// repository write contention (`409 ConcurrentWrite` → [`Error::Conflict`]).
+const FLUSH_CONFLICT_MAX_ATTEMPTS: usize = 4;
+
 /// Bounded per-batch directory cache so queuing `M` messages for `N` peers
 /// performs `O(N)` directory checks rather than `O(M * N)`, while `flush`
 /// always re-validates once per peer against the live directory.
@@ -401,12 +405,25 @@ impl Labyrinth {
             Some(m) => m,
             None => {
                 let (_, keys) = self.my_keys(self.latest).await?;
-                let mut m = Mek::generate(&heads)?;
-                let rec = mek::distribute_labyrinth(
-                    thread_id, &mut m, &self.did, &me_public, &keys, &full,
-                )?;
-                let wire = MekDistribution::from_record(&rec, Some(&me_public), self.now())?;
-                self.b.threads.create_mek(&wire).await?;
+                let mut written = None;
+                for attempt in 0..FLUSH_CONFLICT_MAX_ATTEMPTS {
+                    let mut m = Mek::generate(&heads)?;
+                    let rec = mek::distribute_labyrinth(
+                        thread_id, &mut m, &self.did, &me_public, &keys, &full,
+                    )?;
+                    let wire = MekDistribution::from_record(&rec, Some(&me_public), self.now())?;
+                    match self.b.threads.create_mek(&wire).await {
+                        Ok(()) => {
+                            written = Some((m, rec));
+                            break;
+                        }
+                        Err(Error::Conflict) if attempt + 1 < FLUSH_CONFLICT_MAX_ATTEMPTS => {
+                            super::owner_state::conflict_backoff_jitter();
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                let (m, rec) = written.ok_or(Error::Conflict)?;
                 self.meks
                     .entry(thread_id.to_owned())
                     .or_default()
@@ -611,8 +628,26 @@ impl Labyrinth {
         if items.iter().any(|item| item.mek_id != mek_id) {
             return Err(Error::Malformed("pending sender batch mixes MEKs"));
         }
-        let batch = Batch::from_messages(thread_id, items, self.now())?;
-        let rkey = self.b.threads.append_batch(&batch).await?;
+        let mut flushed_rkey = None;
+        for attempt in 0..FLUSH_CONFLICT_MAX_ATTEMPTS {
+            let items = self
+                .outbox
+                .get(thread_id)
+                .filter(|items| !items.is_empty())
+                .expect("sender buffer checked above");
+            let batch = Batch::from_messages(thread_id, items, self.now())?;
+            match self.b.threads.append_batch(&batch).await {
+                Ok(rkey) => {
+                    flushed_rkey = Some(rkey);
+                    break;
+                }
+                Err(Error::Conflict) if attempt + 1 < FLUSH_CONFLICT_MAX_ATTEMPTS => {
+                    super::owner_state::conflict_backoff_jitter();
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let rkey = flushed_rkey.ok_or(Error::Conflict)?;
         let count = self.outbox.remove(thread_id).map_or(0, |v| v.len());
         self.outbox_rosters.remove(thread_id);
         Ok(Some(FlushedBatch {
@@ -637,8 +672,26 @@ impl Labyrinth {
         if items.iter().any(|item| item.epoch_seq != self.latest) {
             return Err(Error::WrongEpoch);
         }
-        let batch = OwnerBatch::from_messages(items, self.now())?;
-        let rkey = self.b.mailbox.append_owner_batch(&batch).await?;
+        let mut flushed_rkey = None;
+        for attempt in 0..FLUSH_CONFLICT_MAX_ATTEMPTS {
+            let items = self
+                .owner_outbox
+                .get(thread_id)
+                .filter(|items| !items.is_empty())
+                .expect("owner buffer checked above");
+            let batch = OwnerBatch::from_messages(items, self.now())?;
+            match self.b.mailbox.append_owner_batch(&batch).await {
+                Ok(rkey) => {
+                    flushed_rkey = Some(rkey);
+                    break;
+                }
+                Err(Error::Conflict) if attempt + 1 < FLUSH_CONFLICT_MAX_ATTEMPTS => {
+                    super::owner_state::conflict_backoff_jitter();
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let rkey = flushed_rkey.ok_or(Error::Conflict)?;
         let count = self.owner_outbox.remove(thread_id).map_or(0, |v| v.len());
         Ok(Some(FlushedBatch {
             thread_id: thread_id.to_owned(),

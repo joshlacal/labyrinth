@@ -1,20 +1,28 @@
-//! Memory-backed reference PDS / Space host for `com.atproto.space.*` and
-//! Space-scoped encrypted attachment blobs (`atproto#5187`, Gates 1, 3, and 5).
+//! Memory-backed reference PDS / Space host for `com.atproto.space.*`,
+//! `com.atproto.memberspace.*`, RFC 9421 + HPKE `0xFFFF` Export MACs, `STAR`
+//! v0.2 repository archives, and Space-scoped encrypted attachment blobs
+//! (`atproto#5187` November 12 alpha, Gates 1, 3, and 5).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{CONVERSATION_SPACE_TYPE, MAX_WRITES, SpaceError, SpaceRef, SpaceRpc, endpoint};
+use super::{
+    CONVERSATION_SPACE_TYPE, MAX_WRITES, MemberAccess, SpaceError, SpaceRef, SpaceRpc, endpoint,
+};
+use crate::records::Bytes;
 use crate::{Error, Result};
 
 /// Largest JSON request body (reference `jsonLimit`).
 pub const JSON_LIMIT: usize = 1_000_000;
 
 type Reply = core::result::Result<Vec<u8>, SpaceError>;
+type HeaderReply = core::result::Result<(Vec<(String, String)>, Vec<u8>), SpaceError>;
 
 /// Records of one repo in one Space, by record URI.
 type Repo = BTreeMap<String, (String, String, Value)>;
@@ -31,17 +39,60 @@ struct StoredBlob {
     visibility: BlobVisibility,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug)]
+struct WriterMeta {
+    repo_rev: String,
+    space_rev: String,
+}
+
+#[derive(Clone, Debug)]
+enum WriterSeqEntry {
+    Write {
+        repo: String,
+        repo_rev: String,
+        data: [u8; 32],
+    },
+    Removed {
+        repo: String,
+    },
+}
+
 struct State {
     /// `(space ref, author DID)` → records.
     repos: BTreeMap<(String, String), Repo>,
-    /// Explicit member allowlists configured via [`MemorySpaceHost::grant_space_member`].
-    members: HashMap<String, BTreeSet<String>>,
-    /// Explicit revocations configured via [`MemorySpaceHost::revoke_space_member`].
+    /// `(space ref, author DID)` → latest `(repo_rev, space_rev)`.
+    writer_meta: BTreeMap<(String, String), WriterMeta>,
+    /// `space ref` → latest per-writer sequenced state keyed by `space_rev`.
+    space_events: BTreeMap<String, BTreeMap<String, WriterSeqEntry>>,
+    /// Explicit member allowlists (`space ref` → `did` → `(read, write)`).
+    members: HashMap<String, BTreeMap<String, (bool, bool)>>,
+    /// Explicit revocations configured via [`MemorySpaceHost::revoke_space_member`] or `removeMembers`.
     revoked_members: BTreeSet<(String, String)>,
     /// `(author DID, cid)` → blob + visibility.
     blobs: HashMap<(String, String), StoredBlob>,
+    /// Injected `409 ConcurrentWrite` conflict count per `(space, did)`.
+    injected_conflicts: HashMap<(String, String), usize>,
+    /// Host P-256 KEM secret key for HPKE `0xFFFF` Export MAC negotiation.
+    kem_secret: atproto_spaces::kem::P256SecretKey,
     tid: u64,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        let kem_secret = atproto_spaces::kem::P256SecretKey::from_slice(&[0x42; 32])
+            .expect("valid fixed test P-256 scalar");
+        Self {
+            repos: BTreeMap::new(),
+            writer_meta: BTreeMap::new(),
+            space_events: BTreeMap::new(),
+            members: HashMap::new(),
+            revoked_members: BTreeSet::new(),
+            blobs: HashMap::new(),
+            injected_conflicts: HashMap::new(),
+            kem_secret,
+            tid: 0,
+        }
+    }
 }
 
 impl State {
@@ -54,6 +105,131 @@ impl State {
             .map(|i| S32[((v >> (5 * i)) & 31) as usize] as char)
             .collect()
     }
+
+    fn record_writer_commit(&mut self, space: &str, did: &str) {
+        let repo_rev = self.next_tid();
+        let space_rev = self.next_tid();
+        let data = self.repo_lthash_digest(space, did);
+        if let Some(prev) = self.writer_meta.insert(
+            (space.to_owned(), did.to_owned()),
+            WriterMeta {
+                repo_rev: repo_rev.clone(),
+                space_rev: space_rev.clone(),
+            },
+        ) && let Some(events) = self.space_events.get_mut(space)
+        {
+            events.remove(&prev.space_rev);
+        }
+        // Remove any prior `#repoRemoved` entry for this DID in `space`.
+        if let Some(events) = self.space_events.get_mut(space) {
+            events.retain(|_, ev| match ev {
+                WriterSeqEntry::Removed { repo } => repo != did,
+                WriterSeqEntry::Write { repo, .. } => repo != did,
+            });
+        }
+        self.space_events
+            .entry(space.to_owned())
+            .or_default()
+            .insert(
+                space_rev,
+                WriterSeqEntry::Write {
+                    repo: did.to_owned(),
+                    repo_rev,
+                    data,
+                },
+            );
+    }
+
+    fn record_writer_removed(&mut self, space: &str, did: &str) {
+        let space_rev = self.next_tid();
+        self.writer_meta.remove(&(space.to_owned(), did.to_owned()));
+        let events = self.space_events.entry(space.to_owned()).or_default();
+        events.retain(|_, ev| match ev {
+            WriterSeqEntry::Removed { repo } | WriterSeqEntry::Write { repo, .. } => repo != did,
+        });
+        events.insert(
+            space_rev,
+            WriterSeqEntry::Removed {
+                repo: did.to_owned(),
+            },
+        );
+    }
+
+    fn repo_lthash_digest(&self, space: &str, did: &str) -> [u8; 32] {
+        let mut lt = atproto_spaces::lthash::LtHash::empty();
+        if let Some(repo) = self.repos.get(&(space.to_owned(), did.to_owned())) {
+            for (collection, rkey, val) in repo.values() {
+                let dagcbor = json_to_canonical_dagcbor(val);
+                let rec_cid = atproto_spaces::lthash::compute_dagcbor_cid(&dagcbor);
+                lt.add(&atproto_spaces::lthash::compute_record_element_hash(
+                    collection, rkey, &rec_cid,
+                ));
+            }
+        }
+        lt.commitment()
+    }
+}
+
+/// Converts an ATProto JSON `Value` (`$bytes`, `$link`, maps, arrays, scalars)
+/// into canonical DAG-CBOR bytes matching `atproto_spaces::star` rules.
+fn json_to_canonical_dagcbor(v: &Value) -> Vec<u8> {
+    struct Canonical<'a>(&'a Value);
+
+    impl serde::Serialize for Canonical<'_> {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> core::result::Result<S::Ok, S::Error> {
+            use serde::ser::{SerializeMap, SerializeSeq};
+            match self.0 {
+                Value::Null => serializer.serialize_none(),
+                Value::Bool(b) => serializer.serialize_bool(*b),
+                Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        serializer.serialize_i64(i)
+                    } else if let Some(u) = n.as_u64() {
+                        serializer.serialize_u64(u)
+                    } else {
+                        Err(serde::ser::Error::custom("floats forbidden in DAG-CBOR"))
+                    }
+                }
+                Value::String(s) => serializer.serialize_str(s),
+                Value::Array(arr) => {
+                    let mut seq = serializer.serialize_seq(Some(arr.len()))?;
+                    for item in arr {
+                        seq.serialize_element(&Canonical(item))?;
+                    }
+                    seq.end()
+                }
+                Value::Object(map) => {
+                    if map.len() == 1 {
+                        if let Some(b64) = map.get("$bytes").and_then(Value::as_str) {
+                            let raw = STANDARD_NO_PAD
+                                .decode(b64.trim_end_matches('=').as_bytes())
+                                .map_err(serde::ser::Error::custom)?;
+                            return serializer.serialize_bytes(&raw);
+                        }
+                        if let Some(link) = map.get("$link").and_then(Value::as_str)
+                            && let Ok(parsed_cid) = link.parse::<cid::Cid>()
+                        {
+                            return parsed_cid.serialize(serializer);
+                        }
+                    }
+                    let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                    entries.sort_by(|(a, _), (b, _)| {
+                        (a.len(), a.as_bytes()).cmp(&(b.len(), b.as_bytes()))
+                    });
+                    let mut m = serializer.serialize_map(Some(entries.len()))?;
+                    for (k, val) in entries {
+                        m.serialize_entry(k, &Canonical(val))?;
+                    }
+                    m.end()
+                }
+            }
+        }
+    }
+
+    serde_ipld_dagcbor::to_vec(&Canonical(v)).expect("canonical ATProto DAG-CBOR")
 }
 
 /// Collects every `{"$type": "blob", "ref": {"$link": cid}}` CID referenced in `v`.
@@ -102,22 +278,70 @@ impl MemorySpaceHost {
         }
     }
 
-    /// Grants `did` membership read access on `space`.
+    /// Host P-256 `#atproto_kem` `did:key:zDn...` for HPKE `0xFFFF` Export MAC negotiation.
+    pub fn kem_did_key(&self) -> String {
+        let s = self.s.lock().unwrap();
+        atproto_spaces::kem::encode_p256_did_key(&s.kem_secret.public_key())
+    }
+
+    /// Grants `did` membership read/write access on `space`.
     pub fn grant_space_member(&self, space: &SpaceRef, did: &str) {
         let mut s = self.s.lock().unwrap();
         let key = space.to_string();
         s.revoked_members.remove(&(key.clone(), did.to_owned()));
-        s.members.entry(key).or_default().insert(did.to_owned());
+        s.members
+            .entry(key)
+            .or_default()
+            .insert(did.to_owned(), (true, true));
     }
 
-    /// Revokes `did`'s membership read/write access on `space`.
+    /// Revokes `did`'s membership read/write access on `space` and sequences `#repoRemoved`.
     pub fn revoke_space_member(&self, space: &SpaceRef, did: &str) {
         let mut s = self.s.lock().unwrap();
         let key = space.to_string();
         if let Some(m) = s.members.get_mut(&key) {
             m.remove(did);
         }
-        s.revoked_members.insert((key, did.to_owned()));
+        s.revoked_members.insert((key.clone(), did.to_owned()));
+        s.record_writer_removed(&key, did);
+    }
+
+    /// Fault-injection helper rolling back `(space, did)`'s advertised `repoRev` to `older_rev`.
+    pub fn rollback_writer_rev(&self, space: &SpaceRef, did: &str, older_rev: &str) {
+        let mut s = self.s.lock().unwrap();
+        let space_str = space.to_string();
+        let data = s.repo_lthash_digest(&space_str, did);
+        let space_rev =
+            if let Some(meta) = s.writer_meta.get_mut(&(space_str.clone(), did.to_owned())) {
+                meta.repo_rev = older_rev.to_owned();
+                meta.space_rev.clone()
+            } else {
+                let sr = s.next_tid();
+                s.writer_meta.insert(
+                    (space_str.clone(), did.to_owned()),
+                    WriterMeta {
+                        repo_rev: older_rev.to_owned(),
+                        space_rev: sr.clone(),
+                    },
+                );
+                sr
+            };
+        s.space_events.entry(space_str).or_default().insert(
+            space_rev,
+            WriterSeqEntry::Write {
+                repo: did.to_owned(),
+                repo_rev: older_rev.to_owned(),
+                data,
+            },
+        );
+    }
+
+    /// Fault-injection helper causing the next `count` `applyWrites` calls for `(space, did)`
+    /// to fail with HTTP `409 ConcurrentWrite`.
+    pub fn inject_concurrent_write_conflicts(&self, space: &SpaceRef, did: &str, count: usize) {
+        let mut s = self.s.lock().unwrap();
+        s.injected_conflicts
+            .insert((space.to_string(), did.to_owned()), count);
     }
 
     /// Public unauthenticated `com.atproto.sync.getBlob` probe (`Gate 5`).
@@ -172,21 +396,29 @@ impl MemorySpaceHost {
         rkey: &str,
     ) -> Option<Value> {
         let mut s = self.s.lock().unwrap();
-        let uri = record_uri(&space.to_string(), did, collection, rkey);
-        s.repos
-            .get_mut(&(space.to_string(), did.to_owned()))
+        let space_str = space.to_string();
+        let uri = record_uri(&space_str, did, collection, rkey);
+        let out = s
+            .repos
+            .get_mut(&(space_str.clone(), did.to_owned()))
             .and_then(|r| r.remove(&uri))
-            .map(|(.., v)| v)
+            .map(|(.., v)| v);
+        if out.is_some() {
+            s.record_writer_commit(&space_str, did);
+        }
+        out
     }
 
     /// Overwrites one record's value, bypassing every check.
     pub fn tamper(&self, space: &SpaceRef, did: &str, collection: &str, rkey: &str, value: Value) {
         let mut s = self.s.lock().unwrap();
-        let uri = record_uri(&space.to_string(), did, collection, rkey);
+        let space_str = space.to_string();
+        let uri = record_uri(&space_str, did, collection, rkey);
         s.repos
-            .entry((space.to_string(), did.to_owned()))
+            .entry((space_str.clone(), did.to_owned()))
             .or_default()
             .insert(uri, (collection.to_owned(), rkey.to_owned(), value));
+        s.record_writer_commit(&space_str, did);
     }
 }
 
@@ -201,10 +433,8 @@ fn cid(v: &Value) -> String {
     {
         return cid;
     }
-    format!(
-        "bafyrei{}",
-        &hex::encode(Sha256::digest(v.to_string().as_bytes()))[..40]
-    )
+    let dagcbor = json_to_canonical_dagcbor(v);
+    atproto_spaces::lthash::compute_dagcbor_cid(&dagcbor).to_string()
 }
 
 fn err(status: u16, name: &str, msg: impl Into<String>) -> SpaceError {
@@ -239,6 +469,25 @@ struct DeleteRecordIn {
     rkey: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorizeSpaceSyncIn {
+    space: String,
+    credential_key: String,
+}
+
+#[derive(Deserialize)]
+struct PutMembersIn {
+    space: String,
+    members: Vec<MemberAccess>,
+}
+
+#[derive(Deserialize)]
+struct RemoveMembersIn {
+    space: String,
+    dids: Vec<String>,
+}
+
 /// One account's authenticated view of a [`MemorySpaceHost`].
 #[derive(Clone)]
 pub struct SpaceClient {
@@ -258,6 +507,7 @@ impl SpaceClient {
         s: &State,
         space: &str,
         repo: Option<&str>,
+        write: bool,
     ) -> core::result::Result<(), SpaceError> {
         if s.revoked_members
             .contains(&(space.to_owned(), self.did.clone()))
@@ -269,14 +519,16 @@ impl SpaceClient {
             .as_ref()
             .is_some_and(|sr| sr.space_type == CONVERSATION_SPACE_TYPE);
         if is_convo {
-            if let Some(allowed) = s.members.get(space)
-                && !allowed.contains(&self.did)
-            {
-                return Err(err(403, "Forbidden", "caller is not a Space member"));
+            let is_authority = parsed.as_ref().is_some_and(|sr| sr.space_did == self.did);
+            if !is_authority && let Some(allowed) = s.members.get(space) {
+                match allowed.get(&self.did) {
+                    Some(&(can_read, can_write))
+                        if (write && can_write) || (!write && can_read) => {}
+                    _ => return Err(err(403, "Forbidden", "caller is not a Space member")),
+                }
             }
             Ok(())
         } else {
-            // Personal mailbox Space (`read_self` only).
             if let Some(r) = repo
                 && r != self.did
             {
@@ -286,46 +538,225 @@ impl SpaceClient {
         }
     }
 
+    fn check_space_authority(&self, space: &str) -> core::result::Result<SpaceRef, SpaceError> {
+        let parsed =
+            SpaceRef::parse(space).map_err(|_| err(400, "InvalidRequest", "invalid space ref"))?;
+        if parsed.space_did != self.did {
+            return Err(err(403, "NotAuthorized", "caller is not space authority"));
+        }
+        Ok(parsed)
+    }
+
     fn list_spaces(&self, p: &[(&str, String)]) -> Reply {
         let state = self.host.s.lock().unwrap();
         let cursor = param(p, "cursor");
+        if let Some(c) = cursor
+            && SpaceRef::parse(c).is_err()
+        {
+            return Err(err(400, "InvalidCursor", "cursor must be a space ref"));
+        }
         let limit: usize = param(p, "limit")
             .unwrap_or("50")
             .parse()
             .ok()
             .filter(|n| (1..=100).contains(n))
             .ok_or_else(|| err(400, "InvalidRequest", "limit"))?;
-        let matching: Vec<_> = state
+        let matching: Vec<String> = state
             .repos
             .keys()
             .filter(|(uri, did)| {
                 did == &self.did
                     && cursor.is_none_or(|c| uri.as_str() > c)
-                    && SpaceRef::parse(uri)
-                        .is_ok_and(|s| param(p, "spaceType").is_none_or(|t| s.space_type == t))
+                    && SpaceRef::parse(uri).is_ok_and(|s| {
+                        param(p, "spaceDid").is_none_or(|d| s.space_did == d)
+                            && param(p, "spaceType").is_none_or(|t| s.space_type == t)
+                    })
             })
             .map(|(uri, _)| uri.clone())
             .take(limit)
             .collect();
-        let cursor = (matching.len() == limit)
+        let next_cursor = (matching.len() == limit)
             .then(|| matching.last().cloned())
             .flatten();
-        ok(
-            json!({"spaces": matching.iter().map(|uri| json!({"uri": uri})).collect::<Vec<_>>(), "cursor": cursor}),
-        )
+        let spaces: Vec<Value> = matching
+            .iter()
+            .map(|space_uri| {
+                let mut view = json!({ "space": space_uri });
+                if let Some(meta) = state
+                    .writer_meta
+                    .get(&(space_uri.clone(), self.did.clone()))
+                {
+                    let digest = state.repo_lthash_digest(space_uri, &self.did);
+                    view["repoRev"] = Value::from(meta.repo_rev.clone());
+                    view["data"] = serde_json::to_value(Bytes(digest.to_vec())).expect("bytes");
+                }
+                if SpaceRef::parse(space_uri).is_ok_and(|sr| sr.space_did == self.did)
+                    && let Some(events) = state.space_events.get(space_uri)
+                    && let Some((last_rev, _)) = events.iter().next_back()
+                {
+                    view["spaceRev"] = Value::from(last_rev.clone());
+                }
+                view
+            })
+            .collect();
+        let mut out = json!({ "spaces": spaces });
+        if let Some(c) = next_cursor {
+            out["cursor"] = Value::from(c);
+        }
+        ok(out)
     }
 
-    fn list_repos(&self, p: &[(&str, String)]) -> Reply {
+    fn list_writers(&self, p: &[(&str, String)]) -> Reply {
         let space = required(p, "space")?;
+        let cursor = param(p, "cursor");
+        let limit: usize = param(p, "limit")
+            .unwrap_or("100")
+            .parse()
+            .ok()
+            .filter(|n| (1..=1_000).contains(n))
+            .ok_or_else(|| err(400, "InvalidRequest", "limit"))?;
         let s = self.host.s.lock().unwrap();
-        self.check_space_access(&s, space, None)?;
-        let repos: Vec<Value> = s
-            .repos
-            .iter()
-            .filter(|((sp, _), r)| sp == space && !r.is_empty())
-            .map(|((_, did), _)| json!({ "did": did }))
-            .collect();
-        ok(json!({ "repos": repos }))
+        self.check_space_access(&s, space, None, false)?;
+
+        let mut items: Vec<(String, Value)> = Vec::new();
+        if let Some(events) = s.space_events.get(space) {
+            for (space_rev, ev) in events {
+                if cursor.is_some_and(|c| space_rev.as_str() <= c) {
+                    continue;
+                }
+                let val = match ev {
+                    WriterSeqEntry::Write {
+                        repo,
+                        repo_rev,
+                        data,
+                    } => json!({
+                        "$type": "com.atproto.space.defs#repoWrite",
+                        "repo": repo,
+                        "repoRev": repo_rev,
+                        "data": Bytes(data.to_vec()),
+                        "spaceRev": space_rev,
+                    }),
+                    WriterSeqEntry::Removed { repo } => json!({
+                        "$type": "com.atproto.space.defs#repoRemoved",
+                        "repo": repo,
+                        "spaceRev": space_rev,
+                    }),
+                };
+                items.push((space_rev.clone(), val));
+                if items.len() == limit {
+                    break;
+                }
+            }
+        }
+        let next_cursor = (items.len() == limit).then(|| items.last().map(|(sr, _)| sr.clone()));
+        let repos: Vec<Value> = items.into_iter().map(|(_, v)| v).collect();
+        let mut out = json!({ "repos": repos });
+        if let Some(Some(c)) = next_cursor {
+            out["cursor"] = Value::from(c);
+        }
+        ok(out)
+    }
+
+    fn authorize_space_sync(&self, payload: &[u8]) -> Reply {
+        let input: AuthorizeSpaceSyncIn = serde_json::from_slice(payload)
+            .map_err(|e| err(400, "InvalidRequest", e.to_string()))?;
+        atproto_spaces::kem::decode_p256_did_key(&input.credential_key)
+            .map_err(|e| err(400, "InvalidRequest", e.to_string()))?;
+        let mut s = self.host.s.lock().unwrap();
+        if s.revoked_members
+            .contains(&(input.space.clone(), self.did.clone()))
+        {
+            return Err(err(
+                403,
+                "AccountNotAuthorized",
+                "member revoked from Space",
+            ));
+        }
+        self.check_space_access(&s, &input.space, None, false)?;
+        let token_id = s.next_tid();
+        let space_rev = s
+            .space_events
+            .get(&input.space)
+            .and_then(|ev| ev.keys().next_back().cloned());
+        let mut out = json!({
+            "credential": format!("space-cred-{token_id}"),
+        });
+        if let Some(sr) = space_rev {
+            out["spaceRev"] = Value::from(sr);
+        }
+        ok(out)
+    }
+
+    fn put_members(&self, payload: &[u8]) -> Reply {
+        let input: PutMembersIn = serde_json::from_slice(payload)
+            .map_err(|e| err(400, "InvalidRequest", e.to_string()))?;
+        if input.members.len() > 100 {
+            return Err(err(400, "InvalidRequest", "members exceeds 100"));
+        }
+        self.check_space_authority(&input.space)?;
+        let mut s = self.host.s.lock().unwrap();
+        for m in input.members {
+            s.revoked_members
+                .remove(&(input.space.clone(), m.did.clone()));
+            s.members
+                .entry(input.space.clone())
+                .or_default()
+                .insert(m.did, (m.read, m.write));
+        }
+        Ok(Vec::new())
+    }
+
+    fn remove_members(&self, payload: &[u8]) -> Reply {
+        let input: RemoveMembersIn = serde_json::from_slice(payload)
+            .map_err(|e| err(400, "InvalidRequest", e.to_string()))?;
+        if input.dids.len() > 100 {
+            return Err(err(400, "InvalidRequest", "dids exceeds 100"));
+        }
+        self.check_space_authority(&input.space)?;
+        let mut s = self.host.s.lock().unwrap();
+        for did in input.dids {
+            if let Some(map) = s.members.get_mut(&input.space) {
+                map.remove(&did);
+            }
+            s.revoked_members.insert((input.space.clone(), did.clone()));
+            s.record_writer_removed(&input.space, &did);
+        }
+        Ok(Vec::new())
+    }
+
+    fn list_members(&self, p: &[(&str, String)]) -> Reply {
+        let space = required(p, "space")?;
+        self.check_space_authority(space)?;
+        let cursor = param(p, "cursor");
+        let limit: usize = param(p, "limit")
+            .unwrap_or("100")
+            .parse()
+            .ok()
+            .filter(|n| (1..=1_000).contains(n))
+            .ok_or_else(|| err(400, "InvalidRequest", "limit"))?;
+        let s = self.host.s.lock().unwrap();
+        let mut members = Vec::new();
+        if let Some(map) = s.members.get(space) {
+            for (did, &(read, write)) in map {
+                if cursor.is_some_and(|c| did.as_str() <= c) {
+                    continue;
+                }
+                members.push(MemberAccess {
+                    did: did.clone(),
+                    read,
+                    write,
+                });
+                if members.len() == limit {
+                    break;
+                }
+            }
+        }
+        let next_cursor = (members.len() == limit).then(|| members.last().map(|m| m.did.clone()));
+        let mut out = json!({ "members": members });
+        if let Some(Some(c)) = next_cursor {
+            out["cursor"] = Value::from(c);
+        }
+        ok(out)
     }
 
     fn read_repo(
@@ -334,14 +765,18 @@ impl SpaceClient {
         space: &str,
         repo: &str,
     ) -> core::result::Result<Repo, SpaceError> {
-        self.check_space_access(s, space, Some(repo))?;
+        self.check_space_access(s, space, Some(repo), false)?;
         Ok(s.repos
             .get(&(space.to_owned(), repo.to_owned()))
             .cloned()
             .unwrap_or_default())
     }
 
-    fn get_record(&self, p: &[(&str, String)]) -> Reply {
+    fn get_record_with_headers(
+        &self,
+        p: &[(&str, String)],
+        req_headers: &[(String, String)],
+    ) -> HeaderReply {
         let (space, repo) = (required(p, "space")?, required(p, "repo")?);
         let (collection, rkey) = (required(p, "collection")?, required(p, "rkey")?);
         let s = self.host.s.lock().unwrap();
@@ -350,40 +785,126 @@ impl SpaceClient {
         let (.., v) = r
             .get(&uri)
             .ok_or_else(|| err(400, "RecordNotFound", &uri))?;
-        ok(json!({ "uri": uri, "cid": cid(v), "value": v }))
+        let cid_str = cid(v);
+        let mut resp_headers = Vec::new();
+        if let Some(accept) = req_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(atproto_spaces::mac::ACCEPT_SIGNATURE_HEADER))
+            .map(|(_, val)| val.as_str())
+        {
+            let (label, key_share) = atproto_spaces::mac::parse_accept_signature(
+                accept,
+                atproto_spaces::mac::MacProfile::Record,
+            )
+            .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
+            let shared = atproto_spaces::kem::decapsulate_p256(&s.kem_secret, &key_share)
+                .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
+            let (mac_headers, _) =
+                atproto_spaces::mac::sign_record_mac(&shared, &key_share, &label, &uri, &cid_str)
+                    .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
+            resp_headers.push((
+                mac_headers.covered_header_name.to_owned(),
+                mac_headers.covered_header,
+            ));
+            resp_headers.push((
+                atproto_spaces::mac::SIGNATURE_INPUT_HEADER.to_owned(),
+                mac_headers.signature_input,
+            ));
+            resp_headers.push((
+                atproto_spaces::mac::SIGNATURE_HEADER.to_owned(),
+                mac_headers.signature,
+            ));
+        }
+        let body =
+            serde_json::to_vec(&json!({ "uri": uri, "cid": cid_str, "value": v })).expect("json");
+        Ok((resp_headers, body))
+    }
+
+    fn get_repo_with_headers(
+        &self,
+        p: &[(&str, String)],
+        req_headers: &[(String, String)],
+    ) -> HeaderReply {
+        let (space, repo) = (required(p, "space")?, required(p, "repo")?);
+        let mut s = self.host.s.lock().unwrap();
+        let r = self.read_repo(&s, space, repo)?;
+        let rev = match s.writer_meta.get(&(space.to_owned(), repo.to_owned())) {
+            Some(meta) => meta.repo_rev.clone(),
+            None if r.is_empty() => return Err(err(404, "RepoNotFound", repo)),
+            None => s.next_tid(),
+        };
+        let data = s.repo_lthash_digest(space, repo);
+        let mut entries: Vec<atproto_spaces::star::StarRecordEntry> = r
+            .values()
+            .map(
+                |(collection, rkey, val)| atproto_spaces::star::StarRecordEntry {
+                    path: format!("{collection}/{rkey}"),
+                    record_dagcbor: json_to_canonical_dagcbor(val),
+                },
+            )
+            .collect();
+        entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let star_bytes = atproto_spaces::star::write_star_repo(space, repo, &rev, &data, &entries)
+            .map_err(|e| err(500, "InternalServerError", e.to_string()))?;
+
+        let mut resp_headers = Vec::new();
+        if let Some(accept) = req_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(atproto_spaces::mac::ACCEPT_SIGNATURE_HEADER))
+            .map(|(_, val)| val.as_str())
+        {
+            let (label, key_share) = atproto_spaces::mac::parse_accept_signature(
+                accept,
+                atproto_spaces::mac::MacProfile::Commit,
+            )
+            .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
+            let shared = atproto_spaces::kem::decapsulate_p256(&s.kem_secret, &key_share)
+                .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
+            let (mac_headers, _) = atproto_spaces::mac::sign_commit_mac(
+                &shared, &key_share, &label, space, repo, &rev, &data,
+            )
+            .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
+            resp_headers.push((
+                mac_headers.covered_header_name.to_owned(),
+                mac_headers.covered_header,
+            ));
+            resp_headers.push((
+                atproto_spaces::mac::SIGNATURE_INPUT_HEADER.to_owned(),
+                mac_headers.signature_input,
+            ));
+            resp_headers.push((
+                atproto_spaces::mac::SIGNATURE_HEADER.to_owned(),
+                mac_headers.signature,
+            ));
+        }
+        Ok((resp_headers, star_bytes))
     }
 
     fn list_records(&self, p: &[(&str, String)]) -> Reply {
         let (space, repo) = (required(p, "space")?, required(p, "repo")?);
+        if param(p, "reverse").is_some() {
+            return Err(err(400, "InvalidRequest", "reverse parameter is retired"));
+        }
         let limit: usize = match param(p, "limit") {
             None => 50,
             Some(l) => l
                 .parse()
                 .ok()
-                .filter(|l| (1..=100).contains(l))
+                .filter(|l| (1..=1_000).contains(l))
                 .ok_or_else(|| err(400, "InvalidRequest", "limit"))?,
         };
-        let reverse = param(p, "reverse") == Some("true");
         let exclude = param(p, "excludeValues") == Some("true");
         let collection = param(p, "collection");
         let cursor = param(p, "cursor");
         let s = self.host.s.lock().unwrap();
         let r = self.read_repo(&s, space, repo)?;
-        let matching = r
+        let page: Vec<(&String, &(String, String, Value))> = r
             .iter()
-            .filter(|(_, (c, ..))| collection.is_none_or(|x| x == c));
-        let page: Vec<(&String, &(String, String, Value))> = if reverse {
-            matching
-                .filter(|(u, _)| cursor.is_none_or(|c| u.as_str() > c))
-                .take(limit)
-                .collect()
-        } else {
-            matching
-                .rev()
-                .filter(|(u, _)| cursor.is_none_or(|c| u.as_str() < c))
-                .take(limit)
-                .collect()
-        };
+            .filter(|(_, (c, ..))| collection.is_none_or(|x| x == c))
+            .rev()
+            .filter(|(u, _)| cursor.is_none_or(|c| u.as_str() < c))
+            .take(limit)
+            .collect();
         let next = (page.len() == limit).then(|| page.last().map(|(u, _)| (*u).clone()));
         let records: Vec<Value> = page
             .iter()
@@ -416,8 +937,14 @@ impl SpaceClient {
             ));
         }
         let mut s = self.host.s.lock().unwrap();
-        self.check_space_access(&s, &input.space, Some(&self.did))?;
+        self.check_space_access(&s, &input.space, Some(&self.did), true)?;
         let key = (input.space.clone(), self.did.clone());
+        if let Some(rem) = s.injected_conflicts.get_mut(&key)
+            && *rem > 0
+        {
+            *rem -= 1;
+            return Err(err(409, "ConcurrentWrite", "concurrent repository write"));
+        }
         let mut repo = s.repos.get(&key).cloned().unwrap_or_default();
         let mut results = Vec::new();
         let mut promoted_cids = Vec::new();
@@ -486,7 +1013,6 @@ impl SpaceClient {
                 }
             }
         }
-        // Promote any staged blobs referenced in the committed batch to `.space`!
         for blob_cid in promoted_cids {
             if let Some(blob) = s.blobs.get_mut(&(self.did.clone(), blob_cid)) {
                 match &mut blob.visibility {
@@ -502,7 +1028,9 @@ impl SpaceClient {
             }
         }
         if !input.writes.is_empty() {
+            let space_str = input.space.clone();
             s.repos.insert(key, repo);
+            s.record_writer_commit(&space_str, &self.did);
         }
         ok(json!({ "results": results }))
     }
@@ -514,9 +1042,15 @@ impl SpaceClient {
             return Err(err(403, "Forbidden", "repo must match authenticated user"));
         }
         let mut s = self.host.s.lock().unwrap();
+        self.check_space_access(&s, &input.space, Some(&self.did), true)?;
         let uri = record_uri(&input.space, &self.did, &input.collection, &input.rkey);
-        if let Some(r) = s.repos.get_mut(&(input.space.clone(), self.did.clone())) {
-            r.remove(&uri);
+        let removed = s
+            .repos
+            .get_mut(&(input.space.clone(), self.did.clone()))
+            .and_then(|r| r.remove(&uri))
+            .is_some();
+        if removed {
+            s.record_writer_commit(&input.space, &self.did);
         }
         ok(json!({}))
     }
@@ -526,11 +1060,23 @@ impl SpaceClient {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl SpaceRpc for SpaceClient {
     async fn query(&self, nsid: &str, params: &[(&str, String)]) -> Reply {
+        let (_, body) = self.query_with_headers(nsid, params, &[]).await?;
+        Ok(body)
+    }
+
+    async fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> HeaderReply {
         match nsid {
-            endpoint::GET_RECORD => self.get_record(params),
-            endpoint::LIST_RECORDS => self.list_records(params),
-            endpoint::LIST_REPOS => self.list_repos(params),
-            endpoint::LIST_SPACES => self.list_spaces(params),
+            endpoint::GET_RECORD => self.get_record_with_headers(params, headers),
+            endpoint::GET_REPO => self.get_repo_with_headers(params, headers),
+            endpoint::LIST_RECORDS => Ok((Vec::new(), self.list_records(params)?)),
+            endpoint::LIST_WRITERS => Ok((Vec::new(), self.list_writers(params)?)),
+            endpoint::LIST_SPACES => Ok((Vec::new(), self.list_spaces(params)?)),
+            endpoint::LIST_MEMBERS => Ok((Vec::new(), self.list_members(params)?)),
             _ => Err(err(404, "MethodNotImplemented", nsid)),
         }
     }
@@ -542,6 +1088,9 @@ impl SpaceRpc for SpaceClient {
         match nsid {
             endpoint::APPLY_WRITES => self.apply_writes(payload),
             endpoint::DELETE_RECORD => self.delete_record(payload),
+            endpoint::AUTHORIZE_SPACE_SYNC => self.authorize_space_sync(payload),
+            endpoint::PUT_MEMBERS => self.put_members(payload),
+            endpoint::REMOVE_MEMBERS => self.remove_members(payload),
             _ => Err(err(404, "MethodNotImplemented", nsid)),
         }
     }
@@ -574,7 +1123,7 @@ impl SpaceRpc for SpaceClient {
         cid: &str,
     ) -> core::result::Result<Vec<u8>, SpaceError> {
         let s = self.host.s.lock().unwrap();
-        self.check_space_access(&s, space, Some(did))?;
+        self.check_space_access(&s, space, Some(did), false)?;
         let blob = s
             .blobs
             .get(&(did.to_owned(), cid.to_owned()))

@@ -548,3 +548,79 @@ impl MailboxKeysRecord {
         self.current.to_public()
     }
 }
+
+/// Maximum ciphertext byte length in `blue.catbird.labyrinth.readState` (`maxLength: 16384`).
+pub const MAX_READ_STATE_CIPHERTEXT: usize = 16_384;
+
+/// Maximum ciphertext byte length in `blue.catbird.labyrinth.circleOwnerState` (`maxLength: 262144`).
+pub const MAX_CIRCLE_OWNER_STATE_CIPHERTEXT: usize = 262_144;
+
+/// `blue.catbird.labyrinth.readState` in the personal OwnerMailbox Space (`rkey = <conversationId>`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadStateRecord {
+    #[serde(rename = "$type")]
+    pub type_: String,
+    pub ciphertext: Bytes,
+    pub epoch: u64,
+    pub updated_at: String,
+}
+
+impl ReadStateRecord {
+    pub fn new(ciphertext: Vec<u8>, epoch: u64, updated_at: String) -> Result<Self> {
+        let r = Self {
+            type_: nsid::READ_STATE.into(),
+            ciphertext: Bytes(ciphertext),
+            epoch,
+            updated_at,
+        };
+        r.check()?;
+        Ok(r)
+    }
+
+    pub fn check(&self) -> Result<()> {
+        check_type(&self.type_, nsid::READ_STATE)?;
+        if self.ciphertext.0.is_empty() || self.ciphertext.0.len() > MAX_READ_STATE_CIPHERTEXT {
+            return Err(Error::Malformed("readState ciphertext length"));
+        }
+        let _ = super::check_epoch_number(self.epoch)?;
+        let _ = super::ms_from_datetime(&self.updated_at)?;
+        Ok(())
+    }
+}
+
+/// `blue.catbird.labyrinth.circleOwnerState` in the personal OwnerMailbox Space (`rkey = <circleId>`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CircleOwnerStateRecord {
+    #[serde(rename = "$type")]
+    pub type_: String,
+    pub ciphertext: Bytes,
+    pub epoch: u64,
+    pub updated_at: String,
+}
+
+impl CircleOwnerStateRecord {
+    pub fn new(ciphertext: Vec<u8>, epoch: u64, updated_at: String) -> Result<Self> {
+        let r = Self {
+            type_: nsid::CIRCLE_OWNER_STATE.into(),
+            ciphertext: Bytes(ciphertext),
+            epoch,
+            updated_at,
+        };
+        r.check()?;
+        Ok(r)
+    }
+
+    pub fn check(&self) -> Result<()> {
+        check_type(&self.type_, nsid::CIRCLE_OWNER_STATE)?;
+        if self.ciphertext.0.is_empty()
+            || self.ciphertext.0.len() > MAX_CIRCLE_OWNER_STATE_CIPHERTEXT
+        {
+            return Err(Error::Malformed("circleOwnerState ciphertext length"));
+        }
+        let _ = super::check_epoch_number(self.epoch)?;
+        let _ = super::ms_from_datetime(&self.updated_at)?;
+        Ok(())
+    }
+}

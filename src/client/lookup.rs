@@ -118,6 +118,7 @@ impl Labyrinth {
             space_readable: true,
             ..ThreadHistory::default()
         };
+        self.seed_store_writer_floors();
         let window = self.readable_quarantined(
             &mut h,
             self.b
@@ -130,6 +131,7 @@ impl Labyrinth {
             .mailbox
             .list_owner_batches_before(thread_id, before_ms, limit)
             .await?;
+        self.sync_store_writer_floors()?;
         let mut raw: BTreeSet<(u64, &str)> = BTreeSet::new();
         let sender_items = window
             .iter()
@@ -163,6 +165,7 @@ impl Labyrinth {
                 .await,
         )?;
         let owner = self.b.mailbox.get_owner_messages(thread_id, &ids).await?;
+        self.sync_store_writer_floors()?;
         // (rank, timestamp) of each message's positioning copy.
         let mut rank: BTreeMap<&str, (u8, u64)> = BTreeMap::new();
         let mut note = |id: &str, r: (u8, u64)| {

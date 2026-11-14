@@ -32,6 +32,7 @@ pub mod enroll;
 pub mod epochs;
 pub mod lookup;
 pub mod members;
+pub mod owner_state;
 pub mod pins;
 pub mod read;
 pub mod recovery;
@@ -47,6 +48,10 @@ pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
 pub use epochs::{InvalidatedRecoveryMethod, RotationReport, SyncReport};
 pub use lookup::{ThreadCursor, ThreadList, ThreadPage, ThreadSummary};
 pub use members::{ExcludedMember, ExclusionReason};
+pub use owner_state::{
+    ACL_REMOVE_PENDING, ACL_REMOVE_PENDING_ROTATED, ACL_TOMBSTONE_PREFIX, CircleOwnerState,
+    ReadState,
+};
 pub use pins::{PeerPin, RepinProposal};
 pub use read::{
     LoadedMessage, MessageSource, RedactedMessage, RejectedCopy, Rejection, ThreadHistory,
@@ -57,7 +62,7 @@ pub use send::{ArchiveOutcome, FlushedBatch, ResolvedRoster, RosterExclusion};
 
 use crate::device::{DevicePublic, DeviceSecrets};
 use crate::epoch::{EpochKeys as _, EpochSecret};
-use crate::mailbox::EpochPublic;
+use crate::mailbox::{EpochPublic, MailboxKeys};
 use crate::mek::Mek;
 use crate::message::{OwnerMessage, SealedMessage};
 use crate::records::datetime_from_ms;
@@ -159,6 +164,9 @@ pub struct Labyrinth {
     /// verification methods. A non-empty entry permanently disables
     /// receiptless fallback for that conversation.
     receipt_trust: BTreeMap<String, ReceiptTrust>,
+    /// Monotonic `(spaceUri, authorDid) -> repoRev` floor persisted across
+    /// restarts so a Space host cannot roll back a writer's commit head.
+    writer_floors: BTreeMap<(String, String), String>,
     outbox: BTreeMap<String, Vec<SealedMessage>>,
     /// Canonical `(DID, epoch head)` roster under which each sender buffer's
     /// MEK was distributed. Flush revalidates it so a queued ciphertext
@@ -196,6 +204,30 @@ impl Labyrinth {
         }
         let epochs: BTreeMap<u64, EpochSecret> = epochs.into_iter().map(|e| (e.seq, e)).collect();
         let latest = *epochs.keys().next_back().ok_or(Error::NotFound("epoch"))?;
+        let mut writer_floors: BTreeMap<(String, String), String> = BTreeMap::new();
+        for source in [
+            b.mailbox.export_writer_rev_floors(),
+            b.threads.export_writer_rev_floors(),
+        ] {
+            for ((space, author), rev) in source {
+                crate::store::validate_writer_rev_floor(&space, &author, &rev)?;
+                let key = (space, author);
+                match writer_floors.get(&key) {
+                    Some(cur) if cur.as_str() >= rev.as_str() => {}
+                    Some(_) => {
+                        writer_floors.insert(key, rev);
+                    }
+                    None => {
+                        if writer_floors.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES {
+                            return Err(Error::Malformed("writer revision floor table full"));
+                        }
+                        writer_floors.insert(key, rev);
+                    }
+                }
+            }
+        }
+        b.mailbox.replace_writer_rev_floors(&writer_floors);
+        b.threads.replace_writer_rev_floors(&writer_floors);
         Ok(Self {
             did: did.to_owned(),
             device,
@@ -215,6 +247,7 @@ impl Labyrinth {
             pins: BTreeMap::new(),
             meks: BTreeMap::new(),
             receipt_trust: BTreeMap::new(),
+            writer_floors,
             outbox: BTreeMap::new(),
             outbox_rosters: BTreeMap::new(),
             owner_outbox: BTreeMap::new(),
@@ -238,6 +271,124 @@ impl Labyrinth {
         if let Some(ref sink) = self.state_sink {
             let exported = self.export_state()?;
             sink.save_state(&exported)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn seed_store_writer_floors(&self) {
+        self.b.mailbox.seed_writer_rev_floors(&self.writer_floors);
+        self.b.threads.seed_writer_rev_floors(&self.writer_floors);
+    }
+
+    pub(super) fn replace_store_writer_floors(&self) {
+        self.b
+            .mailbox
+            .replace_writer_rev_floors(&self.writer_floors);
+        self.b
+            .threads
+            .replace_writer_rev_floors(&self.writer_floors);
+    }
+
+    pub(super) fn merged_writer_floors(&self) -> Result<BTreeMap<(String, String), String>> {
+        let mut merged = self.writer_floors.clone();
+        for source in [
+            self.b.mailbox.export_writer_rev_floors(),
+            self.b.threads.export_writer_rev_floors(),
+        ] {
+            for ((space, author), offered) in source {
+                crate::store::validate_writer_rev_floor(&space, &author, &offered)?;
+                let key = (space.clone(), author.clone());
+                match merged.get(&key) {
+                    Some(pinned) if offered.as_str() < pinned.as_str() => {
+                        return Err(Error::WriterRollback {
+                            space,
+                            author,
+                            pinned_rev: pinned.clone(),
+                            offered_rev: offered,
+                        });
+                    }
+                    Some(pinned) if offered.as_str() == pinned.as_str() => {}
+                    Some(_) => {
+                        merged.insert(key, offered);
+                    }
+                    None => {
+                        if merged.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES {
+                            return Err(Error::Malformed("writer revision floor table full"));
+                        }
+                        merged.insert(key, offered);
+                    }
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    pub(super) fn sync_store_writer_floors(&mut self) -> Result<()> {
+        let merged = match self.merged_writer_floors() {
+            Ok(m) => m,
+            Err(err) => {
+                self.replace_store_writer_floors();
+                return Err(err);
+            }
+        };
+        if merged != self.writer_floors {
+            let previous = core::mem::replace(&mut self.writer_floors, merged);
+            self.replace_store_writer_floors();
+            if let Err(err) = self.checkpoint_state() {
+                self.writer_floors = previous;
+                self.replace_store_writer_floors();
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Pinned commit revision floor for `(space, author)`, if one has been observed.
+    pub fn writer_rev_floor(&self, space: &str, author: &str) -> Option<&str> {
+        self.writer_floors
+            .get(&(space.to_owned(), author.to_owned()))
+            .map(String::as_str)
+    }
+
+    /// All persisted `(space, author) -> repoRev` commit revision floors.
+    pub fn writer_rev_floors(&self) -> &BTreeMap<(String, String), String> {
+        &self.writer_floors
+    }
+
+    /// Observe and pin a writer's repository commit revision in `space`.
+    /// Fails closed with [`Error::WriterRollback`] if `rev` regresses below the
+    /// previously pinned revision for `(space, author)`.
+    pub fn observe_writer_rev(&mut self, space: &str, author: &str, rev: &str) -> Result<()> {
+        crate::store::validate_writer_rev_floor(space, author, rev)?;
+        let key = (space.to_owned(), author.to_owned());
+        if let Some(pinned) = self.writer_floors.get(&key) {
+            if rev < pinned.as_str() {
+                return Err(Error::WriterRollback {
+                    space: space.to_owned(),
+                    author: author.to_owned(),
+                    pinned_rev: pinned.clone(),
+                    offered_rev: rev.to_owned(),
+                });
+            }
+            if rev == pinned.as_str() {
+                return Ok(());
+            }
+        } else if self.writer_floors.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES {
+            return Err(Error::Malformed("writer revision floor table full"));
+        }
+        let previous = self.writer_floors.insert(key.clone(), rev.to_owned());
+        self.replace_store_writer_floors();
+        if let Err(err) = self.checkpoint_state() {
+            match previous {
+                Some(old) => {
+                    self.writer_floors.insert(key, old);
+                }
+                None => {
+                    self.writer_floors.remove(&key);
+                }
+            }
+            self.replace_store_writer_floors();
+            return Err(err);
         }
         Ok(())
     }
@@ -340,6 +491,51 @@ impl Labyrinth {
             .filter(|p| p.seq == self.latest)
             .cloned()
             .ok_or(Error::NotFound("verified latest epoch record"))
+    }
+
+    /// Mailbox key pairs for epoch `seq`, walking back-links for older
+    /// epochs. Errors when `seq` is unknown.
+    ///
+    /// The result holds secret keys: use it only inside the process, and
+    /// never serialize it or pass it across an FFI boundary.
+    pub async fn mailbox_keys_for(&mut self, seq: u64) -> Result<MailboxKeys> {
+        Ok(self.epoch_secret(seq).await?.mailbox_keys())
+    }
+
+    /// `(seq, epoch head, keys)` for up to `max_epochs` recent epochs ending
+    /// at [`latest_epoch`](Self::latest_epoch), newest first.
+    ///
+    /// The keys are secret: use them only inside the process, and never
+    /// serialize them or pass them across an FFI boundary.
+    pub async fn recent_mailbox_keys(
+        &mut self,
+        max_epochs: usize,
+    ) -> Result<Vec<(u64, [u8; 32], MailboxKeys)>> {
+        if max_epochs == 0 {
+            return Ok(Vec::new());
+        }
+        let latest = self.latest;
+        let count = max_epochs.min((latest as usize).saturating_add(1));
+        let mut out = Vec::with_capacity(count);
+        for offset in 0..count {
+            let seq = latest - (offset as u64);
+            let keys = self.mailbox_keys_for(seq).await?;
+            let (_, record) = self.epoch_record(seq).await?;
+            out.push((seq, record.public.head, keys));
+        }
+        Ok(out)
+    }
+
+    /// `(seq, epoch head, keys)` for the latest epoch and, when one exists,
+    /// the epoch before it. The head is the published
+    /// [`EpochPublic::head`] of that epoch, for building associated data.
+    ///
+    /// The keys are secret: use them only inside the process, and never
+    /// serialize them or pass them across an FFI boundary.
+    pub async fn current_and_previous_mailbox_keys(
+        &mut self,
+    ) -> Result<Vec<(u64, [u8; 32], MailboxKeys)>> {
+        self.recent_mailbox_keys(2).await
     }
 
     /// Verifies my record for epoch `latest` in full ([`epochs::verified_own`])

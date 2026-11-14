@@ -1,7 +1,7 @@
 //! The client lifecycle with every account's mailbox in a personal atproto
 //! Space against the reference Space host, with every `com.atproto.space.*`
-//! request and response validated against the vendored lexicons
-//! (`tests/vectors/atproto-space/`, upstream `permissioned-data` at `5b95b2f2`)
+//! and `com.atproto.memberspace.*` request and response validated against the
+//! vendored lexicons (`tests/vectors/atproto-space/`, upstream `d4def6e9`)
 //! and every record value against ours.
 
 #[path = "support/lexicon.rs"]
@@ -20,7 +20,8 @@ use labyrinth::recovery_code::ALPHABET;
 use labyrinth::sign::Ed25519Transport;
 use labyrinth::store::memory::MemoryBackend;
 use labyrinth::store::space::host::MemorySpaceHost;
-use labyrinth::store::space::{SpaceError, SpaceMailboxStore, SpaceRef, SpaceRpc};
+use labyrinth::store::space::thread::SequencedSpaceThreadStore;
+use labyrinth::store::space::{SpaceError, SpaceMailboxStore, SpaceRef, SpaceRpc, endpoint};
 use labyrinth::store::{MailboxDirectory, MailboxStore, TimeRange};
 use labyrinth::virtual_device::Mechanism;
 use lexicon::Lexicons;
@@ -59,15 +60,27 @@ struct Validating {
 
 impl Validating {
     fn check(&self, nsid: &str, out: &Result<Vec<u8>, SpaceError>) {
-        assert!(nsid.starts_with(SPACE_PREFIX), "{nsid}");
+        assert!(
+            nsid.starts_with(SPACE_PREFIX) || nsid.starts_with("com.atproto.memberspace."),
+            "{nsid}"
+        );
         self.seen.lock().unwrap().insert(nsid.to_owned());
         match out {
-            Ok(body) => {
-                let v: Value = serde_json::from_slice(body).unwrap();
-                self.lex
-                    .validate_output(nsid, &v)
-                    .unwrap_or_else(|e| panic!("{nsid}: {e}\n{v:#}"));
-            }
+            Ok(body) => match self.lex.output_encoding(nsid) {
+                Some("application/json") => {
+                    let v: Value = serde_json::from_slice(body).unwrap();
+                    self.lex
+                        .validate_output(nsid, &v)
+                        .unwrap_or_else(|e| panic!("{nsid}: {e}\n{v:#}"));
+                }
+                Some("application/vnd.dasl.star") => {
+                    assert!(!body.is_empty(), "{nsid}: empty STAR output");
+                }
+                None => {
+                    assert!(body.is_empty(), "{nsid}: expected empty body");
+                }
+                Some(enc) => panic!("{nsid}: unexpected output encoding {enc}"),
+            },
             Err(e) => {
                 let name = e.error.as_deref().unwrap_or("");
                 assert!(
@@ -88,6 +101,21 @@ impl SpaceRpc for Validating {
             .unwrap_or_else(|e| panic!("{nsid}: {e}"));
         let out = self.inner.query(nsid, params).await;
         self.check(nsid, &out);
+        out
+    }
+
+    async fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> Result<(Vec<(String, String)>, Vec<u8>), SpaceError> {
+        self.lex
+            .validate_params(nsid, params)
+            .unwrap_or_else(|e| panic!("{nsid}: {e}"));
+        let out = self.inner.query_with_headers(nsid, params, headers).await;
+        let body_res = out.as_ref().map(|(_, b)| b.clone()).map_err(Clone::clone);
+        self.check(nsid, &body_res);
         out
     }
 
@@ -537,6 +565,40 @@ fn space_store_semantics() {
         block_on(fresh.list_owner_threads()).unwrap(),
         Vec::<String>::new()
     );
+
+    // listSpaces uses the November 12 `space` entry and `spaceDid` filter.
+    let conversation = SpaceRef {
+        space_did: "did:plc:authority".into(),
+        space_type: "blue.catbird.labyrinth.conversation".into(),
+        skey: "11111111-1111-4111-8111-111111111111".into(),
+    };
+    w.host.tamper(
+        &conversation,
+        ALICE,
+        nsid::BATCH,
+        "batch",
+        serde_json::json!({"$type": nsid::BATCH}),
+    );
+    let transport = w.transport(ALICE);
+    assert_eq!(
+        block_on(SequencedSpaceThreadStore::owned_spaces(transport.as_ref())).unwrap(),
+        vec![conversation.to_string()]
+    );
+    let filtered: Value = serde_json::from_slice(
+        &block_on(transport.query(
+            endpoint::LIST_SPACES,
+            &[("spaceDid", "did:plc:authority".into())],
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(filtered["spaces"][0]["space"], conversation.to_string());
+    assert!(
+        w.seen
+            .lock()
+            .unwrap()
+            .contains(&format!("{SPACE_PREFIX}listSpaces"))
+    );
 }
 
 #[test]
@@ -548,6 +610,16 @@ fn space_ref_round_trips() {
         "at://did:plc:alice/space/blue.catbird.labyrinth.mailbox/self"
     );
     assert_eq!(SpaceRef::parse(&s).unwrap(), r);
+    assert_eq!(
+        SpaceRef::parse_hedged("at:space/did:plc:alice/blue.catbird.labyrinth.mailbox/self")
+            .unwrap(),
+        r
+    );
+    assert_eq!(
+        SpaceRef::parse_hedged("at://space/did:plc:alice/blue.catbird.labyrinth.mailbox/self")
+            .unwrap(),
+        r
+    );
     for bad in [
         "did:plc:alice/space/x/y",
         "at://did:plc:alice/space/x",

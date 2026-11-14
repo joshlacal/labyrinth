@@ -24,15 +24,44 @@ pub use keys::{
 };
 pub use memory::MemoryBackend;
 
+use std::collections::BTreeMap;
+
 use crate::attachment::AttachmentCiphertextMeta;
 use crate::deletion::Redaction;
 use crate::mailbox::EpochPublic;
 use crate::records::{
-    AttachmentManifest, Batch, Device, Epoch, EpochMember, MailboxKeysRecord, MekDistribution,
-    OtcSession, OwnerBatch, VirtualDevice,
+    AttachmentManifest, Batch, CircleOwnerStateRecord, Device, Epoch, EpochMember,
+    MailboxKeysRecord, MekDistribution, OtcSession, OwnerBatch, ReadStateRecord, VirtualDevice,
 };
 use crate::sign::XVerifyingKey;
 use crate::{Error, Result};
+
+/// Maximum byte length of a Space URI key in a persisted writer revision floor.
+pub const MAX_WRITER_FLOOR_SPACE_LEN: usize = 512;
+/// Maximum byte length of an author DID key in a persisted writer revision floor.
+pub const MAX_WRITER_FLOOR_AUTHOR_LEN: usize = 256;
+/// Maximum byte length of a repository commit `repoRev` string in a writer revision floor.
+pub const MAX_WRITER_FLOOR_REV_LEN: usize = 128;
+/// Maximum number of `(space_uri, author_did)` entries in a writer revision floor table.
+pub const MAX_WRITER_FLOOR_ENTRIES: usize = 65_536;
+
+/// Validate that `(space, author, offered_rev)` are non-empty, printable ASCII,
+/// and within wire/state size bounds (`512` / `256` / `128` bytes).
+pub fn validate_writer_rev_floor(space: &str, author: &str, offered_rev: &str) -> Result<()> {
+    let valid_token = |s: &str, max_len: usize| {
+        !s.is_empty() && s.len() <= max_len && s.bytes().all(|b| b.is_ascii_graphic())
+    };
+    if !valid_token(space, MAX_WRITER_FLOOR_SPACE_LEN) {
+        return Err(Error::Malformed("invalid writer revision space"));
+    }
+    if !valid_token(author, MAX_WRITER_FLOOR_AUTHOR_LEN) {
+        return Err(Error::Malformed("invalid writer revision author"));
+    }
+    if !valid_token(offered_rev, MAX_WRITER_FLOOR_REV_LEN) {
+        return Err(Error::Malformed("invalid writer revision"));
+    }
+    Ok(())
+}
 
 /// Conditional `Send` bound: `Send` on native targets, unconstrained on `wasm32`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -200,6 +229,68 @@ pub trait MailboxStore: MaybeSend + MaybeSync {
     async fn get_otc_session(&self, session_id: &str) -> Result<Option<OtcSession>> {
         let _ = session_id;
         Err(Error::NotSupported("getOtcSession"))
+    }
+
+    /// Encrypted per-conversation UI read-watermark state (`blue.catbird.labyrinth.readState`).
+    async fn get_read_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(ReadStateRecord, Option<String>)>> {
+        let _ = conversation_id;
+        Err(Error::NotSupported("getReadState"))
+    }
+    /// Writes `blue.catbird.labyrinth.readState/<conversationId>`. When `expected_cid`
+    /// is `None`, creates if absent (`Error::Conflict` if present); when `Some(cid)`,
+    /// updates only if the current record CID matches `cid` (`Error::Conflict` otherwise).
+    async fn put_read_state(
+        &self,
+        conversation_id: &str,
+        record: &ReadStateRecord,
+        expected_cid: Option<&str>,
+    ) -> Result<String> {
+        let _ = (conversation_id, record, expected_cid);
+        Err(Error::NotSupported("putReadState"))
+    }
+    async fn list_read_states(&self) -> Result<Vec<(String, ReadStateRecord, Option<String>)>> {
+        Err(Error::NotSupported("listReadStates"))
+    }
+
+    /// Encrypted per-circle owner state (`blue.catbird.labyrinth.circleOwnerState`).
+    async fn get_circle_owner_state(
+        &self,
+        circle_id: &str,
+    ) -> Result<Option<(CircleOwnerStateRecord, Option<String>)>> {
+        let _ = circle_id;
+        Err(Error::NotSupported("getCircleOwnerState"))
+    }
+    /// Writes `blue.catbird.labyrinth.circleOwnerState/<circleId>`. When `expected_cid`
+    /// is `None`, creates if absent (`Error::Conflict` if present); when `Some(cid)`,
+    /// updates only if the current record CID matches `cid` (`Error::Conflict` otherwise).
+    async fn put_circle_owner_state(
+        &self,
+        circle_id: &str,
+        record: &CircleOwnerStateRecord,
+        expected_cid: Option<&str>,
+    ) -> Result<String> {
+        let _ = (circle_id, record, expected_cid);
+        Err(Error::NotSupported("putCircleOwnerState"))
+    }
+    async fn list_circle_owner_states(
+        &self,
+    ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>)>> {
+        Err(Error::NotSupported("listCircleOwnerStates"))
+    }
+
+    /// Install persisted `(space_uri, author_did) -> rev` floors restored from client state.
+    fn seed_writer_rev_floors(&self, _floors: &BTreeMap<(String, String), String>) {}
+    /// Atomically replace the store's `(space_uri, author_did) -> rev` floor table
+    /// (used on rollback so rejected store entries cannot linger).
+    fn replace_writer_rev_floors(&self, floors: &BTreeMap<(String, String), String>) {
+        self.seed_writer_rev_floors(floors);
+    }
+    /// Export the highest `(space_uri, author_did) -> rev` floors observed by this store.
+    fn export_writer_rev_floors(&self) -> BTreeMap<(String, String), String> {
+        BTreeMap::new()
     }
 
     /// Appends an owner batch (rkey = TID, assigned by the store).
@@ -551,6 +642,18 @@ pub trait ThreadStore: MaybeSend + MaybeSync {
     async fn clear_records(&self, thread_id: &str) -> Result<()> {
         let _ = thread_id;
         Err(Error::NotSupported("clearRecords"))
+    }
+
+    /// Install persisted `(space_uri, author_did) -> rev` floors restored from client state.
+    fn seed_writer_rev_floors(&self, _floors: &BTreeMap<(String, String), String>) {}
+    /// Atomically replace the store's `(space_uri, author_did) -> rev` floor table
+    /// (used on rollback so rejected store entries cannot linger).
+    fn replace_writer_rev_floors(&self, floors: &BTreeMap<(String, String), String>) {
+        self.seed_writer_rev_floors(floors);
+    }
+    /// Export the highest `(space_uri, author_did) -> rev` floors observed by this store.
+    fn export_writer_rev_floors(&self) -> BTreeMap<(String, String), String> {
+        BTreeMap::new()
     }
 }
 

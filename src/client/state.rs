@@ -36,6 +36,7 @@
 //! pins     u32 × (did str16, seq u64, head 32, sigKey 32)
 //! receipts u32 × (threadId str16, authority str16,
 //!                 u32 × (verificationMethod str16, SEC1 key blob16))
+//! writerFloors u32 × (space str16, author str16, rev str16)
 //! meks     u32 × (threadId str16, u32 × (secret 32, rosterHash 32, provenance))
 //!          maps in ascending key byte order, MEKs oldest first;
 //!          decode accepts any map order, export is always canonical
@@ -259,6 +260,13 @@ impl Labyrinth {
                 w.blob(public_key)?;
             }
         }
+        let writer_floors = self.merged_writer_floors()?;
+        w.u32(writer_floors.len())?;
+        for ((space, author), rev) in &writer_floors {
+            w.str(space)?;
+            w.str(author)?;
+            w.str(rev)?;
+        }
         w.u32(self.meks.len())?;
         for (thread, meks) in &self.meks {
             w.str(thread)?;
@@ -396,6 +404,20 @@ impl Labyrinth {
                 return Err(Error::Malformed("duplicate state receipt conversation"));
             }
         }
+        let writer_floor_count = r.count(2 + 2 + 2)?;
+        if writer_floor_count > crate::store::MAX_WRITER_FLOOR_ENTRIES {
+            return Err(Error::Malformed("state writer revision floor table full"));
+        }
+        let mut writer_floors = BTreeMap::new();
+        for _ in 0..writer_floor_count {
+            let space = r.str()?;
+            let author = r.str()?;
+            let rev = r.str()?;
+            crate::store::validate_writer_rev_floor(&space, &author, &rev)?;
+            if writer_floors.insert((space, author), rev).is_some() {
+                return Err(Error::Malformed("duplicate state writer revision floor"));
+            }
+        }
         let mut meks = BTreeMap::new();
         for _ in 0..r.count(2 + 4)? {
             let thread = r.str()?;
@@ -430,6 +452,30 @@ impl Labyrinth {
         if pending_directory_publication.is_some_and(|seq| seq != latest) {
             return Err(Error::Malformed("state pending publication is not latest"));
         }
+        for ((space, author), pinned) in writer_floors {
+            let key = (space.clone(), author.clone());
+            match me.writer_floors.get(&key) {
+                Some(existing) if existing.as_str() < pinned.as_str() => {
+                    return Err(Error::WriterRollback {
+                        space,
+                        author,
+                        pinned_rev: pinned,
+                        offered_rev: existing.clone(),
+                    });
+                }
+                Some(existing) if existing.as_str() >= pinned.as_str() => {}
+                None => {
+                    if me.writer_floors.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES {
+                        return Err(Error::Malformed("writer revision floor table full"));
+                    }
+                    me.writer_floors.insert(key, pinned);
+                }
+                Some(_) => {
+                    me.writer_floors.insert(key, pinned);
+                }
+            }
+        }
+        me.replace_store_writer_floors();
         // [CB-43] Everything the mailbox alone can prove is checked now.
         // The attester lookup may wait for the directory: a restart must
         // work offline, and nothing is addressed to this epoch until a
