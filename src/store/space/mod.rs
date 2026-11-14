@@ -933,58 +933,164 @@ impl SpaceMailboxStore {
         Ok(())
     }
 
-    async fn put_cas(
+    fn is_hyphenated_uuid_36(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 36 {
+            return false;
+        }
+        for (i, &ch) in b.iter().enumerate() {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                if ch != b'-' {
+                    return false;
+                }
+            } else if !ch.is_ascii_hexdigit() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn versioned_cas_rkey(logical_id: &str, version: u64) -> String {
+        format!("{logical_id}-{version:012}")
+    }
+
+    fn match_versioned_rkey(logical_id: &str, rkey: &str) -> Option<u64> {
+        if rkey == logical_id {
+            return Some(0);
+        }
+        let suffix = rkey.strip_prefix(logical_id)?.strip_prefix('-')?;
+        if suffix.len() != 12 || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        suffix.parse::<u64>().ok().filter(|&v| v >= 1)
+    }
+
+    fn split_versioned_rkey(rkey: &str) -> (&str, u64) {
+        if !Self::is_hyphenated_uuid_36(rkey)
+            && let Some((prefix, suffix)) = rkey.rsplit_once('-')
+            && !prefix.is_empty()
+            && suffix.len() == 12
+            && suffix.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(ver) = suffix.parse::<u64>()
+            && ver >= 1
+        {
+            return (prefix, ver);
+        }
+        (rkey, 0)
+    }
+
+    async fn get_versioned_cas<T: DeserializeOwned>(
         &self,
         collection: &'static str,
-        rkey: &str,
+        logical_id: &str,
+    ) -> Result<Option<(T, Option<String>)>> {
+        let best = self
+            .list_raw_with_cid(collection, true)
+            .await?
+            .into_iter()
+            .filter_map(|(rkey, cid, value)| {
+                Self::match_versioned_rkey(logical_id, &rkey).map(|ver| (ver, cid, value))
+            })
+            .max_by_key(|(ver, _, _)| *ver);
+        let Some((_, cid, value)) = best else {
+            return Ok(None);
+        };
+        Ok(Some((decode(value)?, cid)))
+    }
+
+    async fn list_versioned_cas<T: DeserializeOwned>(
+        &self,
+        collection: &'static str,
+    ) -> Result<Vec<(String, T, Option<String>)>> {
+        let mut by_logical: BTreeMap<String, (u64, T, Option<String>)> = BTreeMap::new();
+        for (rkey, rec, cid) in self.list_with_cid::<T>(collection).await? {
+            let (logical_id, ver) = Self::split_versioned_rkey(&rkey);
+            match by_logical.get(logical_id) {
+                Some((cur_ver, _, _)) if *cur_ver > ver => {}
+                _ => {
+                    by_logical.insert(logical_id.to_owned(), (ver, rec, cid));
+                }
+            }
+        }
+        Ok(by_logical
+            .into_iter()
+            .map(|(logical_id, (_, rec, cid))| (logical_id, rec, cid))
+            .collect())
+    }
+
+    async fn put_versioned_cas(
+        &self,
+        collection: &'static str,
+        logical_id: &str,
         value: &impl Serialize,
         expected_cid: Option<&str>,
     ) -> Result<String> {
         let encoded = encode(value)?;
-        match expected_cid {
+        let existing: Vec<(u64, String, Option<String>)> = self
+            .list_raw_with_cid(collection, false)
+            .await?
+            .into_iter()
+            .filter_map(|(rkey, cid, _)| {
+                Self::match_versioned_rkey(logical_id, &rkey).map(|ver| (ver, rkey, cid))
+            })
+            .collect();
+
+        let next_ver = match expected_cid {
             None => {
-                let results = self
-                    .apply_results(&[WriteOp::Create {
-                        collection,
-                        rkey: Some(rkey.to_owned()),
-                        value: encoded,
-                    }])
-                    .await?;
-                results
-                    .into_iter()
-                    .next()
-                    .and_then(|r| r.cid)
-                    .ok_or_else(|| Error::Backend("space create result missing cid".into()))
-            }
-            Some(expected) => {
-                let Some((_, cur_cid)) = self.get_with_cid::<Value>(collection, rkey).await? else {
-                    return Err(Error::Conflict);
-                };
-                if cur_cid.as_deref() != Some(expected) {
+                if !existing.is_empty() {
                     return Err(Error::Conflict);
                 }
-                let results = self
-                    .apply_results(&[WriteOp::Update {
-                        collection,
-                        rkey: rkey.to_owned(),
-                        value: encoded,
-                    }])
-                    .await?;
-                let written_cid = results
-                    .into_iter()
-                    .next()
-                    .and_then(|r| r.cid)
-                    .ok_or_else(|| Error::Backend("space update result missing cid".into()))?;
-                let Some((_, after_cid)) = self.get_with_cid::<Value>(collection, rkey).await?
+                1
+            }
+            Some(expected) => {
+                let Some((max_ver, _, max_cid)) = existing.iter().max_by_key(|(ver, _, _)| *ver)
                 else {
                     return Err(Error::Conflict);
                 };
-                if after_cid.as_deref() != Some(written_cid.as_str()) {
+                if max_cid.as_deref() != Some(expected) {
                     return Err(Error::Conflict);
                 }
-                Ok(written_cid)
+                max_ver
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Backend("cas version overflow".into()))?
+            }
+        };
+
+        let target_rkey = Self::versioned_cas_rkey(logical_id, next_ver);
+        let results = self
+            .apply_results(&[WriteOp::Create {
+                collection,
+                rkey: Some(target_rkey),
+                value: encoded,
+            }])
+            .await?;
+        let written_cid = results
+            .into_iter()
+            .next()
+            .and_then(|r| r.cid)
+            .ok_or_else(|| Error::Backend("space create result missing cid".into()))?;
+
+        let stale_rkeys: Vec<String> = existing
+            .into_iter()
+            .filter(|(ver, _, _)| *ver < next_ver)
+            .map(|(_, rkey, _)| rkey)
+            .collect();
+        for chunk in stale_rkeys.chunks(MAX_WRITES) {
+            let deletes: Vec<WriteOp> = chunk
+                .iter()
+                .map(|rkey| WriteOp::Delete {
+                    collection,
+                    rkey: rkey.clone(),
+                })
+                .collect();
+            if let Err(Error::NotFound("record")) = self.apply(&deletes).await {
+                for rkey in chunk {
+                    let _ = self.delete_record_idempotent(collection, rkey).await;
+                }
             }
         }
+
+        Ok(written_cid)
     }
 
     fn stored<T>(&self, rkey: String, value: T) -> Stored<T> {
@@ -1413,7 +1519,7 @@ impl MailboxStore for SpaceMailboxStore {
         conversation_id: &str,
     ) -> Result<Option<(ReadStateRecord, Option<String>)>> {
         let Some((rec, cid)) = self
-            .get_with_cid::<ReadStateRecord>(nsid::READ_STATE, conversation_id)
+            .get_versioned_cas::<ReadStateRecord>(nsid::READ_STATE, conversation_id)
             .await?
         else {
             return Ok(None);
@@ -1429,13 +1535,13 @@ impl MailboxStore for SpaceMailboxStore {
         expected_cid: Option<&str>,
     ) -> Result<String> {
         record.check()?;
-        self.put_cas(nsid::READ_STATE, conversation_id, record, expected_cid)
+        self.put_versioned_cas(nsid::READ_STATE, conversation_id, record, expected_cid)
             .await
     }
 
     async fn list_read_states(&self) -> Result<Vec<(String, ReadStateRecord, Option<String>)>> {
         let rows = self
-            .list_with_cid::<ReadStateRecord>(nsid::READ_STATE)
+            .list_versioned_cas::<ReadStateRecord>(nsid::READ_STATE)
             .await?;
         for (_, rec, _) in &rows {
             rec.check()?;
@@ -1448,7 +1554,7 @@ impl MailboxStore for SpaceMailboxStore {
         circle_id: &str,
     ) -> Result<Option<(CircleOwnerStateRecord, Option<String>)>> {
         let Some((rec, cid)) = self
-            .get_with_cid::<CircleOwnerStateRecord>(nsid::CIRCLE_OWNER_STATE, circle_id)
+            .get_versioned_cas::<CircleOwnerStateRecord>(nsid::CIRCLE_OWNER_STATE, circle_id)
             .await?
         else {
             return Ok(None);
@@ -1464,7 +1570,7 @@ impl MailboxStore for SpaceMailboxStore {
         expected_cid: Option<&str>,
     ) -> Result<String> {
         record.check()?;
-        self.put_cas(nsid::CIRCLE_OWNER_STATE, circle_id, record, expected_cid)
+        self.put_versioned_cas(nsid::CIRCLE_OWNER_STATE, circle_id, record, expected_cid)
             .await
     }
 
@@ -1472,7 +1578,7 @@ impl MailboxStore for SpaceMailboxStore {
         &self,
     ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>)>> {
         let rows = self
-            .list_with_cid::<CircleOwnerStateRecord>(nsid::CIRCLE_OWNER_STATE)
+            .list_versioned_cas::<CircleOwnerStateRecord>(nsid::CIRCLE_OWNER_STATE)
             .await?;
         for (_, rec, _) in &rows {
             rec.check()?;

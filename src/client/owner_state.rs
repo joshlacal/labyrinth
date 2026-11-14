@@ -459,33 +459,48 @@ impl Labyrinth {
         if conversation_id.is_empty() || conversation_id.len() > 256 {
             return Err(Error::Malformed("readState conversationId length"));
         }
+        let mut candidate = ReadState::new(conversation_id, read_through_seq, self.now())?;
         for attempt in 0..CAS_MAX_ATTEMPTS {
             self.seed_store_writer_floors();
             let current = self.b.mailbox.get_read_state(conversation_id).await?;
             self.sync_store_writer_floors()?;
 
-            let candidate = ReadState::new(conversation_id, read_through_seq, self.now())?;
-            let (merged, expected_cid) = match current {
+            let expected_cid = match current {
                 Some((record, cid)) => {
                     let existing = self.decrypt_read_state(conversation_id, &record).await?;
-                    if existing.read_through_seq >= read_through_seq {
+                    if existing.read_through_seq >= candidate.read_through_seq {
                         return Ok(existing);
                     }
-                    (existing.merge(&candidate)?, cid)
+                    candidate = existing.merge(&candidate)?;
+                    cid
                 }
-                None => (candidate, None),
+                None => None,
             };
 
-            let record = self.encrypt_read_state(&merged).await?;
+            let record = self.encrypt_read_state(&candidate).await?;
             match self
                 .b
                 .mailbox
                 .put_read_state(conversation_id, &record, expected_cid.as_deref())
                 .await
             {
-                Ok(_cid) => return Ok(merged),
-                Err(Error::Conflict) if attempt + 1 < CAS_MAX_ATTEMPTS => {
-                    conflict_backoff_jitter();
+                Ok(_cid) => return Ok(candidate),
+                Err(Error::Conflict) => {
+                    self.seed_store_writer_floors();
+                    let latest = self.b.mailbox.get_read_state(conversation_id).await?;
+                    self.sync_store_writer_floors()?;
+                    if let Some((latest_rec, _)) = latest {
+                        let existing = self
+                            .decrypt_read_state(conversation_id, &latest_rec)
+                            .await?;
+                        if existing.read_through_seq >= candidate.read_through_seq {
+                            return Ok(existing);
+                        }
+                        candidate = existing.merge(&candidate)?;
+                    }
+                    if attempt + 1 < CAS_MAX_ATTEMPTS {
+                        conflict_backoff_jitter();
+                    }
                 }
                 Err(err) => return Err(err),
             }

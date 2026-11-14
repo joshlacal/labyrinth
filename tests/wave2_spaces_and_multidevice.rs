@@ -1019,6 +1019,7 @@ fn oversized_and_malformed_writer_revs_rejected_without_poisoning_client_state_o
         fail_next: fail_next.clone(),
         saved: Arc::default(),
     };
+    h.net.register_chat_device(ALICE, tpub(1));
     let mut alice = block_on(Labyrinth::initialize(
         ALICE,
         Box::new(signer(11)),
@@ -1138,6 +1139,7 @@ fn intra_list_writers_stream_rollback_and_pre_removal_floor_pinning_rejected() {
             Arc::new(move || clock.now_ms())
         });
     alice_threads.set_thread_space(THREAD, h.conv_space.clone());
+    h.net.register_chat_device(ALICE, tpub(1));
     let mut alice = block_on(Labyrinth::initialize(
         ALICE,
         Box::new(signer(11)),
@@ -1229,4 +1231,660 @@ fn intra_list_writers_stream_rollback_and_pre_removal_floor_pinning_rejected() {
             offered_rev: "rev-0007".to_owned(),
         }
     );
+}
+
+#[derive(Default)]
+struct RpcAuditLog {
+    writes: Vec<(String, String, String)>,
+    mek_get_repos: Vec<String>,
+    mek_list_writers: usize,
+}
+
+type PreCreateHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+struct SpySpaceRpc {
+    inner: Arc<dyn SpaceRpc>,
+    log: Arc<Mutex<RpcAuditLog>>,
+    pre_create_hook: Option<PreCreateHook>,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl SpaceRpc for SpySpaceRpc {
+    async fn query(&self, nsid: &str, params: &[(&str, String)]) -> Result<Vec<u8>, SpaceError> {
+        if nsid == "com.atproto.space.getRecord" {
+            let collection = params
+                .iter()
+                .find(|(k, _)| *k == "collection")
+                .map(|(_, v)| v.as_str());
+            if collection == Some(nsid::MEK)
+                && let Some((_, repo)) = params.iter().find(|(k, _)| *k == "repo")
+            {
+                self.log.lock().unwrap().mek_get_repos.push(repo.clone());
+            }
+        } else if nsid == "com.atproto.space.listWriters" {
+            self.log.lock().unwrap().mek_list_writers += 1;
+        }
+        self.inner.query(nsid, params).await
+    }
+
+    async fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> Result<(Vec<(String, String)>, Vec<u8>), SpaceError> {
+        self.inner.query_with_headers(nsid, params, headers).await
+    }
+
+    async fn procedure(&self, nsid: &str, payload: &[u8]) -> Result<Vec<u8>, SpaceError> {
+        if nsid == "com.atproto.space.applyWrites"
+            && let Ok(v) = serde_json::from_slice::<Value>(payload)
+            && let Some(writes) = v["writes"].as_array()
+        {
+            for w in writes {
+                let kind = w["$type"].as_str().unwrap_or("").to_owned();
+                let collection = w["collection"].as_str().unwrap_or("").to_owned();
+                let rkey = w["rkey"].as_str().unwrap_or("").to_owned();
+                if kind == "com.atproto.space.applyWrites#create"
+                    && let Some(hook) = &self.pre_create_hook
+                {
+                    hook(&collection, &rkey);
+                }
+                self.log
+                    .lock()
+                    .unwrap()
+                    .writes
+                    .push((kind, collection, rkey));
+            }
+        }
+        self.inner.procedure(nsid, payload).await
+    }
+
+    async fn upload_blob(&self, bytes: &[u8], mime_type: &str) -> Result<String, SpaceError> {
+        self.inner.upload_blob(bytes, mime_type).await
+    }
+
+    async fn get_blob(&self, space: &str, did: &str, cid: &str) -> Result<Vec<u8>, SpaceError> {
+        self.inner.get_blob(space, did, cid).await
+    }
+}
+
+#[test]
+fn versioned_circle_owner_state_create_cas_eliminates_toctou_and_preserves_acl_tombstones() {
+    let h = SpaceHarness::new();
+    let mut phone = h.init(ALICE, 1);
+
+    let tablet_log = Arc::new(Mutex::new(RpcAuditLog::default()));
+    let hook_armed = Arc::new(Mutex::new(false));
+    let host_for_hook = h.host.clone();
+    let transport_for_hook = h.transport(ALICE);
+    let net_for_hook = h.net.clone();
+    let clock_for_hook = h.clock.clone();
+    let hook_armed_cl = hook_armed.clone();
+
+    let circle_id = "550e8400-e29b-41d4-a716-446655440000";
+    let space_uri = format!("at://{ALICE}/space/blue.catbird.circles.circle/{circle_id}");
+
+    // Seed initial state v1 on phone.
+    let initial = CircleOwnerState {
+        circle_id: circle_id.to_owned(),
+        space_uri: space_uri.clone(),
+        current_key_version: 1,
+        joined_at_version_by_did: BTreeMap::from([(BOB.to_owned(), 1), (CAROL.to_owned(), 1)]),
+        pending_ops: BTreeMap::new(),
+        updated_at: "2026-11-14T10:00:00.000Z".to_owned(),
+    };
+    let cid_v1 = block_on(phone.put_circle_owner_state(&initial, None)).unwrap();
+
+    // Enroll tablet with an intercepting transport that injects a concurrent phone write
+    // AFTER tablet has listed circleOwnerState v1 and right BEFORE tablet sends #create v2!
+    let pre_create_target = format!("{circle_id}-000000000002");
+    let cid_v1_for_hook = cid_v1.clone();
+    let initial_for_hook = initial.clone();
+    let spy_rpc: Arc<dyn SpaceRpc> = Arc::new(SpySpaceRpc {
+        inner: h.transport(ALICE),
+        log: tablet_log.clone(),
+        pre_create_hook: Some(Arc::new(move |collection, rkey| {
+            let mut armed = hook_armed_cl.lock().unwrap();
+            if *armed && collection == nsid::CIRCLE_OWNER_STATE && rkey == pre_create_target {
+                *armed = false;
+                // Concurrent writer (phone) commits v2 with __acl__ removal tombstone for BOB
+                // in the exact window between tablet's pre-read and tablet's applyWrites!
+                let mb = SpaceMailboxStore::for_owner(
+                    ALICE,
+                    transport_for_hook.clone(),
+                    Box::new(net_for_hook.pds_publisher(ALICE)),
+                )
+                .with_clock(Arc::new({
+                    let c = clock_for_hook.clone();
+                    move || c.now_ms()
+                }));
+                let (_, existing_rec) = (
+                    &host_for_hook,
+                    block_on(mb.get_circle_owner_state(circle_id))
+                        .unwrap()
+                        .expect("v1 exists"),
+                );
+                assert_eq!(existing_rec.1.as_deref(), Some(cid_v1_for_hook.as_str()));
+            }
+        })),
+    });
+
+    let tablet_backends = Backends {
+        mailbox: Box::new(
+            SpaceMailboxStore::for_owner(ALICE, spy_rpc, Box::new(h.net.pds_publisher(ALICE)))
+                .with_page_size(2)
+                .with_clock(Arc::new({
+                    let c = h.clock.clone();
+                    move || c.now_ms()
+                })),
+        ),
+        threads: Box::new(h.threads(ALICE, 2)),
+        directory: Box::new(h.directory()),
+        publishers: vec![Box::new(h.net.ds_publisher(ALICE))],
+        clock: Box::new(h.clock.clone()),
+    };
+    let mut tablet = h.enroll_sibling(&mut phone, ALICE, 2, tablet_backends);
+
+    // Both devices read v1 (`cid_v1`) concurrently.
+    let (phone_snap, phone_cid) = block_on(phone.get_circle_owner_state(circle_id))
+        .unwrap()
+        .unwrap();
+    let (_tablet_snap, tablet_cid) = block_on(tablet.get_circle_owner_state(circle_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(phone_cid.as_deref(), Some(cid_v1.as_str()));
+    assert_eq!(tablet_cid.as_deref(), Some(cid_v1.as_str()));
+
+    // Phone writes v2 removing BOB with an __acl__ tombstone.
+    let mut phone_v2 = phone_snap;
+    phone_v2.current_key_version = 2;
+    phone_v2.mark_acl_remove_pending(BOB, true);
+    phone_v2.updated_at = "2026-11-14T10:01:00.000Z".to_owned();
+    let cid_v2 = block_on(phone.put_circle_owner_state(&phone_v2, phone_cid.as_deref())).unwrap();
+    assert_ne!(cid_v1, cid_v2);
+
+    // Tablet races a direct CAS put using stale `tablet_cid` (`cid_v1`): must fail closed with Conflict.
+    let mut tablet_candidate = initial_for_hook;
+    tablet_candidate.current_key_version = 3;
+    tablet_candidate
+        .joined_at_version_by_did
+        .insert("did:plc:dave".to_owned(), 3);
+    tablet_candidate.updated_at = "2026-11-14T10:02:00.000Z".to_owned();
+    assert_eq!(
+        block_on(tablet.put_circle_owner_state(&tablet_candidate, tablet_cid.as_deref())),
+        Err(Error::Conflict)
+    );
+
+    // Now simulate the exact TOCTOU race inside `put_versioned_cas` itself:
+    // inject `circle_id-000000000003` onto the Space host right before tablet's `#create` for v3 lands!
+    let pre_v3_rkey = format!("{circle_id}-000000000003");
+    let raw_v2 = block_on(h.mailbox(ALICE).get_circle_owner_state(circle_id))
+        .unwrap()
+        .unwrap()
+        .0;
+    let host_client = h.host.client(ALICE);
+    let race_log = Arc::new(Mutex::new(RpcAuditLog::default()));
+    let raced_once = Arc::new(Mutex::new(true));
+    let raced_once_cl = raced_once.clone();
+    let pre_v3_rkey_cl = pre_v3_rkey.clone();
+    let mailbox_space_str = SpaceRef::mailbox(ALICE).to_string();
+    let raw_v2_json = serde_json::to_value(&raw_v2).unwrap();
+    let racing_rpc: Arc<dyn SpaceRpc> = Arc::new(SpySpaceRpc {
+        inner: h.transport(ALICE),
+        log: race_log.clone(),
+        pre_create_hook: Some(Arc::new(move |collection, rkey| {
+            let mut should_race = raced_once_cl.lock().unwrap();
+            if *should_race && collection == nsid::CIRCLE_OWNER_STATE && rkey == pre_v3_rkey_cl {
+                *should_race = false;
+                // Concurrent device wins `#create` on version 000000000003 first!
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "space": mailbox_space_str,
+                    "repo": ALICE,
+                    "validate": false,
+                    "writes": [{
+                        "$type": "com.atproto.space.applyWrites#create",
+                        "collection": nsid::CIRCLE_OWNER_STATE,
+                        "rkey": pre_v3_rkey_cl,
+                        "value": raw_v2_json,
+                    }]
+                }))
+                .unwrap();
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        block_on(host_client.procedure("com.atproto.space.applyWrites", &payload))
+                            .expect("winning concurrent #create on v3 succeeds");
+                    })
+                    .join()
+                    .unwrap();
+                });
+            }
+        })),
+    });
+    let mut racing_tablet = h.enroll_sibling(
+        &mut phone,
+        ALICE,
+        3,
+        Backends {
+            mailbox: Box::new(
+                SpaceMailboxStore::for_owner(
+                    ALICE,
+                    racing_rpc,
+                    Box::new(h.net.pds_publisher(ALICE)),
+                )
+                .with_page_size(2),
+            ),
+            threads: Box::new(h.threads(ALICE, 3)),
+            directory: Box::new(h.directory()),
+            publishers: vec![Box::new(h.net.ds_publisher(ALICE))],
+            clock: Box::new(h.clock.clone()),
+        },
+    );
+
+    // `merge_circle_owner_state` hits atomic RecordAlreadyExists on v3, re-reads v3, merges CRDT,
+    // and commits v4 while lazily deleting < v4!
+    let (merged, _cid_v4) = block_on(racing_tablet.merge_circle_owner_state(&tablet_candidate))
+        .expect("merge retries onto v4 after atomic #create conflict on v3");
+    assert_eq!(merged.current_key_version, 3);
+    assert!(!merged.joined_at_version_by_did.contains_key(BOB));
+    assert_eq!(
+        merged.joined_at_version_by_did.get("did:plc:dave"),
+        Some(&3)
+    );
+    assert_eq!(
+        merged
+            .pending_ops
+            .get(&CircleOwnerState::acl_tombstone_key(BOB))
+            .map(String::as_str),
+        Some(ACL_REMOVE_PENDING_ROTATED)
+    );
+
+    // Verify ZERO `#update` ops were ever emitted on circleOwnerState, and only the head versioned rkey remains!
+    let audit = race_log.lock().unwrap();
+    assert!(
+        !audit
+            .writes
+            .iter()
+            .any(|(kind, col, _)| col == nsid::CIRCLE_OWNER_STATE && kind.ends_with("#update")),
+        "circleOwnerState must never use client-side #update CAS: {:?}",
+        audit.writes
+    );
+    assert!(
+        audit.writes.iter().any(|(kind, col, rkey)| {
+            kind.ends_with("#create")
+                && col == nsid::CIRCLE_OWNER_STATE
+                && rkey == &format!("{circle_id}-000000000004")
+        }),
+        "expected atomic #create on v4, got {:?}",
+        audit.writes
+    );
+    drop(audit);
+
+    // Check raw collection rows: older versions (< v4) were lazily cleaned up, leaving only v4.
+    let list_params = [
+        ("space", SpaceRef::mailbox(ALICE).to_string()),
+        ("repo", ALICE.to_owned()),
+        ("collection", nsid::CIRCLE_OWNER_STATE.to_owned()),
+    ];
+    let raw_list: Value = serde_json::from_slice(
+        &block_on(
+            h.host
+                .client(ALICE)
+                .query("com.atproto.space.listRecords", &list_params),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let remaining_rkeys: Vec<&str> = raw_list["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["rkey"].as_str())
+        .collect();
+    assert_eq!(
+        remaining_rkeys,
+        vec![format!("{circle_id}-000000000004").as_str()]
+    );
+
+    // Legacy unversioned rkey fallback (including 36-char UUID ending in 12 decimal digits):
+    let legacy_id = "123e4567-e89b-12d3-a456-123456789012";
+    let mut legacy_state = initial;
+    legacy_state.circle_id = legacy_id.to_owned();
+    legacy_state.space_uri = format!("at://{ALICE}/space/blue.catbird.circles.circle/{legacy_id}");
+    // Write a versioned record via temp phone, extract ciphertext, and plant under unversioned rkey.
+    let tmp_cid = block_on(phone.put_circle_owner_state(&legacy_state, None)).unwrap();
+    let (legacy_rec, _) = block_on(h.mailbox(ALICE).get_circle_owner_state(legacy_id))
+        .unwrap()
+        .unwrap();
+    let _ = tmp_cid;
+    let del_v1 = serde_json::to_vec(&serde_json::json!({
+        "space": SpaceRef::mailbox(ALICE).to_string(),
+        "repo": ALICE,
+        "collection": nsid::CIRCLE_OWNER_STATE,
+        "rkey": format!("{legacy_id}-000000000001"),
+    }))
+    .unwrap();
+    block_on(
+        h.host
+            .client(ALICE)
+            .procedure("com.atproto.space.deleteRecord", &del_v1),
+    )
+    .unwrap();
+    let plant_legacy = serde_json::to_vec(&serde_json::json!({
+        "space": SpaceRef::mailbox(ALICE).to_string(),
+        "repo": ALICE,
+        "validate": false,
+        "writes": [{
+            "$type": "com.atproto.space.applyWrites#create",
+            "collection": nsid::CIRCLE_OWNER_STATE,
+            "rkey": legacy_id,
+            "value": serde_json::to_value(&legacy_rec).unwrap(),
+        }]
+    }))
+    .unwrap();
+    block_on(
+        h.host
+            .client(ALICE)
+            .procedure("com.atproto.space.applyWrites", &plant_legacy),
+    )
+    .unwrap();
+
+    // Legacy unversioned row is readable via both get and list, and upgrades cleanly to `-000000000001`.
+    let (loaded_legacy, legacy_cid) = block_on(phone.get_circle_owner_state(legacy_id))
+        .unwrap()
+        .expect("legacy unversioned rkey must remain readable");
+    assert_eq!(loaded_legacy.circle_id, legacy_id);
+    let listed_ids: BTreeSet<String> = block_on(phone.list_circle_owner_states())
+        .unwrap()
+        .into_iter()
+        .map(|s| s.circle_id)
+        .collect();
+    assert!(listed_ids.contains(legacy_id));
+
+    let mut upgraded = loaded_legacy;
+    upgraded.current_key_version = 2;
+    upgraded.updated_at = "2026-11-14T10:05:00.000Z".to_owned();
+    block_on(phone.put_circle_owner_state(&upgraded, legacy_cid.as_deref()))
+        .expect("CAS upgrade from legacy unversioned rkey to -000000000001 must succeed");
+}
+
+#[test]
+fn read_state_write_conflict_merges_monotonic_max_watermark() {
+    let h = SpaceHarness::new();
+    let mut phone = h.init(ALICE, 1);
+
+    let conv = "conv-monotonic-race";
+    assert_eq!(
+        block_on(phone.advance_read_state(conv, 10))
+            .unwrap()
+            .read_through_seq,
+        10
+    );
+
+    // Pre-encrypt a higher watermark (95) on phone so our pre-create hook can commit `conv-000000000002`
+    // right before tablet's attempt to advance to `40` commits `conv-000000000002`.
+    let other_conv = "conv-template";
+    block_on(phone.advance_read_state(other_conv, 95)).unwrap();
+    // Instead of swapping conversation AAD, have a second phone handle advance `conv` to 95 inside the hook!
+    let raced = Arc::new(Mutex::new(true));
+    let raced_cl = raced.clone();
+    let target_rkey = format!("{conv}-000000000002");
+    let phone_for_race = Arc::new(Mutex::new(h.enroll_sibling(
+        &mut phone,
+        ALICE,
+        4,
+        h.backends(ALICE, 4),
+    )));
+    let phone_for_race_cl = phone_for_race.clone();
+
+    let spy_rpc: Arc<dyn SpaceRpc> = Arc::new(SpySpaceRpc {
+        inner: h.transport(ALICE),
+        log: Arc::default(),
+        pre_create_hook: Some(Arc::new(move |collection, rkey| {
+            let mut fire = raced_cl.lock().unwrap();
+            if *fire && collection == nsid::READ_STATE && rkey == target_rkey {
+                *fire = false;
+                std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let mut winner = phone_for_race_cl.lock().unwrap();
+                        let res = block_on(winner.advance_read_state(conv, 95)).unwrap();
+                        assert_eq!(res.read_through_seq, 95);
+                    })
+                    .join()
+                    .unwrap();
+                });
+            }
+        })),
+    });
+
+    let mut tablet = h.enroll_sibling(
+        &mut phone,
+        ALICE,
+        2,
+        Backends {
+            mailbox: Box::new(
+                SpaceMailboxStore::for_owner(ALICE, spy_rpc, Box::new(h.net.pds_publisher(ALICE)))
+                    .with_page_size(2),
+            ),
+            threads: Box::new(h.threads(ALICE, 2)),
+            directory: Box::new(h.directory()),
+            publishers: vec![Box::new(h.net.ds_publisher(ALICE))],
+            clock: Box::new(h.clock.clone()),
+        },
+    );
+
+    // Tablet tries to advance to 40, collides on v2 against phone's 95, re-reads and returns MAX(40, 95) = 95!
+    let resolved = block_on(tablet.advance_read_state(conv, 40)).unwrap();
+    assert_eq!(resolved.read_through_seq, 95);
+    assert_eq!(
+        block_on(phone.get_read_state(conv))
+            .unwrap()
+            .unwrap()
+            .read_through_seq,
+        95
+    );
+}
+
+#[test]
+fn find_meks_probes_batch_author_first_o1_and_falls_back_across_writers() {
+    let h = SpaceHarness::new();
+    let log = Arc::new(Mutex::new(RpcAuditLog::default()));
+    let spy_rpc: Arc<dyn SpaceRpc> = Arc::new(SpySpaceRpc {
+        inner: h.transport(ALICE),
+        log: log.clone(),
+        pre_create_hook: None,
+    });
+    let alice_threads = SpaceThreadStore::new(spy_rpc, ALICE)
+        .with_page_size(2)
+        .with_device_pubkey(&tpub(1))
+        .with_clock(Arc::new({
+            let c = h.clock.clone();
+            move || c.now_ms()
+        }));
+    alice_threads.set_thread_space(THREAD, h.conv_space.clone());
+    h.net.register_chat_device(ALICE, tpub(1));
+    let mut alice = block_on(Labyrinth::initialize(
+        ALICE,
+        Box::new(signer(1)),
+        Backends {
+            mailbox: Box::new(h.mailbox(ALICE)),
+            threads: Box::new(alice_threads),
+            directory: Box::new(h.directory()),
+            publishers: vec![Box::new(h.net.ds_publisher(ALICE))],
+            clock: Box::new(h.clock.clone()),
+        },
+    ))
+    .unwrap();
+
+    // Populate 10 additional active writers in the Space so `listWriters` has 12 repos.
+    let mut all_dids = vec![ALICE.to_owned(), BOB.to_owned(), CAROL.to_owned()];
+    let mut senders = Vec::new();
+    for i in 0..9u8 {
+        let did = format!("did:plc:writer{i:02}");
+        h.host.grant_space_member(&h.conv_space, &did);
+        let peer = h.init(&did, 20 + i);
+        all_dids.push(did.clone());
+        senders.push((did, peer));
+    }
+    let mut bob = h.init(BOB, 2);
+    let _carol = h.init(CAROL, 3);
+    let roster_refs: Vec<&str> = all_dids.iter().map(String::as_str).collect();
+
+    // Have each extra writer publish a batch so all repos appear in `listWriters`.
+    for (idx, (_did, peer)) in senders.iter_mut().enumerate() {
+        let r = block_on(peer.resolve_roster(&roster_refs)).unwrap();
+        block_on(peer.archive_outgoing(
+            THREAD,
+            &r,
+            &format!("noise-{idx}"),
+            4_000 + idx as u64,
+            b"noise",
+        ))
+        .unwrap();
+        block_on(peer.flush()).unwrap();
+    }
+
+    // Bob publishes message "bob-target" under Bob's MEK.
+    let bob_roster = block_on(bob.resolve_roster(&roster_refs)).unwrap();
+    block_on(bob.archive_outgoing(THREAD, &bob_roster, "bob-target", 5_000, b"hello o1")).unwrap();
+    block_on(bob.flush()).unwrap();
+
+    // Clear spy log and fetch ONLY Bob's batch on Alice (`sender = Some(BOB)` -> no listWriters for batches either!).
+    // Actually `load_thread` lists batches across writers, then decrypts Bob's batch.
+    // Clear right before `load_thread` and inspect `mek_get_repos`!
+    *log.lock().unwrap() = RpcAuditLog::default();
+    let loaded = block_on(alice.load_thread(
+        THREAD,
+        TimeRange {
+            from_ms: Some(4_999),
+            until_ms: None,
+        },
+    ))
+    .unwrap();
+    assert_eq!(loaded.messages.len(), 1);
+    assert_eq!(loaded.messages[0].frame, b"hello o1");
+
+    let mek_gets = log.lock().unwrap().mek_get_repos.clone();
+    assert_eq!(
+        mek_gets,
+        vec![BOB.to_owned()],
+        "MEK lookup must probe batch author BOB first in O(1) without touching the other 11 writers"
+    );
+
+    // Bounded fallback check across all 12 writers when preferred author (`CAROL`) misses:
+    // `CAROL` is probed first, NOT re-probed during the 8-way concurrent fallback sweep,
+    // and `BOB`'s `MekDistribution` is recovered cleanly!
+    let bob_meks: Value = serde_json::from_slice(
+        &block_on(h.host.client(BOB).query(
+            "com.atproto.space.listRecords",
+            &[
+                ("space", h.conv_space.to_string()),
+                ("repo", BOB.to_owned()),
+                ("collection", nsid::MEK.to_owned()),
+            ],
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let mek_rec = &bob_meks["records"].as_array().unwrap()[0];
+    let mek_rkey = mek_rec["rkey"].as_str().unwrap().to_owned();
+    let mek_id_bytes: [u8; 12] = hex::decode(&mek_rkey).unwrap().try_into().unwrap();
+
+    let fb_log = Arc::new(Mutex::new(RpcAuditLog::default()));
+    let fb_spy: Arc<dyn SpaceRpc> = Arc::new(SpySpaceRpc {
+        inner: h.transport(ALICE),
+        log: fb_log.clone(),
+        pre_create_hook: None,
+    });
+    let fb_store = SpaceThreadStore::new(fb_spy, ALICE)
+        .with_page_size(2)
+        .with_device_pubkey(&tpub(1));
+    fb_store.set_thread_space(THREAD, h.conv_space.clone());
+
+    let found = block_on(fb_store.find_meks_with_hint(THREAD, &mek_id_bytes, Some(CAROL)))
+        .expect("bounded fallback across 12 writers must locate BOB's MEK");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].author, BOB);
+    let fb_gets = fb_log.lock().unwrap().mek_get_repos.clone();
+    assert_eq!(
+        fb_gets.first().map(String::as_str),
+        Some(CAROL),
+        "preferred_author CAROL must be probed first"
+    );
+    assert_eq!(
+        fb_gets.iter().filter(|d| d.as_str() == CAROL).count(),
+        1,
+        "preferred_author CAROL must not be probed twice during fallback"
+    );
+    assert_eq!(
+        fb_gets.len(),
+        1 + senders.len() + 1,
+        "preferred probe (CAROL) + 10 active writers in listWriters (9 peers + BOB) = 11 total getRecord probes"
+    );
+
+    // Also verify `find_mek_from_author` issues 0 `listWriters` and 1 `getRecord`.
+    *fb_log.lock().unwrap() = RpcAuditLog::default();
+    let direct = block_on(fb_store.find_mek_from_author(THREAD, BOB, &mek_id_bytes))
+        .unwrap()
+        .expect("direct author probe must find BOB's MEK");
+    assert_eq!(direct.author, BOB);
+    let direct_audit = fb_log.lock().unwrap();
+    assert_eq!(direct_audit.mek_list_writers, 0);
+    assert_eq!(direct_audit.mek_get_repos, vec![BOB.to_owned()]);
+}
+
+#[test]
+fn passkey_recovery_registration_rotates_owner_mailbox_epoch_and_anchors_virtual_device() {
+    use labyrinth::store::MailboxDirectory as _;
+
+    let h = SpaceHarness::new();
+    let mut phone = h.init(ALICE, 1);
+    assert_eq!(phone.latest_epoch(), 0);
+
+    let prf = [0x5A; 32];
+    let cred_id = b"cred-passkey-rotate";
+    let setup = block_on(phone.create_passkey_recovery(&prf, cred_id)).unwrap();
+    assert_eq!(
+        phone.latest_epoch(),
+        1,
+        "create_passkey_recovery must rotate OwnerMailbox epoch so EpochPublic.membersHash anchors the virtual device"
+    );
+
+    // Virtual device bundle is carried forward as an initial member of epoch 1 (`encrypted_entropy` present),
+    // and both PDS `mailboxKeys` and DS `epoch_head_floors` commit `membersHash` over `{phone, virtual_device}`!
+    let mb = h.mailbox(ALICE);
+    let vdev = block_on(mb.get_virtual_device(&setup.vdevice_id))
+        .unwrap()
+        .expect("virtual device bundle");
+    let (vrec, _) = vdev.to_bundle_for_did(ALICE).unwrap();
+    let expected_members_hash = labyrinth::mailbox::members_hash_for_devices(&[
+        phone.device_public().clone(),
+        vrec.public.clone(),
+    ])
+    .unwrap();
+
+    let dir = h.directory();
+    let latest_pub = block_on(dir.latest_two_source(ALICE)).unwrap().unwrap();
+    assert_eq!(latest_pub.seq, 1);
+    assert_eq!(latest_pub.members_hash, expected_members_hash);
+
+    let member_e1 = block_on(mb.get_epoch_member(1, &vrec.public.device_key_pub))
+        .unwrap()
+        .expect("virtual device must be an initial member of rotated epoch 1");
+    assert!(
+        member_e1.encrypted_entropy.is_some(),
+        "carried-over virtual device in epoch 1 must hold encrypted_entropy"
+    );
+
+    h.net.register_chat_device(ALICE, tpub(9));
+    let (restored, _) = block_on(Labyrinth::restore_with_passkey(
+        ALICE,
+        &prf,
+        cred_id,
+        Box::new(signer(9)),
+        h.backends(ALICE, 9),
+    ))
+    .expect("passkey restore after registration epoch rotation must succeed");
+    assert_eq!(restored.latest_epoch(), 2);
 }

@@ -195,13 +195,21 @@ impl Labyrinth {
     /// Create a recovery bundle whose code is also stored wrapped under a
     /// WebAuthn PRF output ([CB-13]), so [`Labyrinth::restore_with_passkey`]
     /// can recover without the user typing it.
+    ///
+    /// Immediately rotates the personal `OwnerMailbox` epoch (`E -> E + 1`) so
+    /// the newly registered virtual device is carried over as an initial member
+    /// committed into `EpochPublic.members_hash` across PDS `mailboxKeys` and
+    /// `mls-ds` `publishEpochHead`.
     pub async fn create_passkey_recovery(
         &mut self,
         prf_output: &[u8],
         credential_id: &[u8],
     ) -> Result<RecoverySetup> {
-        self.create_bundle(Mechanism::Passkey, Some((prf_output, credential_id)))
-            .await
+        let setup = self
+            .create_bundle(Mechanism::Passkey, Some((prf_output, credential_id)))
+            .await?;
+        self.rotate_epoch().await?;
+        Ok(setup)
     }
 
     async fn create_bundle(

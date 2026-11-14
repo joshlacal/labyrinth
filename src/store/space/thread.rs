@@ -798,6 +798,69 @@ impl SpaceThreadStore {
             .map(|(k, v)| Ok((k, decode(v)?)))
             .collect()
     }
+
+    async fn probe_mek_repo(
+        &self,
+        space: &SpaceRef,
+        did: &str,
+        rkey: &str,
+    ) -> Result<Option<Stored<MekDistribution>>> {
+        match self
+            .get_from::<MekDistribution>(space, did, nsid::MEK, rkey)
+            .await
+        {
+            Ok(Some(m)) => Ok(Some(Stored {
+                author: did.to_owned(),
+                rkey: rkey.to_owned(),
+                value: m,
+                order: None,
+            })),
+            Ok(None) | Err(Error::Malformed(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn probe_meks_bounded(
+        &self,
+        space: &SpaceRef,
+        repos: &[String],
+        rkey: &str,
+    ) -> Result<Vec<Stored<MekDistribution>>> {
+        const MEK_FALLBACK_CONCURRENCY: usize = 8;
+        if repos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results: Vec<Option<Stored<MekDistribution>>> = vec![None; repos.len()];
+        let mut next_idx = 0usize;
+        let mut in_flight = Vec::with_capacity(repos.len().min(MEK_FALLBACK_CONCURRENCY));
+        while next_idx < repos.len() && in_flight.len() < MEK_FALLBACK_CONCURRENCY {
+            let idx = next_idx;
+            next_idx += 1;
+            in_flight.push((idx, Box::pin(self.probe_mek_repo(space, &repos[idx], rkey))));
+        }
+        while !in_flight.is_empty() {
+            let (done_pos, outcome) = core::future::poll_fn(|cx| {
+                for (pos, (_, fut)) in in_flight.iter_mut().enumerate() {
+                    if let core::task::Poll::Ready(res) = fut.as_mut().poll(cx) {
+                        return core::task::Poll::Ready((pos, res));
+                    }
+                }
+                core::task::Poll::Pending
+            })
+            .await;
+            let (idx, _) = in_flight.swap_remove(done_pos);
+            results[idx] = outcome?;
+            if next_idx < repos.len() {
+                let new_idx = next_idx;
+                next_idx += 1;
+                in_flight.push((
+                    new_idx,
+                    Box::pin(self.probe_mek_repo(space, &repos[new_idx], rkey)),
+                ));
+            }
+        }
+        Ok(results.into_iter().flatten().collect())
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -826,25 +889,62 @@ impl ThreadStore for SpaceThreadStore {
         thread_id: &str,
         mek_id: &[u8; 12],
     ) -> Result<Vec<Stored<MekDistribution>>> {
+        self.find_meks_with_hint(thread_id, mek_id, None).await
+    }
+
+    fn supports_author_mek_fast_path(&self) -> bool {
+        true
+    }
+
+    async fn find_mek_from_author(
+        &self,
+        thread_id: &str,
+        author_did: &str,
+        mek_id: &[u8; 12],
+    ) -> Result<Option<Stored<MekDistribution>>> {
         let space = self.space_for(thread_id)?;
         let rkey = hex::encode(mek_id);
-        let repos = self.list_repos(&space).await?;
+        self.probe_mek_repo(&space, author_did, &rkey).await
+    }
+
+    async fn find_meks_excluding_author(
+        &self,
+        thread_id: &str,
+        excluded_author: &str,
+        mek_id: &[u8; 12],
+    ) -> Result<Vec<Stored<MekDistribution>>> {
+        let space = self.space_for(thread_id)?;
+        let rkey = hex::encode(mek_id);
+        let repos: Vec<String> = self
+            .list_repos(&space)
+            .await?
+            .into_iter()
+            .filter(|did| did.as_str() != excluded_author)
+            .collect();
+        self.probe_meks_bounded(&space, &repos, &rkey).await
+    }
+
+    async fn find_meks_with_hint(
+        &self,
+        thread_id: &str,
+        mek_id: &[u8; 12],
+        preferred_author: Option<&str>,
+    ) -> Result<Vec<Stored<MekDistribution>>> {
+        let space = self.space_for(thread_id)?;
+        let rkey = hex::encode(mek_id);
         let mut out = Vec::new();
-        for did in repos {
-            match self
-                .get_from::<MekDistribution>(&space, &did, nsid::MEK, &rkey)
-                .await
-            {
-                Ok(Some(m)) => out.push(Stored {
-                    author: did,
-                    rkey: rkey.clone(),
-                    value: m,
-                    order: None,
-                }),
-                Ok(None) | Err(Error::Malformed(_)) => {}
-                Err(e) => return Err(e),
-            }
+        if let Some(preferred) = preferred_author
+            && let Some(hit) = self.probe_mek_repo(&space, preferred, &rkey).await?
+        {
+            out.push(hit);
         }
+        let repos: Vec<String> = self
+            .list_repos(&space)
+            .await?
+            .into_iter()
+            .filter(|did| preferred_author != Some(did.as_str()))
+            .collect();
+        out.extend(self.probe_meks_bounded(&space, &repos, &rkey).await?);
         Ok(out)
     }
 

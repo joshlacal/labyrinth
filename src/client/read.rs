@@ -884,23 +884,74 @@ impl Labyrinth {
             );
             return Err(Error::NotFound("mek lookup budget exceeded for author"));
         }
-        let candidates = self.b.threads.find_meks(thread_id, mek_id).await?;
-        if candidates.is_empty() {
-            missing_meks.insert(*mek_id);
-        }
         let mut err = Error::NotFound("mek");
-        for c in candidates {
-            let at = VouchAt::of(c.order, claim_ms);
-            match self.open_mek_record(thread_id, &c, at).await {
-                Ok(m) => {
-                    self.meks
-                        .entry(thread_id.to_owned())
-                        .or_default()
-                        .push(m.clone());
-                    self.checkpoint_state()?;
-                    return Ok(m);
+        if self.b.threads.supports_author_mek_fast_path() {
+            let mut author_candidate_seen = false;
+            if let Some(c) = self
+                .b
+                .threads
+                .find_mek_from_author(thread_id, author, mek_id)
+                .await?
+            {
+                author_candidate_seen = true;
+                let at = VouchAt::of(c.order, claim_ms);
+                match self.open_mek_record(thread_id, &c, at).await {
+                    Ok(m) => {
+                        self.meks
+                            .entry(thread_id.to_owned())
+                            .or_default()
+                            .push(m.clone());
+                        self.checkpoint_state()?;
+                        return Ok(m);
+                    }
+                    Err(e) => err = e,
                 }
-                Err(e) => err = e,
+            }
+            let candidates = self
+                .b
+                .threads
+                .find_meks_excluding_author(thread_id, author, mek_id)
+                .await?;
+            let other_candidate_seen = !candidates.is_empty();
+            for c in candidates {
+                let at = VouchAt::of(c.order, claim_ms);
+                match self.open_mek_record(thread_id, &c, at).await {
+                    Ok(m) => {
+                        self.meks
+                            .entry(thread_id.to_owned())
+                            .or_default()
+                            .push(m.clone());
+                        self.checkpoint_state()?;
+                        return Ok(m);
+                    }
+                    Err(e) => err = e,
+                }
+            }
+            if !author_candidate_seen && !other_candidate_seen {
+                missing_meks.insert(*mek_id);
+            }
+        } else {
+            let candidates = self
+                .b
+                .threads
+                .find_meks_with_hint(thread_id, mek_id, Some(author))
+                .await?;
+            if candidates.is_empty() {
+                missing_meks.insert(*mek_id);
+            }
+            for c in candidates {
+                let at = VouchAt::of(c.order, claim_ms);
+                match self.open_mek_record(thread_id, &c, at).await {
+                    Ok(m) => {
+                        self.meks
+                            .entry(thread_id.to_owned())
+                            .or_default()
+                            .push(m.clone());
+                        self.checkpoint_state()?;
+                        return Ok(m);
+                    }
+                    Err(e) => err = e,
+                }
             }
         }
         let misses = author_mek_misses.entry(author.to_owned()).or_insert(0);

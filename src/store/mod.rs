@@ -465,6 +465,63 @@ pub trait ThreadStore: MaybeSend + MaybeSync {
         mek_id: &[u8; 12],
     ) -> Result<Vec<Stored<MekDistribution>>>;
 
+    /// Whether this store supports probing a single writer repository via
+    /// [`Self::find_mek_from_author`] + [`Self::find_meks_excluding_author`]
+    /// without invoking [`Self::find_meks`] twice on a miss.
+    fn supports_author_mek_fast_path(&self) -> bool {
+        false
+    }
+
+    /// Probe a single writer's repository (`author_did`) directly for `mek_id`
+    /// (`rkey = hex(mek_id)`) without enumerating `listWriters` across the Space.
+    async fn find_mek_from_author(
+        &self,
+        thread_id: &str,
+        author_did: &str,
+        mek_id: &[u8; 12],
+    ) -> Result<Option<Stored<MekDistribution>>> {
+        Ok(self
+            .find_meks_with_hint(thread_id, mek_id, Some(author_did))
+            .await?
+            .into_iter()
+            .find(|s| s.author == author_did))
+    }
+
+    /// Every MEK record in the thread with this id from writers other than
+    /// `excluded_author`.
+    async fn find_meks_excluding_author(
+        &self,
+        thread_id: &str,
+        excluded_author: &str,
+        mek_id: &[u8; 12],
+    ) -> Result<Vec<Stored<MekDistribution>>> {
+        Ok(self
+            .find_meks(thread_id, mek_id)
+            .await?
+            .into_iter()
+            .filter(|s| s.author != excluded_author)
+            .collect())
+    }
+
+    /// Every MEK record in the thread with this id across repos, probing
+    /// `preferred_author` first when provided.
+    async fn find_meks_with_hint(
+        &self,
+        thread_id: &str,
+        mek_id: &[u8; 12],
+        preferred_author: Option<&str>,
+    ) -> Result<Vec<Stored<MekDistribution>>> {
+        let mut meks = self.find_meks(thread_id, mek_id).await?;
+        if let Some(preferred) = preferred_author
+            && let Some(pos) = meks.iter().position(|s| s.author == preferred)
+            && pos > 0
+        {
+            let first = meks.remove(pos);
+            meks.insert(0, first);
+        }
+        Ok(meks)
+    }
+
     /// Appends a sender batch (`<16-hex-first-seq>-<tid>` when sequenced, else `<tid>`).
     async fn append_batch(&self, batch: &Batch) -> Result<String>;
     /// Batches of `thread_id` (from `sender` only, if given) holding at least

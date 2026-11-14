@@ -136,6 +136,53 @@ impl ThreadStore for MemoryThreads {
         })
     }
 
+    fn supports_author_mek_fast_path(&self) -> bool {
+        true
+    }
+
+    async fn find_mek_from_author(
+        &self,
+        thread_id: &str,
+        author_did: &str,
+        mek_id: &[u8; 12],
+    ) -> Result<Option<Stored<MekDistribution>>> {
+        let rkey = hex::encode(mek_id);
+        self.space(thread_id, |t| {
+            Ok(t.repos
+                .get(author_did)
+                .and_then(|r| r.meks.get(&rkey))
+                .map(|(m, order)| Stored {
+                    author: author_did.to_owned(),
+                    rkey,
+                    value: m.clone(),
+                    order: *order,
+                }))
+        })
+    }
+
+    async fn find_meks_excluding_author(
+        &self,
+        thread_id: &str,
+        excluded_author: &str,
+        mek_id: &[u8; 12],
+    ) -> Result<Vec<Stored<MekDistribution>>> {
+        let rkey = hex::encode(mek_id);
+        self.space(thread_id, |t| {
+            Ok(t.repos
+                .iter()
+                .filter(|(did, _)| did.as_str() != excluded_author)
+                .filter_map(|(did, r)| {
+                    r.meks.get(&rkey).map(|(m, order)| Stored {
+                        author: did.clone(),
+                        rkey: rkey.clone(),
+                        value: m.clone(),
+                        order: *order,
+                    })
+                })
+                .collect())
+        })
+    }
+
     async fn append_batch(&self, batch: &Batch) -> Result<String> {
         let mut s = self.backend.lock();
         if s.threads
