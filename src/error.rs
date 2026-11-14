@@ -66,6 +66,12 @@ pub enum Error {
     /// served intact. Rotation aborts rather than silently evicting it.
     #[error("a member this device verified in epoch {seq} no longer verifies")]
     MemberTampered { seq: u64 },
+    /// Epoch `seq` was written to the mailbox store, but anchoring its head in
+    /// the public directory failed. The client keeps `pending_directory_publication`
+    /// set so the caller can retry [`crate::client::Labyrinth::publish_latest_keys`]
+    /// or reconcile a lost race via [`crate::client::Labyrinth::recover_unanchored_fork`].
+    #[error("epoch {seq} was written to mailbox store but directory publication failed: {reason}")]
+    EpochUnanchored { seq: u64, reason: String },
     /// The backend does not provide this operation (yet), e.g. an mls-ds
     /// endpoint whose lexicon is not wired into the XRPC stores.
     #[error("operation not supported by this backend: {0}")]

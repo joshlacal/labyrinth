@@ -184,6 +184,14 @@ impl MailboxStore for BundleView {
     async fn set_device_revoked(&self, k: &XVerifyingKey, at: &str) -> labyrinth::Result<()> {
         self.inner.set_device_revoked(k, at).await
     }
+    async fn set_device_revocation(
+        &self,
+        k: &XVerifyingKey,
+        at: &str,
+        rev: &labyrinth::records::DeviceRevocationDef,
+    ) -> labyrinth::Result<()> {
+        self.inner.set_device_revocation(k, at, rev).await
+    }
     async fn get_device(&self, k: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
         self.inner.get_device(k).await
     }
@@ -231,6 +239,11 @@ impl MailboxStore for BundleView {
     async fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
         Ok(self.bundles.clone())
     }
+    async fn list_virtual_device_records(
+        &self,
+    ) -> labyrinth::Result<Vec<labyrinth::Result<VirtualDevice>>> {
+        Ok(self.bundles.iter().cloned().map(Ok).collect())
+    }
     async fn put_otc_session(&self, s: &OtcSession) -> labyrinth::Result<()> {
         self.inner.put_otc_session(s).await
     }
@@ -269,6 +282,14 @@ impl MailboxStore for Truncating {
     }
     async fn set_device_revoked(&self, k: &XVerifyingKey, at: &str) -> labyrinth::Result<()> {
         self.inner.set_device_revoked(k, at).await
+    }
+    async fn set_device_revocation(
+        &self,
+        k: &XVerifyingKey,
+        at: &str,
+        rev: &labyrinth::records::DeviceRevocationDef,
+    ) -> labyrinth::Result<()> {
+        self.inner.set_device_revocation(k, at, rev).await
     }
     async fn get_device(&self, k: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
         self.inner.get_device(k).await
@@ -329,6 +350,14 @@ impl MailboxStore for Truncating {
     }
     async fn touch_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<()> {
         self.inner.touch_virtual_device(id).await
+    }
+    async fn delete_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<()> {
+        self.inner.delete_virtual_device(id).await
+    }
+    async fn list_virtual_device_records(
+        &self,
+    ) -> labyrinth::Result<Vec<labyrinth::Result<VirtualDevice>>> {
+        self.inner.list_virtual_device_records().await
     }
 }
 
@@ -414,11 +443,24 @@ fn full_lifecycle() {
     let before = ["a1", "b1", "c1", "a2", "b2"];
     assert_eq!(got(&read(&mut carol)), w.expected(&before));
 
-    // Alice's phone is lost: the laptop revokes it and rotates (1 -> 2).
+    // Alice's phone is lost: the laptop revokes it and rotates (1 -> 2),
+    // atomically invalidating pre-revocation recovery methods and issuing a replacement.
     w.net.remove_chat_device(ALICE, transport_pub(1), w.ts + 1);
     let phone_key = phone.device_public().device_key_pub;
     let rot = block_on(laptop.revoke_device(&phone_key)).unwrap();
     assert_eq!(rot.new_epoch, 2);
+    let replacement = rot
+        .rekeyed_recovery
+        .expect("physical revocation re-keys recovery methods");
+    assert!(matches!(
+        block_on(Labyrinth::restore_with_recovery_code(
+            ALICE,
+            &code,
+            w.chat_device(ALICE, 9),
+            w.backends(ALICE),
+        )),
+        Err(Error::BadRecoveryCode)
+    ));
     assert_eq!(
         block_on(phone.sync_epochs()).unwrap_err(),
         Error::NotEpochMember
@@ -451,11 +493,11 @@ fn full_lifecycle() {
     .unwrap();
     assert_eq!(tablet.latest_epoch(), 3);
 
-    // A NEW Alice device restores from the recovery code with one typo,
+    // A NEW Alice device restores from the replacement recovery code with one typo,
     // opens epoch 4 (Gate 3), and reads the whole thread before and after revocation.
     let (mut alice, _) = block_on(Labyrinth::restore_with_recovery_code(
         ALICE,
-        &one_typo(&code),
+        &one_typo(replacement.code.as_str()),
         w.chat_device(ALICE, 5),
         w.backends(ALICE),
     ))
@@ -522,18 +564,18 @@ fn full_lifecycle() {
     .unwrap();
     assert_eq!(ids(&h), ["d1"]);
 
-    // A backend that hides epochs > 1 from a restoring device (bundle minted in epoch 1) is detected.
+    // A backend that hides epochs > 2 from a restoring device (bundle minted in epoch 2) is detected.
     let truncated = w.with_stores(
         ALICE,
         Box::new(Truncating {
             inner: w.net.mailbox(ALICE),
-            max_seq: 1,
+            max_seq: 2,
         }),
         Box::new(w.net.directory()),
     );
     let err = block_on(Labyrinth::restore_with_recovery_code(
         ALICE,
-        &code,
+        replacement.code.as_str(),
         w.chat_device(ALICE, 7),
         truncated,
     ))
@@ -542,7 +584,7 @@ fn full_lifecycle() {
         err,
         Error::EpochTruncated {
             published: 4,
-            reached: 1
+            reached: 2
         }
     );
 }

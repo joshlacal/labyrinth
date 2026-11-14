@@ -69,6 +69,8 @@ pub fn open_genesis(
         encrypted_prev_seq: None,
         encrypted_prev_root: None,
         opened_by: me.public().device_key_pub,
+        revocations: Vec::new(),
+        revocations_sig: None,
     };
     Ok((epoch, NewEpoch { record, members }))
 }
@@ -84,6 +86,31 @@ pub fn open_next(
     me: &DeviceSecrets,
     transport: &dyn TransportSigner,
 ) -> Result<(PendingEpoch, NewEpoch)> {
+    open_next_with_additions(
+        did,
+        prev,
+        prev_public,
+        prev_members,
+        continuing,
+        &[],
+        me,
+        transport,
+    )
+}
+
+/// Open the epoch after `prev`, carrying `continuing` members from `prev` and
+/// atomically admitting `added_virtual` recovery devices into `E+1`.
+#[allow(clippy::too_many_arguments)]
+pub fn open_next_with_additions(
+    did: &str,
+    prev: &EpochSecret,
+    prev_public: &EpochPublic,
+    prev_members: &[EpochMemberRecord],
+    continuing: &[DevicePublic],
+    added_virtual: &[DevicePublic],
+    me: &DeviceSecrets,
+    transport: &dyn TransportSigner,
+) -> Result<(PendingEpoch, NewEpoch)> {
     let auth = require_physical(me)?;
     verify_public(prev, prev_public)?;
     let seq = prev
@@ -91,7 +118,8 @@ pub fn open_next(
         .checked_add(1)
         .ok_or(Error::Malformed("epoch sequence overflow"))?;
 
-    let mut recipients: Vec<DevicePublic> = Vec::with_capacity(continuing.len() + 1);
+    let mut recipients: Vec<DevicePublic> =
+        Vec::with_capacity(continuing.len() + added_virtual.len() + 1);
     for d in continuing.iter().chain(core::iter::once(me.public())) {
         if !recipients
             .iter()
@@ -107,6 +135,19 @@ pub fn open_next(
             .ok_or(Error::NotEpochMember)?;
         verify_member(prev, rec, d.is_virtual)?;
         d.verify()?;
+    }
+    for v in added_virtual {
+        if !v.is_virtual {
+            return Err(Error::DeviceTampered);
+        }
+        v.verify()?;
+        if recipients
+            .iter()
+            .any(|r| r.device_key_pub == v.device_key_pub)
+        {
+            return Err(Error::Conflict);
+        }
+        recipients.push(v.clone());
     }
 
     let mut entropy = Zeroizing::new([0u8; 32]);
@@ -135,6 +176,8 @@ pub fn open_next(
         )?),
         encrypted_prev_root: Some(aead::seal(&data_key, METADATA_AAD, prev.root())?),
         opened_by: me.public().device_key_pub,
+        revocations: Vec::new(),
+        revocations_sig: None,
     };
 
     let auth_pub = auth.public();
@@ -229,6 +272,8 @@ pub fn open_next_enrolling(
         )?),
         encrypted_prev_root: Some(aead::seal(&data_key, METADATA_AAD, prev.root())?),
         opened_by: new_device.public().device_key_pub,
+        revocations: Vec::new(),
+        revocations_sig: None,
     };
 
     let auth_pub = auth.public();

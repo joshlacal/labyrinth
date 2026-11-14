@@ -12,8 +12,15 @@ use crate::message::{
     open_sender_committed, verify_sender_device,
 };
 use crate::records::{Batch, BatchEntry, MekDistribution, OwnerBatch};
-use crate::store::{ServerOrder, Stored, TimeRange, VouchAt, keys_valid_for};
+use crate::store::{
+    AuthorQuarantine, QuarantineReason, ServerOrder, Stored, TimeRange, VouchAt, keys_valid_for,
+    push_quarantine,
+};
 use crate::{Error, Result};
+
+/// Maximum uncached `find_meks` misses tolerated from one batch author in a
+/// single `load_thread` pass before quarantining further misses from that author.
+const MAX_UNCACHED_MEK_MISSES_PER_AUTHOR: usize = 16;
 
 /// Where a loaded message came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +113,10 @@ pub struct ThreadHistory {
     pub deleted_for_me: Vec<String>,
     /// Witness copies that contradict an accepted copy (ruling 3).
     pub rejected: Vec<RejectedCopy>,
+    /// Authors whose malformed records, unverifiable redactions, non-member
+    /// batches, out-of-range timestamps, or excessive MEK misses were isolated
+    /// during this read without aborting sibling authors' history.
+    pub quarantined: Vec<AuthorQuarantine>,
     /// False if the conversation space refused reads ([`Error::Forbidden`]);
     /// only owner-archived messages are then included.
     pub space_readable: bool,
@@ -204,11 +215,11 @@ impl Labyrinth {
             space_readable: true,
             ..ThreadHistory::default()
         };
-        let batches = self.readable(
+        let batches = self.readable_quarantined(
             &mut h,
             self.b
                 .threads
-                .list_batches(thread_id, None, TimeRange::ALL)
+                .list_batches_quarantined(thread_id, None, TimeRange::ALL)
                 .await,
         )?;
         let owner = self
@@ -249,6 +260,7 @@ impl Labyrinth {
 
     /// A sender-batch listing; `Forbidden` (removed from a Space) degrades
     /// to the owner archive and clears `h.space_readable`.
+    #[allow(dead_code)]
     pub(super) fn readable(
         &self,
         h: &mut ThreadHistory,
@@ -264,41 +276,104 @@ impl Labyrinth {
         }
     }
 
+    /// Per-author quarantine-aware variant of [`readable`](Self::readable).
+    pub(super) fn readable_quarantined(
+        &self,
+        h: &mut ThreadHistory,
+        r: Result<(Vec<Stored<Batch>>, Vec<AuthorQuarantine>)>,
+    ) -> Result<Vec<Stored<Batch>>> {
+        match r {
+            Ok((b, quarantined)) => {
+                for q in quarantined {
+                    push_quarantine(&mut h.quarantined, q.author, q.reason, q.detail);
+                }
+                Ok(b)
+            }
+            Err(Error::Forbidden) => {
+                h.space_readable = false;
+                Ok(Vec::new())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Opens every item of `batches` that `keep(messageId, timestamp)`
     /// selects into `h`, in server admission order, so witness copies reach
-    /// [`finish`] earliest-admitted first. An unverifiable redaction fails
-    /// the read with [`Error::BadSignature`] when `strict`; otherwise it is
-    /// skipped.
+    /// [`finish`] earliest-admitted first. Malformed batches, unverifiable
+    /// redactions, non-participant authors, out-of-range timestamps, and
+    /// excessive MEK misses are isolated per author in `h.quarantined`.
     pub(super) async fn open_batches(
         &mut self,
         thread_id: &str,
         mut batches: Vec<Stored<Batch>>,
         keep: Keep<'_>,
         h: &mut ThreadHistory,
-        strict: bool,
+        _strict: bool,
         receipts_required: bool,
     ) -> Result<()> {
         batches.sort_by_key(|b| b.order.map(|o| o.labyrinth_seq));
         let mut roster_membership = HashMap::new();
+        let mut leaves_tracked = false;
+        if !batches.is_empty() {
+            match self
+                .b
+                .directory
+                .member_device_keys(thread_id, &self.did)
+                .await?
+            {
+                Some(own_leaves) => {
+                    leaves_tracked = true;
+                    roster_membership.insert(self.did.clone(), !own_leaves.is_empty());
+                }
+                None if receipts_required => {
+                    return Err(Error::DirectoryIncomplete {
+                        pds_present: true,
+                        ds_present: false,
+                    });
+                }
+                None => {}
+            }
+        }
+        let mut missing_meks: HashSet<[u8; 12]> = HashSet::new();
+        let mut author_mek_misses: HashMap<String, usize> = HashMap::new();
         for b in batches {
-            if receipts_required {
+            if leaves_tracked {
                 let is_member = if let Some(is_member) = roster_membership.get(&b.author) {
                     *is_member
                 } else {
-                    let leaves = self
+                    let is_member = self
                         .b
                         .directory
                         .member_device_keys(thread_id, &b.author)
                         .await?
-                        .ok_or(Error::DirectoryIncomplete {
-                            pds_present: true,
-                            ds_present: false,
-                        })?;
-                    let is_member = !leaves.is_empty();
+                        .is_some_and(|leaves| !leaves.is_empty());
                     roster_membership.insert(b.author.clone(), is_member);
                     is_member
                 };
                 if !is_member {
+                    push_quarantine(
+                        &mut h.quarantined,
+                        b.author.clone(),
+                        QuarantineReason::NonParticipant,
+                        "batch author is not a conversation participant",
+                    );
+                    if !receipts_required
+                        && b.value.thread_id == thread_id
+                        && let Ok(items) = b.value.entries()
+                    {
+                        for entry in items {
+                            if let BatchEntry::Sealed(s) = entry
+                                && keep(&s.message_id, s.timestamp)
+                            {
+                                h.undecryptable.push(Undecryptable {
+                                    message_id: s.message_id,
+                                    timestamp: s.timestamp,
+                                    sender: Some(b.author.clone()),
+                                    error: Error::BadPublicKey,
+                                });
+                            }
+                        }
+                    }
                     continue;
                 }
             }
@@ -311,6 +386,12 @@ impl Labyrinth {
             let items = match items {
                 Ok(items) => items,
                 Err(error) => {
+                    push_quarantine(
+                        &mut h.quarantined,
+                        b.author.clone(),
+                        QuarantineReason::MalformedRecord,
+                        error.to_string(),
+                    );
                     h.undecryptable.push(Undecryptable {
                         message_id: format!("batch:{}", b.rkey),
                         timestamp: 0,
@@ -340,15 +421,50 @@ impl Labyrinth {
                                 timestamp,
                                 sender: b.author.clone(),
                             });
-                        } else if strict {
-                            return Err(Error::BadSignature);
+                        } else {
+                            push_quarantine(
+                                &mut h.quarantined,
+                                b.author.clone(),
+                                QuarantineReason::InvalidRedaction,
+                                format!("unverifiable redaction on {message_id}"),
+                            );
+                            h.undecryptable.push(Undecryptable {
+                                message_id,
+                                timestamp,
+                                sender: author.clone(),
+                                error: Error::BadSignature,
+                            });
                         }
                         continue;
                     }
                 };
+                if s.timestamp > i64::MAX as u64 {
+                    push_quarantine(
+                        &mut h.quarantined,
+                        b.author.clone(),
+                        QuarantineReason::TimestampOutOfRange,
+                        format!("timestamp {} exceeds i64::MAX", s.timestamp),
+                    );
+                    h.undecryptable.push(Undecryptable {
+                        message_id: s.message_id.clone(),
+                        timestamp: s.timestamp,
+                        sender: author.clone(),
+                        error: Error::Malformed("timestamp exceeds i64::MAX"),
+                    });
+                    continue;
+                }
                 let at = VouchAt::of(b.order, s.timestamp);
                 match self
-                    .open_sealed_inner(thread_id, &b.author, &s, at, receipts_required)
+                    .open_sealed_bounded(
+                        thread_id,
+                        &b.author,
+                        &s,
+                        at,
+                        receipts_required,
+                        &mut missing_meks,
+                        &mut author_mek_misses,
+                        &mut h.quarantined,
+                    )
                     .await
                 {
                     Ok(opened) => {
@@ -447,6 +563,17 @@ impl Labyrinth {
                     continue;
                 }
                 let selected = keep(&m.message_id, m.timestamp);
+                if m.timestamp > i64::MAX as u64 {
+                    if selected {
+                        h.undecryptable.push(Undecryptable {
+                            message_id: m.message_id,
+                            timestamp: m.timestamp,
+                            sender: None,
+                            error: Error::Malformed("timestamp exceeds i64::MAX"),
+                        });
+                    }
+                    continue;
+                }
                 let opened = match self.epoch_secret(m.epoch_seq).await {
                     Ok(e) => open_owner_content(e.root(), &m),
                     Err(err) => Err(err),
@@ -563,6 +690,7 @@ impl Labyrinth {
     /// that member's message and archived it. Every check is unchanged (the
     /// sealing key must still be one of `author`'s chat devices at the
     /// receipt's order); the result names the receipt's sender.
+    #[allow(dead_code)]
     pub(super) async fn open_sealed_inner(
         &mut self,
         thread_id: &str,
@@ -570,6 +698,34 @@ impl Labyrinth {
         s: &SealedMessage,
         at: VouchAt,
         receipts_required: bool,
+    ) -> Result<OpenedSealed> {
+        let mut missing_meks = HashSet::new();
+        let mut author_mek_misses = HashMap::new();
+        let mut quarantined = Vec::new();
+        self.open_sealed_bounded(
+            thread_id,
+            author,
+            s,
+            at,
+            receipts_required,
+            &mut missing_meks,
+            &mut author_mek_misses,
+            &mut quarantined,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_sealed_bounded(
+        &mut self,
+        thread_id: &str,
+        author: &str,
+        s: &SealedMessage,
+        at: VouchAt,
+        receipts_required: bool,
+        missing_meks: &mut HashSet<[u8; 12]>,
+        author_mek_misses: &mut HashMap<String, usize>,
+        quarantined: &mut Vec<AuthorQuarantine>,
     ) -> Result<OpenedSealed> {
         if let Some(archived) = &s.sequencer_receipt {
             self.verify_and_remember_receipt(thread_id, &archived.signed)
@@ -594,7 +750,17 @@ impl Labyrinth {
             });
             let author_keys = self.b.directory.device_transport_keys(author).await?;
             verify_sender_device(s, &keys_valid_for(&author_keys, Some(&leaves), receipt_at))?;
-            let mek = self.mek_for(thread_id, &s.mek_id, issued_ms).await?;
+            let mek = self
+                .mek_for_bounded(
+                    thread_id,
+                    author,
+                    &s.mek_id,
+                    issued_ms,
+                    missing_meks,
+                    author_mek_misses,
+                    quarantined,
+                )
+                .await?;
             let (frame_nonce, frame) = open_sender_committed(s, thread_id, &mek)?;
             labyrinth_protocol::verify_archived_item_commitment(
                 &archived.signed,
@@ -621,7 +787,17 @@ impl Labyrinth {
         }
 
         verify_sender_device(s, &self.transport_keys(author, Some(thread_id), at).await?)?;
-        let mek = self.mek_for(thread_id, &s.mek_id, s.timestamp).await?;
+        let mek = self
+            .mek_for_bounded(
+                thread_id,
+                author,
+                &s.mek_id,
+                s.timestamp,
+                missing_meks,
+                author_mek_misses,
+                quarantined,
+            )
+            .await?;
         open_sender(s, thread_id, &mek).map(OpenedSealed::Plain)
     }
 
@@ -672,7 +848,17 @@ impl Labyrinth {
         Ok(sender_did.to_owned())
     }
 
-    async fn mek_for(&mut self, thread_id: &str, mek_id: &[u8; 12], claim_ms: u64) -> Result<Mek> {
+    #[allow(clippy::too_many_arguments)]
+    async fn mek_for_bounded(
+        &mut self,
+        thread_id: &str,
+        author: &str,
+        mek_id: &[u8; 12],
+        claim_ms: u64,
+        missing_meks: &mut HashSet<[u8; 12]>,
+        author_mek_misses: &mut HashMap<String, usize>,
+        quarantined: &mut Vec<AuthorQuarantine>,
+    ) -> Result<Mek> {
         if let Some(m) = self
             .meks
             .get(thread_id)
@@ -680,8 +866,25 @@ impl Labyrinth {
         {
             return Ok(m.clone());
         }
+        if missing_meks.contains(mek_id) {
+            return Err(Error::NotFound("mek"));
+        }
+        let prior_misses = author_mek_misses.get(author).copied().unwrap_or(0);
+        if prior_misses >= MAX_UNCACHED_MEK_MISSES_PER_AUTHOR {
+            push_quarantine(
+                quarantined,
+                author.to_owned(),
+                QuarantineReason::ExcessiveMekMisses,
+                format!("exceeded {MAX_UNCACHED_MEK_MISSES_PER_AUTHOR} uncached MEK lookups"),
+            );
+            return Err(Error::NotFound("mek lookup budget exceeded for author"));
+        }
+        let candidates = self.b.threads.find_meks(thread_id, mek_id).await?;
+        if candidates.is_empty() {
+            missing_meks.insert(*mek_id);
+        }
         let mut err = Error::NotFound("mek");
-        for c in self.b.threads.find_meks(thread_id, mek_id).await? {
+        for c in candidates {
             let at = VouchAt::of(c.order, claim_ms);
             match self.open_mek_record(thread_id, &c, at).await {
                 Ok(m) => {
@@ -694,6 +897,16 @@ impl Labyrinth {
                 }
                 Err(e) => err = e,
             }
+        }
+        let misses = author_mek_misses.entry(author.to_owned()).or_insert(0);
+        *misses = misses.saturating_add(1);
+        if *misses >= MAX_UNCACHED_MEK_MISSES_PER_AUTHOR {
+            push_quarantine(
+                quarantined,
+                author.to_owned(),
+                QuarantineReason::ExcessiveMekMisses,
+                format!("exceeded {MAX_UNCACHED_MEK_MISSES_PER_AUTHOR} uncached MEK lookups"),
+            );
         }
         Err(err)
     }
@@ -799,6 +1012,7 @@ pub(super) fn finish(h: &mut ThreadHistory, tombstones: &[Tombstone]) {
         .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
     h.rejected
         .sort_by(|a, b| (a.timestamp, &a.message_id).cmp(&(b.timestamp, &b.message_id)));
+    h.quarantined.sort_by(|a, b| a.author.cmp(&b.author));
 }
 
 fn committed(m: &LoadedMessage) -> bool {

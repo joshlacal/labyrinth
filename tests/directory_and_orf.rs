@@ -132,11 +132,33 @@ fn composite_directory_detects_truncation_by_the_mailbox_host() {
     ))
     .unwrap();
     let e0_pub = phone.latest_public().unwrap();
-    let code = block_on(phone.create_recovery_code(Mechanism::Code))
+    let setup = block_on(phone.create_recovery_code(Mechanism::Code)).unwrap();
+    let code = setup.code.as_str().to_owned();
+    let e0_vdev_rkey = hex::encode(setup.vdevice_id);
+    let e0_vdev = space_host
+        .record(
+            &space,
+            A,
+            labyrinth::records::nsid::VIRTUAL_DEVICE,
+            &e0_vdev_rkey,
+        )
+        .unwrap();
+    let e0_vdev_pub = serde_json::from_value::<labyrinth::records::VirtualDevice>(e0_vdev.clone())
         .unwrap()
-        .code
-        .as_str()
-        .to_owned();
+        .to_bundle_for_did(A)
+        .unwrap()
+        .0
+        .public
+        .device_key_pub;
+    let e0_vdev_device_rkey = hex::encode(e0_vdev_pub.0);
+    let e0_vdev_device = space_host
+        .record(
+            &space,
+            A,
+            labyrinth::records::nsid::DEVICE,
+            &e0_vdev_device_rkey,
+        )
+        .unwrap();
 
     // Enroll laptop (opens epoch 1) and revoke phone (opens epoch 2).
     let mut r = phone.otc_offer().unwrap();
@@ -172,10 +194,25 @@ fn composite_directory_detects_truncation_by_the_mailbox_host() {
     );
 
     // Malicious PDS rolls back the mailbox Space and its `mailboxKeys` view to epoch 0,
-    // hiding epochs 1 and 2 while `mls-ds` retains epoch 2.
+    // hiding epochs 1 and 2 (and restoring the epoch-0 virtual device snapshot) while
+    // `mls-ds` retains epoch 2.
     for rkey in ["000000000001", "000000000002"] {
         let _ = space_host.remove(&space, A, labyrinth::records::nsid::EPOCH, rkey);
     }
+    space_host.tamper(
+        &space,
+        A,
+        labyrinth::records::nsid::VIRTUAL_DEVICE,
+        &e0_vdev_rkey,
+        e0_vdev,
+    );
+    space_host.tamper(
+        &space,
+        A,
+        labyrinth::records::nsid::DEVICE,
+        &e0_vdev_device_rkey,
+        e0_vdev_device,
+    );
     // Build a truncated PDS directory view serving only `e0_pub`.
     let truncated_pds = || FixedForDid {
         did: A,

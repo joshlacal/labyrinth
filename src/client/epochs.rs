@@ -1,21 +1,32 @@
 //! Mailbox lifecycle: genesis, forward/backward chaining, revocation and
 //! the epoch-integrity check (SPEC §5, §10).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::members::{Audit, ExcludedMember, ExclusionReason};
+use super::enroll::RecoverySetup;
+use super::members::{Audit, ExcludedMember, ExclusionReason, verify_epoch_members_hash};
 use super::{Backends, Labyrinth};
-use crate::device::{ChatBinding, DevicePublic, DeviceSecrets};
+use crate::device::{ChatBinding, DevicePublic, DeviceRevocation, DeviceSecrets};
 use crate::epoch::{
     EpochMemberRecord, EpochRecord, EpochSecret, OpenedEpoch, backward_chain, forward_chain,
-    open_genesis, open_next, verify_member, verify_public,
+    open_genesis, open_next_with_additions, verify_member, verify_public,
 };
 use crate::hpke::hawk::HawkEncSecret;
 use crate::mailbox::EpochPublic;
-use crate::records::{Device, Epoch, EpochMember, MailboxKeysRecord};
+use crate::records::{Device, Epoch, EpochMember, MailboxKeysRecord, VirtualDevice};
+use crate::recovery_code::RecoveryCode;
 use crate::sign::{TransportSigner, XVerifyingKey};
 use crate::store::{MailboxDirectory, MailboxStore};
+use crate::virtual_device::{self, Mechanism};
 use crate::{Error, Result};
+
+/// A recovery method invalidated and rotated out when revoking a physical device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidatedRecoveryMethod {
+    pub vdevice_id: [u8; 16],
+    pub mechanism: Mechanism,
+    pub device_key: XVerifyingKey,
+}
 
 /// Result of [`Labyrinth::sync_epochs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,11 +53,20 @@ pub struct RotationReport {
     pub new_epoch: u64,
     /// The revoked device; `None` for an ordinary rotation.
     pub revoked: Option<XVerifyingKey>,
+    /// Other revoked members evicted in this rotation (pending revocations,
+    /// signed store revocations, or invalidated virtual recovery devices).
+    pub evicted_revoked: Vec<XVerifyingKey>,
     /// Members of the previous epoch the rotation dropped because they
     /// failed verification, are not bound to a current chat device
     /// ([CB-25] as amended, [CB-36]), or are recovery bundles past their
     /// TTL ([CB-39]). Never silent: show these.
     pub excluded: Vec<ExcludedMember>,
+    /// Recovery methods invalidated and excluded because a physical device
+    /// was revoked.
+    pub invalidated_recovery_methods: Vec<InvalidatedRecoveryMethod>,
+    /// Fresh recovery code minted in `new_epoch` when one or more active
+    /// recovery methods were invalidated by a physical device revocation.
+    pub rekeyed_recovery: Option<RecoverySetup>,
 }
 
 /// How many times a rotation retries after losing the create race.
@@ -150,6 +170,8 @@ pub(super) async fn verified_own_signatures(
         }
     };
     record.public.verify(did, prev.as_ref())?;
+    record.verify_revocations(did)?;
+    verify_epoch_members_hash(mb, secret, &record.public).await?;
     Ok(record.public)
 }
 
@@ -221,6 +243,9 @@ async fn step_forward(
         return Ok(squat(
             "it is not signed by the previous epoch's mailbox key",
         ));
+    }
+    if record.verify_revocations(did).is_err() {
+        return Ok(squat("its revocation list signature is invalid"));
     }
     let opener_raw = match mb.get_device(&record.opened_by).await {
         Ok(opt) => opt,
@@ -339,6 +364,9 @@ async fn is_epoch_header_or_opener_invalid(
         return Ok(Some(true));
     };
     if record.public.verify(did, Some(prev_public)).is_err() {
+        return Ok(Some(true));
+    }
+    if record.verify_revocations(did).is_err() {
         return Ok(Some(true));
     }
     let opener_raw = match mb.get_device(&record.opened_by).await {
@@ -684,7 +712,8 @@ impl Labyrinth {
     /// Re-audit the cached latest epoch and include invalid/omitted rows for
     /// keys this client already knows were members.
     async fn ensure_latest_revocation_safe(&self) -> Result<()> {
-        if self.revoked.is_empty() {
+        let all_revoked = self.all_revoked_keys();
+        if all_revoked.is_empty() {
             return Ok(());
         }
         let epoch = self
@@ -700,9 +729,9 @@ impl Labyrinth {
                     .iter()
                     .filter_map(|member| member.device_key.map(|key| key.0)),
             )
-            .any(|key| self.revoked.contains(&key));
+            .any(|key| all_revoked.contains(&key));
         let omitted_verified_revoked = self.verified.0 == epoch.seq
-            && self.verified.1.iter().any(|key| self.revoked.contains(key));
+            && self.verified.1.iter().any(|key| all_revoked.contains(key));
         if served_revoked || omitted_verified_revoked {
             return Err(Error::EpochSquatted {
                 seq: epoch.seq,
@@ -718,20 +747,32 @@ impl Labyrinth {
     ///
     /// [`Error::NotEpochMember`] means this device has been revoked.
     pub async fn sync_epochs(&mut self) -> Result<SyncReport> {
+        self.flush_cache.clear();
         // Publication failure is separately durable; callers with a status
         // surface retry it explicitly, while core sync may still reach a
         // safely verifiable mailbox chain.
         let _ = self.retry_pending_directory_publication().await;
-        self.sync_epochs_allowing(&BTreeSet::new()).await
+        let opener_revoked = self.all_revoked_keys();
+        self.sync_epochs_inner(&BTreeMap::new(), &opener_revoked)
+            .await
     }
 
-    /// Sync while permitting `pending_revocations` to remain members of the
-    /// reached chain. This is used only between the local decision to revoke
-    /// a target and the rotation that removes it; no ordinary operation gets
-    /// access to an epoch containing a previously revoked device.
-    async fn sync_epochs_allowing(
+    /// Sync for archiving and roster resolution: permits uncommitted pending
+    /// revocations only up to the epoch at which each pending revocation was
+    /// decided locally, while refusing any epoch opened by a revoked/pending
+    /// device and any newer epoch that re-admits a pending or revoked device.
+    pub(super) async fn sync_epochs_for_archive(&mut self) -> Result<SyncReport> {
+        let _ = self.retry_pending_directory_publication().await;
+        let allowed_pending = self.pending_revocations.clone();
+        let opener_revoked = self.all_revoked_keys();
+        self.sync_epochs_inner(&allowed_pending, &opener_revoked)
+            .await
+    }
+
+    async fn sync_epochs_inner(
         &mut self,
-        pending_revocations: &BTreeSet<[u8; 32]>,
+        allowed_pending_until: &BTreeMap<[u8; 32], u64>,
+        opener_revoked: &BTreeSet<[u8; 32]>,
     ) -> Result<SyncReport> {
         let from = self.latest;
         let start = self
@@ -739,18 +780,13 @@ impl Labyrinth {
             .get(&from)
             .cloned()
             .ok_or(Error::NotFound("epoch"))?;
-        let enforced_revoked: BTreeSet<[u8; 32]> = self
-            .revoked
-            .difference(pending_revocations)
-            .copied()
-            .collect();
         let reached = chain_forward(
             self.b.mailbox.as_ref(),
             &self.did,
             start,
             self.device.public(),
             &self.device.storage,
-            &enforced_revoked,
+            opener_revoked,
         )
         .await?;
         let latest = reached.last().expect("chain contains its start");
@@ -777,11 +813,25 @@ impl Labyrinth {
             &latest_public.head,
         )
         .await?;
+        let all_revoked = self.all_revoked_keys();
+        let mut discovered_revocations = BTreeSet::new();
         let mut latest_audit = None;
         for epoch in &reached {
+            let (_, rec) = epoch_record(self.b.mailbox.as_ref(), epoch.seq).await?;
+            rec.verify_revocations(&self.did)?;
+            discovered_revocations.extend(rec.revocations.iter().map(|k| k.0));
             let audit = self.audit_epoch(epoch).await?;
-            let is_enforced_revoked =
-                |key: &[u8; 32]| self.revoked.contains(key) && !pending_revocations.contains(key);
+            let is_disallowed_revoked = |key: &[u8; 32]| {
+                if self.revoked.contains(key) {
+                    return true;
+                }
+                if self.pending_revocations.contains_key(key) {
+                    return allowed_pending_until
+                        .get(key)
+                        .is_none_or(|&max_seq| epoch.seq > max_seq);
+                }
+                false
+            };
             let served_revoked = confirmed_epoch_member_keys(&audit)
                 .map(|member| member.0)
                 .chain(
@@ -790,9 +840,9 @@ impl Labyrinth {
                         .iter()
                         .filter_map(|member| member.device_key.map(|key| key.0)),
                 )
-                .any(|key| is_enforced_revoked(&key));
+                .any(|key| is_disallowed_revoked(&key));
             let omitted_verified_revoked =
-                self.verified.0 == epoch.seq && self.verified.1.iter().any(is_enforced_revoked);
+                self.verified.0 == epoch.seq && self.verified.1.iter().any(is_disallowed_revoked);
             if served_revoked || omitted_verified_revoked {
                 return Err(Error::EpochSquatted {
                     seq: epoch.seq,
@@ -800,21 +850,47 @@ impl Labyrinth {
                 });
             }
             self.check_not_tampered(epoch.seq, &audit)?;
+            audit.verify_members_hash(epoch.seq, &rec.public)?;
             latest_audit = Some(audit);
         }
         let audit = latest_audit.expect("chain contains its start");
-        let readmitted = confirmed_epoch_member_keys(&audit)
-            .filter(|k| self.revoked.contains(&k.0))
+        let active_in_latest: BTreeSet<[u8; 32]> =
+            confirmed_epoch_member_keys(&audit).map(|k| k.0).collect();
+        let readmitted = active_in_latest
+            .iter()
+            .filter(|k| all_revoked.contains(*k))
+            .copied()
+            .map(XVerifyingKey)
             .collect::<Vec<_>>();
 
         let to = latest.seq;
+        let mut state_mutated = to != from;
+        for k in discovered_revocations {
+            self.pending_revocations.remove(&k);
+            if self.revoked.insert(k) {
+                state_mutated = true;
+            }
+        }
+        if to > from {
+            let promoted: Vec<[u8; 32]> = self
+                .pending_revocations
+                .keys()
+                .filter(|k| !active_in_latest.contains(*k))
+                .copied()
+                .collect();
+            for k in promoted {
+                self.pending_revocations.remove(&k);
+                self.revoked.insert(k);
+                state_mutated = true;
+            }
+        }
         for e in reached {
             self.epochs.insert(e.seq, e);
         }
         self.latest = to;
         self.adopted(latest_public);
         self.remember_verified(to, audit.valid.iter().map(|v| v.record.device_key_pub.0));
-        if to != from {
+        if state_mutated {
             self.checkpoint_state()?;
         }
         Ok(SyncReport {
@@ -857,6 +933,7 @@ impl Labyrinth {
             return Err(Error::Unattested);
         }
 
+        let all_revoked = self.all_revoked_keys();
         // Step through any valid, clean intermediate epochs `self.latest + 1 .. seq`
         // so an offline device that missed a valid sibling rotation before a squat
         // can catch up to `seq - 1` without failing all-or-nothing in `sync_epochs`.
@@ -872,7 +949,7 @@ impl Labyrinth {
                 &prev,
                 self.device.public(),
                 &self.device.storage,
-                &self.revoked,
+                &all_revoked,
             )
             .await?
             {
@@ -887,6 +964,8 @@ impl Labyrinth {
                     });
                 }
                 StepOutcome::Valid(next_epoch) => {
+                    let (_, rec) = epoch_record(self.b.mailbox.as_ref(), next_epoch.seq).await?;
+                    rec.verify_revocations(&self.did)?;
                     let audit = self.audit_epoch(&next_epoch).await?;
                     let served_revoked = confirmed_epoch_member_keys(&audit)
                         .map(|m| m.0)
@@ -896,7 +975,7 @@ impl Labyrinth {
                                 .iter()
                                 .filter_map(|m| m.device_key.map(|k| k.0)),
                         )
-                        .any(|k| self.revoked.contains(&k));
+                        .any(|k| all_revoked.contains(&k));
                     if served_revoked {
                         return Err(Error::EpochSquatted {
                             seq: next_epoch.seq,
@@ -904,7 +983,7 @@ impl Labyrinth {
                         });
                     }
                     self.check_not_tampered(next_epoch.seq, &audit)?;
-                    let (_, rec) = epoch_record(self.b.mailbox.as_ref(), next_epoch.seq).await?;
+                    audit.verify_members_hash(next_epoch.seq, &rec.public)?;
                     let reached_seq = next_epoch.seq;
                     self.epochs.insert(reached_seq, *next_epoch);
                     self.latest = reached_seq;
@@ -940,13 +1019,16 @@ impl Labyrinth {
             &prev,
             self.device.public(),
             &self.device.storage,
-            &self.revoked,
+            &all_revoked,
         )
         .await?
         {
             StepOutcome::Absent => return Ok(false),
             StepOutcome::Valid(next_epoch) => {
+                let (_, rec) = epoch_record(self.b.mailbox.as_ref(), next_epoch.seq).await?;
+                rec.verify_revocations(&self.did)?;
                 let audit = self.audit_epoch(&next_epoch).await?;
+                audit.verify_members_hash(next_epoch.seq, &rec.public)?;
                 let served_revoked = confirmed_epoch_member_keys(&audit)
                     .map(|m| m.0)
                     .chain(
@@ -955,18 +1037,28 @@ impl Labyrinth {
                             .iter()
                             .filter_map(|m| m.device_key.map(|k| k.0)),
                     )
-                    .any(|k| self.revoked.contains(&k));
+                    .any(|k| all_revoked.contains(&k));
                 if !served_revoked {
                     self.sync_epochs().await?;
                     return Ok(false);
                 }
-                // `next_epoch` re-admits a locally-revoked device -> treat as squatted
-                // and fall through to the directory anchoring check!
+                ensure_seq_unanchored_in_directory(
+                    self.b.directory.as_ref(),
+                    &self.did,
+                    seq,
+                    self.latest,
+                )
+                .await?;
+                return Err(Error::EpochSquatted {
+                    seq,
+                    reason: "it re-admits a device this client revoked",
+                });
             }
             StepOutcome::Squatted { .. } => {}
         }
 
-        // Refuse deletion if this device's own record is already marked revoked in the mailbox.
+        // Refuse deletion only if this device's own record carries a valid
+        // signed revocation from an attested physical device of the account.
         if let Ok(Some(my_dev)) = self
             .b
             .mailbox
@@ -974,7 +1066,28 @@ impl Labyrinth {
             .await
             && my_dev.revoked_at.is_some()
         {
-            return Err(Error::NotEpochMember);
+            let all_devices = self.b.mailbox.list_devices().await?;
+            let known_transport: BTreeSet<[u8; 32]> = self
+                .b
+                .directory
+                .device_transport_keys(&self.did)
+                .await?
+                .into_iter()
+                .map(|k| k.key)
+                .collect();
+            let valid_revokers =
+                super::members::valid_revoker_keys(&self.did, &all_devices, &known_transport);
+            if matches!(
+                super::members::check_signed_revocation(
+                    &self.did,
+                    &my_dev,
+                    &self.device.public().device_key_pub,
+                    &valid_revokers,
+                ),
+                Ok(true)
+            ) {
+                return Err(Error::NotEpochMember);
+            }
         }
 
         // Cross-check the directory (`CompositeDirectory` = PDS + `mls-ds`) BEFORE
@@ -991,13 +1104,16 @@ impl Labyrinth {
             &prev,
             self.device.public(),
             &self.device.storage,
-            &self.revoked,
+            &all_revoked,
         )
         .await?
         {
             StepOutcome::Absent => return Ok(false),
             StepOutcome::Valid(next_epoch) => {
+                let (_, rec) = epoch_record(self.b.mailbox.as_ref(), next_epoch.seq).await?;
+                rec.verify_revocations(&self.did)?;
                 let audit = self.audit_epoch(&next_epoch).await?;
+                audit.verify_members_hash(next_epoch.seq, &rec.public)?;
                 let served_revoked = confirmed_epoch_member_keys(&audit)
                     .map(|m| m.0)
                     .chain(
@@ -1006,11 +1122,15 @@ impl Labyrinth {
                             .iter()
                             .filter_map(|m| m.device_key.map(|k| k.0)),
                     )
-                    .any(|k| self.revoked.contains(&k));
+                    .any(|k| all_revoked.contains(&k));
                 if !served_revoked {
                     self.sync_epochs().await?;
                     return Ok(false);
                 }
+                return Err(Error::EpochSquatted {
+                    seq,
+                    reason: "it re-admits a device this client revoked",
+                });
             }
             StepOutcome::Squatted { .. } => {}
         }
@@ -1077,10 +1197,39 @@ impl Labyrinth {
     }
 
     /// Revoke a device: record it in this client's local revoked set,
-    /// mark it revoked in the store, then open a new epoch that carries
-    /// over every other unrevoked member ([CB-11], [CB-25]) and publish its
-    /// keys. Retries if a sibling device opens the same epoch first.
+    /// mark it revoked in the store with a signed [`DeviceRevocation`], then
+    /// open a new epoch that carries over every other unrevoked member
+    /// ([CB-11], [CB-25]), re-keys recovery methods on physical revocation,
+    /// and publishes its keys.
+    ///
+    /// If the new epoch is written to the mailbox store but directory
+    /// publication fails, returns [`Error::EpochUnanchored`] while retaining
+    /// the completed [`RotationReport`] via
+    /// [`last_unanchored_rotation`](Self::last_unanchored_rotation).
     pub async fn revoke_device(&mut self, target: &XVerifyingKey) -> Result<RotationReport> {
+        match self.revoke_device_with_report(target).await? {
+            (report, None) => {
+                self.last_unanchored_rotation = None;
+                Ok(report)
+            }
+            (report, Some(err)) => {
+                let seq = report.new_epoch;
+                self.last_unanchored_rotation = Some(report);
+                Err(Error::EpochUnanchored {
+                    seq,
+                    reason: err.to_string(),
+                })
+            }
+        }
+    }
+
+    /// [`revoke_device`](Self::revoke_device), returning `(report, Some(err))`
+    /// instead of [`Error::EpochUnanchored`] when the mailbox rotation succeeded
+    /// and only directory publication remained pending.
+    pub async fn revoke_device_with_report(
+        &mut self,
+        target: &XVerifyingKey,
+    ) -> Result<(RotationReport, Option<Error>)> {
         if *target == self.device.public().device_key_pub {
             return Err(Error::Malformed("a device cannot revoke itself"));
         }
@@ -1089,38 +1238,338 @@ impl Labyrinth {
         {
             return Err(Error::PendingWrites);
         }
-        if self.revoked.insert(target.0) {
+        self.flush_cache.clear();
+        let already_known =
+            self.pending_revocations.contains_key(&target.0) || self.revoked.contains(&target.0);
+        if !already_known {
+            // Allow catching up through epochs already anchored in the directory
+            // before this local revocation decision, while refusing any
+            // unanchored Space-only race opened by `target` or any previously
+            // revoked/pending key.
+            let pre_existing_revoked = self.all_revoked_keys();
+            let published_seq = match self.b.directory.latest(&self.did).await {
+                Ok(Some(pub_e)) if pub_e.verify(&self.did, None).is_ok() => pub_e.seq,
+                _ => self.latest,
+            };
+            let max_decision_seq = self.latest.max(published_seq);
+            self.pending_revocations.insert(target.0, max_decision_seq);
             self.checkpoint_state()?;
+            let mut allowed_pending = self.pending_revocations.clone();
+            allowed_pending.insert(target.0, max_decision_seq);
+            // Check that no epoch above `published_seq` in the mailbox was opened by `target`.
+            if let Ok(Some(unanchored_next)) = self
+                .b
+                .mailbox
+                .get_epoch(max_decision_seq.saturating_add(1))
+                .await
+                && let Ok(rec) = unanchored_next.value.to_record()
+                && rec.opened_by == *target
+            {
+                return Err(Error::EpochSquatted {
+                    seq: max_decision_seq.saturating_add(1),
+                    reason: "it was opened by a device this client revoked",
+                });
+            }
+            self.sync_epochs_inner(&allowed_pending, &pre_existing_revoked)
+                .await?;
+            if self.pending_revocations.contains_key(&target.0) {
+                self.pending_revocations.insert(target.0, self.latest);
+                self.checkpoint_state()?;
+            }
+        } else {
+            let allowed_pending = self.pending_revocations.clone();
+            let opener_revoked = self.all_revoked_keys();
+            self.sync_epochs_inner(&allowed_pending, &opener_revoked)
+                .await?;
         }
-        self.sync_epochs_allowing(&BTreeSet::from([target.0]))
-            .await?;
-        self.b
-            .mailbox
-            .set_device_revoked(target, &self.now())
-            .await?;
+
+        let now = self.now();
+        let mut to_stamp: BTreeSet<[u8; 32]> = self.pending_revocations.keys().copied().collect();
+        to_stamp.insert(target.0);
+        let mut rekey_virtual_methods = false;
+        for key_bytes in &to_stamp {
+            let key = XVerifyingKey(*key_bytes);
+            let is_virtual = self
+                .b
+                .mailbox
+                .get_device(&key)
+                .await?
+                .and_then(|d| d.to_public().ok())
+                .is_some_and(|p| p.is_virtual);
+            if !is_virtual {
+                rekey_virtual_methods = true;
+            }
+            let rev = DeviceRevocation::sign(&self.did, &key, &now, &self.device.device_key)?;
+            let rev_def = crate::records::DeviceRevocationDef::from_revocation(&rev);
+            self.b
+                .mailbox
+                .set_device_revocation(&key, &now, &rev_def)
+                .await?;
+        }
+
         for _ in 0..ROTATE_ATTEMPTS {
-            let exclude = self.revoked.clone();
-            match self.rotate(&exclude).await {
+            let exclude = self.all_revoked_keys();
+            match self
+                .rotate_inner(&exclude, Some(*target), rekey_virtual_methods)
+                .await
+            {
                 Err(Error::Conflict) => {
-                    self.sync_epochs().await?;
+                    let opener_revoked = self.all_revoked_keys();
+                    let published_seq = match self.b.directory.latest(&self.did).await {
+                        Ok(Some(pub_e)) if pub_e.verify(&self.did, None).is_ok() => pub_e.seq,
+                        _ => self.latest,
+                    };
+                    let max_allowed_seq = self.latest.max(published_seq);
+                    let mut allowed_pending = self.pending_revocations.clone();
+                    for val in allowed_pending.values_mut() {
+                        *val = (*val).max(max_allowed_seq);
+                    }
+                    self.sync_epochs_inner(&allowed_pending, &opener_revoked)
+                        .await?;
+                    let cur = self.latest;
+                    for val in self.pending_revocations.values_mut() {
+                        *val = cur;
+                    }
+                    self.checkpoint_state()?;
                 }
-                Ok((new_epoch, excluded)) => {
-                    return Ok(RotationReport {
-                        new_epoch,
-                        revoked: Some(*target),
-                        excluded,
-                    });
-                }
+                Ok(outcome) => return Ok(outcome),
                 Err(e) => return Err(e),
             }
         }
         Err(Error::Conflict)
     }
 
-    /// Devices this client has revoked. Part of the persisted client state
-    /// ([`Labyrinth::export_state`]).
+    /// Report from the most recent rotation whose mailbox write committed while
+    /// directory publication remained pending.
+    pub fn last_unanchored_rotation(&self) -> Option<&RotationReport> {
+        self.last_unanchored_rotation.as_ref()
+    }
+
+    /// Cancel an uncommitted local revocation decision before its rotation
+    /// completes. Returns `Ok(true)` if `target` was pending and removed, or
+    /// `Ok(false)` if `target` was not pending (including if already rotated out).
+    pub fn cancel_pending_revocation(&mut self, target: &XVerifyingKey) -> Result<bool> {
+        let Some(prev_seq) = self.pending_revocations.remove(&target.0) else {
+            return Ok(false);
+        };
+        if let Err(err) = self.checkpoint_state() {
+            self.pending_revocations.insert(target.0, prev_seq);
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    /// Devices whose revocation rotation has not yet committed.
+    pub fn pending_revocation_devices(&self) -> impl Iterator<Item = XVerifyingKey> + '_ {
+        self.pending_revocations.keys().copied().map(XVerifyingKey)
+    }
+
+    /// Devices this client has revoked (committed or pending). Part of the
+    /// persisted client state ([`Labyrinth::export_state`]).
     pub fn revoked_devices(&self) -> impl Iterator<Item = XVerifyingKey> + '_ {
-        self.revoked.iter().map(|k| XVerifyingKey(*k))
+        self.all_revoked_keys().into_iter().map(XVerifyingKey)
+    }
+
+    /// Recover from losing an unanchored directory publication race: if this
+    /// client holds an unanchored local tip `self.latest` (`pending_directory_publication == Some(self.latest)`)
+    /// and the directory independently anchors a competing chain from `self.latest - 1`,
+    /// roll back the unanchored local tip, adopt the anchored chain, and
+    /// immediately rotate to evict any locally revoked device still present on
+    /// the anchored chain.
+    pub async fn recover_unanchored_fork(&mut self) -> Result<Option<RotationReport>> {
+        let Some(pending) = self.pending_directory_publication else {
+            return Ok(None);
+        };
+        if pending != self.latest || pending == 0 {
+            return Ok(None);
+        }
+        let anchored = match self.b.directory.latest_two_source(&self.did).await? {
+            Some(a) => Some(a),
+            None => self.b.directory.latest(&self.did).await?,
+        };
+        let Some(anchored) = anchored else {
+            return Ok(None);
+        };
+        anchored.verify(&self.did, None)?;
+        check_own_attester(self.b.directory.as_ref(), &self.did, &anchored).await?;
+        if anchored.seq < pending {
+            return Ok(None);
+        }
+        let my_pending_head = self.latest_public().ok().map(|p| p.head);
+        if anchored.seq == pending && my_pending_head == Some(anchored.head) {
+            let _ = self.retry_pending_directory_publication().await?;
+            return Ok(None);
+        }
+
+        let base_seq = pending - 1;
+        let base_secret = self.epoch_secret(base_seq).await?;
+        let (_, base_rec) = epoch_record(self.b.mailbox.as_ref(), base_seq).await?;
+        verify_public(&base_secret, &base_rec.public)?;
+
+        // Verify the mailbox holds a continuous chain from `base_seq` to `anchored.head`.
+        let mut cursor_pub = base_rec.public.clone();
+        for seq in pending..=anchored.seq {
+            let (_, next_rec) = epoch_record(self.b.mailbox.as_ref(), seq).await?;
+            next_rec.public.verify(&self.did, Some(&cursor_pub))?;
+            next_rec.verify_revocations(&self.did)?;
+            cursor_pub = next_rec.public;
+        }
+        if cursor_pub.head != anchored.head {
+            return Err(Error::Malformed(
+                "anchored directory head does not match mailbox chain",
+            ));
+        }
+
+        let must_evict = self.all_revoked_keys();
+        let saved_epochs = self.epochs.clone();
+        let saved_latest = self.latest;
+        let saved_own = self.own_latest.clone();
+        let saved_attester = self.own_attester_checked;
+        let saved_pending_pub = self.pending_directory_publication;
+        let saved_verified = self.verified.clone();
+        let saved_revoked = self.revoked.clone();
+        let saved_pending_rev = self.pending_revocations.clone();
+
+        let adopt_res: Result<(Audit, BTreeSet<[u8; 32]>)> = async {
+            self.epochs.retain(|&seq, _| seq <= base_seq);
+            self.latest = base_seq;
+            self.own_latest = Some(base_rec.public.clone());
+            self.own_attester_checked = true;
+            self.pending_directory_publication = None;
+            self.verified = (base_seq, BTreeSet::new());
+
+            let reached = chain_forward(
+                self.b.mailbox.as_ref(),
+                &self.did,
+                base_secret,
+                self.device.public(),
+                &self.device.storage,
+                &BTreeSet::new(),
+            )
+            .await?;
+            let tip = reached.last().expect("non-empty");
+            if tip.seq < anchored.seq {
+                return Err(Error::EpochTruncated {
+                    published: anchored.seq,
+                    reached: tip.seq,
+                });
+            }
+            let mut chain_revoked = BTreeSet::new();
+            let mut latest_audit = None;
+            for ep in &reached {
+                let (_, rec) = epoch_record(self.b.mailbox.as_ref(), ep.seq).await?;
+                rec.verify_revocations(&self.did)?;
+                chain_revoked.extend(rec.revocations.iter().map(|k| k.0));
+                let audit = self.audit_epoch(ep).await?;
+                audit.verify_members_hash(ep.seq, &rec.public)?;
+                latest_audit = Some(audit);
+            }
+            let tip_pub = verified_own(
+                self.b.mailbox.as_ref(),
+                self.b.directory.as_ref(),
+                &self.did,
+                tip,
+            )
+            .await?;
+            check_candidate_integrity(
+                self.b.mailbox.as_ref(),
+                self.b.directory.as_ref(),
+                &self.did,
+                tip.seq,
+                &tip_pub.head,
+            )
+            .await?;
+            let audit = latest_audit.expect("non-empty");
+            let to = tip.seq;
+            for e in reached {
+                self.epochs.insert(e.seq, e);
+            }
+            self.latest = to;
+            self.adopted(tip_pub);
+            self.remember_verified(to, audit.valid.iter().map(|v| v.record.device_key_pub.0));
+            Ok((audit, chain_revoked))
+        }
+        .await;
+
+        let (audit, chain_revoked) = match adopt_res {
+            Ok(v) => v,
+            Err(err) => {
+                self.epochs = saved_epochs;
+                self.latest = saved_latest;
+                self.own_latest = saved_own;
+                self.own_attester_checked = saved_attester;
+                self.pending_directory_publication = saved_pending_pub;
+                self.verified = saved_verified;
+                self.revoked = saved_revoked;
+                self.pending_revocations = saved_pending_rev;
+                return Err(err);
+            }
+        };
+
+        for k in chain_revoked {
+            self.pending_revocations.remove(&k);
+            self.revoked.insert(k);
+        }
+
+        let active_in_tip: BTreeSet<[u8; 32]> =
+            confirmed_epoch_member_keys(&audit).map(|k| k.0).collect();
+        let still_present: Vec<XVerifyingKey> = must_evict
+            .iter()
+            .filter(|k| active_in_tip.contains(*k))
+            .copied()
+            .map(XVerifyingKey)
+            .collect();
+        if still_present.is_empty() {
+            for k in must_evict {
+                self.pending_revocations.remove(&k);
+                self.revoked.insert(k);
+            }
+            self.flush_cache.clear();
+            self.checkpoint_state()?;
+            return Ok(None);
+        }
+
+        // At least one locally revoked device is still active on the winning
+        // anchored fork: stamp signed revocations and rotate immediately!
+        for k in &still_present {
+            self.revoked.remove(&k.0);
+            self.pending_revocations.insert(k.0, self.latest);
+        }
+        let now = self.now();
+        let mut rekey_virtual_methods = false;
+        for k in &still_present {
+            let is_virtual = self
+                .b
+                .mailbox
+                .get_device(k)
+                .await?
+                .and_then(|d| d.to_public().ok())
+                .is_some_and(|p| p.is_virtual);
+            if !is_virtual {
+                rekey_virtual_methods = true;
+            }
+            let rev = DeviceRevocation::sign(&self.did, k, &now, &self.device.device_key)?;
+            let rev_def = crate::records::DeviceRevocationDef::from_revocation(&rev);
+            self.b
+                .mailbox
+                .set_device_revocation(k, &now, &rev_def)
+                .await?;
+        }
+        let exclude = self.all_revoked_keys();
+        let primary = still_present.first().copied();
+        let (report, unfinished) = self
+            .rotate_inner(&exclude, primary, rekey_virtual_methods)
+            .await?;
+        if let Some(err) = unfinished {
+            let seq = report.new_epoch;
+            self.last_unanchored_rotation = Some(report);
+            return Err(Error::EpochUnanchored {
+                seq,
+                reason: err.to_string(),
+            });
+        }
+        self.last_unanchored_rotation = None;
+        Ok(Some(report))
     }
 
     /// Rotate the mailbox to the next epoch while carrying over unrevoked
@@ -1131,19 +1580,34 @@ impl Labyrinth {
         {
             return Err(Error::PendingWrites);
         }
+        self.flush_cache.clear();
         self.sync_epochs().await?;
         for _ in 0..ROTATE_ATTEMPTS {
-            let exclude = self.revoked.clone();
-            match self.rotate(&exclude).await {
+            let exclude = self.all_revoked_keys();
+            match self.rotate_inner(&exclude, None, false).await {
                 Err(Error::Conflict) => {
-                    self.sync_epochs().await?;
+                    let opener_revoked = self.all_revoked_keys();
+                    let published_seq = match self.b.directory.latest(&self.did).await {
+                        Ok(Some(pub_e)) if pub_e.verify(&self.did, None).is_ok() => pub_e.seq,
+                        _ => self.latest,
+                    };
+                    let max_allowed_seq = self.latest.max(published_seq);
+                    let mut allowed_pending = self.pending_revocations.clone();
+                    for val in allowed_pending.values_mut() {
+                        *val = (*val).max(max_allowed_seq);
+                    }
+                    self.sync_epochs_inner(&allowed_pending, &opener_revoked)
+                        .await?;
+                    let cur = self.latest;
+                    for val in self.pending_revocations.values_mut() {
+                        *val = cur;
+                    }
+                    self.checkpoint_state()?;
                 }
-                Ok((new_epoch, excluded)) => {
-                    return Ok(RotationReport {
-                        new_epoch,
-                        revoked: None,
-                        excluded,
-                    });
+                Ok((report, None)) => return Ok(report),
+                Ok((report, Some(err))) => {
+                    self.last_unanchored_rotation = Some(report);
+                    return Err(err);
                 }
                 Err(error) => return Err(error),
             }
@@ -1157,11 +1621,12 @@ impl Labyrinth {
     async fn expired_recovery_devices(&self) -> Result<BTreeSet<[u8; 32]>> {
         let now = self.b.clock.now_ms();
         let mut expired = BTreeSet::new();
-        for vdev in self.b.mailbox.list_virtual_devices().await? {
-            let Ok((record, _)) = vdev.to_bundle() else {
+        for entry in self.b.mailbox.list_virtual_device_records().await? {
+            let Ok(vdev) = entry else { continue };
+            let Ok((record, _)) = vdev.to_bundle_for_did(&self.did) else {
                 continue;
             };
-            if super::enroll::vdevice_stale_at_ms(record.mechanism, &vdev)
+            if super::enroll::vdevice_stale_at_ms(record.mechanism, &vdev, now)
                 .ok()
                 .flatten()
                 .is_some_and(|stale_at| now >= stale_at)
@@ -1174,9 +1639,14 @@ impl Labyrinth {
 
     /// Open the epoch after `self.latest`, carrying over every member of
     /// the previous epoch except this device (the opener is added by
-    /// [`open_next`]), the devices in `exclude`, devices the store reports
-    /// as revoked, and expired recovery bundles ([CB-39]).
-    async fn rotate(&mut self, exclude: &BTreeSet<[u8; 32]>) -> Result<(u64, Vec<ExcludedMember>)> {
+    /// [`open_next_with_additions`]), the devices in `exclude`, devices the
+    /// store reports as validly revoked, and expired recovery bundles ([CB-39]).
+    async fn rotate_inner(
+        &mut self,
+        exclude: &BTreeSet<[u8; 32]>,
+        primary_revoked: Option<XVerifyingKey>,
+        rekey_virtual_methods: bool,
+    ) -> Result<(RotationReport, Option<Error>)> {
         let prev = self.epoch_secret(self.latest).await?;
         let mine = self.transport.transport_public_key();
         let current = self.b.directory.device_transport_keys(&self.did).await?;
@@ -1185,15 +1655,88 @@ impl Labyrinth {
             // we were removed); a rotation would drop every sibling.
             return Err(Error::Unattested);
         }
-        let audit = self.audit_epoch(&prev).await?;
-        self.check_not_tampered(prev.seq, &audit)?;
-        let expired = self.expired_recovery_devices().await?;
         let mb = self.b.mailbox.as_ref();
         let (_, prev_record) = epoch_record(mb, prev.seq).await?;
+        prev_record.verify_revocations(&self.did)?;
+        let audit = self.audit_epoch(&prev).await?;
+        self.check_not_tampered(prev.seq, &audit)?;
+        audit.verify_members_hash(prev.seq, &prev_record.public)?;
+        if audit.excluded.iter().any(|x| {
+            x.reason == ExclusionReason::UnsignedRevocation
+                && x.device_key.is_none_or(|k| !exclude.contains(&k.0))
+        }) {
+            return Err(Error::DeviceTampered);
+        }
+        let expired = self.expired_recovery_devices().await?;
         let me = self.device.public().device_key_pub;
+        let now = self.now();
+
+        let mut invalidated_recovery_methods = Vec::new();
+        let mut invalidated_vkeys = BTreeSet::new();
+        if rekey_virtual_methods {
+            for v in &audit.valid {
+                let k = v.record.device_key_pub;
+                if v.public.is_virtual
+                    && k != me
+                    && !exclude.contains(&k.0)
+                    && !v.revoked
+                    && !expired.contains(&k.0)
+                {
+                    let (vdevice_id, mechanism) = v
+                        .vdevice_meta
+                        .ok_or(Error::Malformed("virtual member missing bundle metadata"))?;
+                    invalidated_vkeys.insert(k.0);
+                    invalidated_recovery_methods.push(InvalidatedRecoveryMethod {
+                        vdevice_id,
+                        mechanism,
+                        device_key: k,
+                    });
+                }
+            }
+        }
+
+        let mut replacement_vdev: Option<(RecoveryCode, DeviceSecrets)> = None;
+        let mut added_virtual_pubs = Vec::new();
+        if !invalidated_recovery_methods.is_empty() {
+            let new_code = RecoveryCode::generate()?;
+            let new_vsecrets = DeviceSecrets::generate_virtual()?;
+            added_virtual_pubs.push(new_vsecrets.public().clone());
+            replacement_vdev = Some((new_code, new_vsecrets));
+        }
+
+        let mut cumulative_revoked: BTreeSet<[u8; 32]> =
+            prev_record.revocations.iter().map(|k| k.0).collect();
+        cumulative_revoked.extend(exclude.iter().copied());
+        cumulative_revoked.extend(invalidated_vkeys.iter().copied());
+
+        let mut evicted_set = BTreeSet::new();
+        for v in &audit.valid {
+            let k = v.record.device_key_pub;
+            if k != me
+                && (exclude.contains(&k.0)
+                    || v.revoked
+                    || cumulative_revoked.contains(&k.0)
+                    || invalidated_vkeys.contains(&k.0))
+            {
+                cumulative_revoked.insert(k.0);
+                if Some(k) != primary_revoked {
+                    evicted_set.insert(k.0);
+                }
+            }
+        }
+        for &k in exclude {
+            if Some(XVerifyingKey(k)) != primary_revoked {
+                evicted_set.insert(k);
+            }
+        }
+
         let carried = |v: &&super::members::ValidMember| {
             let k = v.record.device_key_pub;
-            k != me && !exclude.contains(&k.0) && !v.revoked
+            k != me
+                && !exclude.contains(&k.0)
+                && !v.revoked
+                && !cumulative_revoked.contains(&k.0)
+                && !invalidated_vkeys.contains(&k.0)
         };
         let continuing: Vec<DevicePublic> = audit
             .valid
@@ -1214,45 +1757,110 @@ impl Labyrinth {
             .collect();
         let prev_members: Vec<EpochMemberRecord> =
             audit.valid.iter().map(|v| v.record.clone()).collect();
-        let (pending, new) = open_next(
+        let (pending, mut new) = open_next_with_additions(
             &self.did,
             &prev,
             &prev_record.public,
             &prev_members,
             &continuing,
+            &added_virtual_pubs,
             &self.device,
             self.transport.as_ref(),
         )?;
-        if new
-            .members
-            .iter()
-            .any(|m| exclude.contains(&m.device_key_pub.0))
-        {
+        if !cumulative_revoked.is_empty() {
+            new.record.sign_revocations(
+                &self.did,
+                &self.device.device_key,
+                cumulative_revoked.iter().copied().map(XVerifyingKey),
+            )?;
+        }
+        if new.members.iter().any(|m| {
+            exclude.contains(&m.device_key_pub.0) || invalidated_vkeys.contains(&m.device_key_pub.0)
+        }) {
             return Err(Error::Malformed("rotation would re-admit a revoked device"));
         }
-        let now = self.now();
+
+        let prepared_replacement = if let Some((new_code, new_vsecrets)) = replacement_vdev {
+            let vrec = virtual_device::seal_virtual_device(
+                &self.did,
+                &new_code,
+                &new_vsecrets,
+                &pending,
+                Mechanism::Code,
+                Some(now.as_str()),
+            )?;
+            let bundle = VirtualDevice::from_bundle(&vrec, None, now.clone());
+            mb.create_device(&Device::from_public(new_vsecrets.public(), now.clone()))
+                .await?;
+            mb.create_virtual_device(&bundle).await?;
+            Some((vrec.vdevice_id, new_code))
+        } else {
+            None
+        };
         let members: Vec<_> = new
             .members
             .iter()
             .map(|m| EpochMember::from_record(m, now.clone()))
             .collect();
-        let epoch = Epoch::from_record(&new.record, now);
-        let id = create_epoch_reconciled(mb, &epoch, &members).await?;
+        let epoch = Epoch::from_record(&new.record, now.clone());
+        let id = match create_epoch_reconciled(mb, &epoch, &members).await {
+            Ok(id) => id,
+            Err(err) => {
+                if let Some((ref vdevice_id, _)) = prepared_replacement {
+                    let _ = mb.delete_virtual_device(vdevice_id).await;
+                }
+                return Err(err);
+            }
+        };
         let e = pending.assign_id(id);
+
+        for k in cumulative_revoked {
+            self.pending_revocations.remove(&k);
+            self.revoked.insert(k);
+        }
         self.latest = e.seq;
         self.epochs.insert(e.seq, e);
         // Made here, so it needs no checking.
         self.adopted(new.record.public.clone());
         self.remember_verified(self.latest, new.members.iter().map(|m| m.device_key_pub.0));
         self.pending_directory_publication = Some(self.latest);
+        self.flush_cache.clear();
         self.checkpoint_state()?;
-        self.retry_pending_directory_publication().await?;
+
+        for inv in &invalidated_recovery_methods {
+            if let Ok(rev) =
+                DeviceRevocation::sign(&self.did, &inv.device_key, &now, &self.device.device_key)
+            {
+                let rev_def = crate::records::DeviceRevocationDef::from_revocation(&rev);
+                let _ = self
+                    .b
+                    .mailbox
+                    .set_device_revocation(&inv.device_key, &now, &rev_def)
+                    .await;
+            }
+            let _ = self.b.mailbox.delete_virtual_device(&inv.vdevice_id).await;
+        }
+
+        let rekeyed_recovery =
+            prepared_replacement.map(|(vdevice_id, code)| RecoverySetup { vdevice_id, code });
+        let unfinished = self.retry_pending_directory_publication().await.err();
         let excluded = audit
             .excluded
             .into_iter()
             .filter(|x| x.device_key.is_none_or(|k| !exclude.contains(&k.0)))
             .chain(expired_members)
             .collect();
-        Ok((self.latest, excluded))
+        let evicted_revoked = evicted_set.into_iter().map(XVerifyingKey).collect();
+        Ok((
+            RotationReport {
+                new_epoch: self.latest,
+                revoked: primary_revoked,
+                evicted_revoked,
+                excluded,
+                invalidated_recovery_methods,
+                rekeyed_recovery,
+            },
+            unfinished,
+        ))
     }
 }

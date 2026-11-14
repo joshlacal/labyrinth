@@ -728,6 +728,14 @@ fn fault_line_3_clear_squatted_epoch_absorbs_unanchored_valid_sibling_and_preser
         ) -> labyrinth::Result<()> {
             self.0.set_device_revoked(k, at).await
         }
+        async fn set_device_revocation(
+            &self,
+            k: &labyrinth::sign::XVerifyingKey,
+            at: &str,
+            rev: &labyrinth::records::DeviceRevocationDef,
+        ) -> labyrinth::Result<()> {
+            self.0.set_device_revocation(k, at, rev).await
+        }
         async fn get_device(
             &self,
             k: &labyrinth::sign::XVerifyingKey,
@@ -774,6 +782,17 @@ fn fault_line_3_clear_squatted_epoch_absorbs_unanchored_valid_sibling_and_preser
             &self,
         ) -> labyrinth::Result<Vec<labyrinth::records::VirtualDevice>> {
             self.0.list_virtual_devices().await
+        }
+        async fn list_virtual_device_records(
+            &self,
+        ) -> labyrinth::Result<Vec<labyrinth::Result<labyrinth::records::VirtualDevice>>> {
+            self.0.list_virtual_device_records().await
+        }
+        async fn touch_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<()> {
+            self.0.touch_virtual_device(id).await
+        }
+        async fn delete_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<()> {
+            self.0.delete_virtual_device(id).await
         }
         async fn append_owner_batch(
             &self,

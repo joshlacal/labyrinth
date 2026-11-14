@@ -290,11 +290,24 @@ fn full_lifecycle_in_spaces() {
     assert_eq!(got(&read(&mut carol)), w.expected(&before));
 
     // The phone is lost: the laptop revokes it (an `#update` of its device
-    // record) and opens epoch 2.
+    // record), opens epoch 2, and atomically re-keys recovery methods.
     w.net.remove_chat_device(ALICE, tpub(1), w.ts + 1);
     let phone_key = phone.device_public().device_key_pub;
     let rot = block_on(laptop.revoke_device(&phone_key)).unwrap();
     assert_eq!(rot.new_epoch, 2);
+    let recovery = rot
+        .rekeyed_recovery
+        .expect("physical revocation re-keys recovery methods");
+    assert!(matches!(
+        block_on(Labyrinth::restore_with_recovery_code(
+            ALICE,
+            &code,
+            w.chat_device(ALICE, 9),
+            w.backends(ALICE),
+        )),
+        Err(Error::BadRecoveryCode)
+    ));
+    let code = recovery.code.as_str().to_owned();
     assert_eq!(
         block_on(phone.sync_epochs()).unwrap_err(),
         Error::NotEpochMember

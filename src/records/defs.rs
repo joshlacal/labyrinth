@@ -203,6 +203,30 @@ pub struct TransportAttestationDef {
     pub sig: Bytes,
 }
 
+/// `defs#deviceRevocation`: XEdDSA revocation statement signed by a physical device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeviceRevocationDef {
+    pub revoked_by: Bytes,
+    pub sig: Bytes,
+}
+
+impl DeviceRevocationDef {
+    pub fn from_revocation(r: &crate::device::DeviceRevocation) -> Self {
+        Self {
+            revoked_by: Bytes::from_slice(&r.revoked_by.0),
+            sig: Bytes::from_slice(&r.sig),
+        }
+    }
+
+    pub fn to_revocation(&self) -> Result<crate::device::DeviceRevocation> {
+        Ok(crate::device::DeviceRevocation {
+            revoked_by: XVerifyingKey(self.revoked_by.array("revokedBy length")?),
+            sig: self.sig.array("deviceRevocation sig length")?,
+        })
+    }
+}
+
 /// `defs#epochPublic` (SPEC §5.2–5.3, Gate 2/3 `membersHash`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

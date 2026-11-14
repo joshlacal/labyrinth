@@ -10,7 +10,11 @@
 //! Removing a method revokes its virtual device (a rotation that excludes
 //! it, [CB-11]) and then deletes the bundle.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::members::{check_signed_revocation, valid_revoker_keys};
 use super::{Labyrinth, RotationReport};
+use crate::epoch::verify_member;
 use crate::records::ms_from_datetime;
 use crate::sign::XVerifyingKey;
 use crate::virtual_device::Mechanism;
@@ -59,32 +63,104 @@ impl RecoveryMethod {
 }
 
 impl Labyrinth {
-    /// Every recovery method (virtual device) of the account.
+    /// Every active recovery method (virtual device) in the current epoch,
+    /// cross-checked against its `epochMember`, `device`, and `virtualDevice`
+    /// records so forged or orphaned bundles are never listed as active.
     pub async fn list_recovery_methods(&self) -> Result<Vec<RecoveryMethod>> {
         let mb = self.b.mailbox.as_ref();
+        let epoch = self
+            .epochs
+            .get(&self.latest)
+            .ok_or(Error::NotFound("epoch"))?;
+        let now_ms = self.b.clock.now_ms();
+        let all_devices = mb.list_devices().await?;
+        let known_transport: BTreeSet<[u8; 32]> = self
+            .b
+            .directory
+            .device_transport_keys(&self.did)
+            .await
+            .map(|keys| keys.into_iter().map(|k| k.key).collect())
+            .unwrap_or_default();
+        let valid_revokers = valid_revoker_keys(&self.did, &all_devices, &known_transport);
+        let all_revoked = self.all_revoked_keys();
+
+        let mut bundles = BTreeMap::new();
+        for entry in mb.list_virtual_device_records().await? {
+            let Ok(v) = entry else { continue };
+            let Ok((rec, _)) = v.to_bundle_for_did(&self.did) else {
+                continue;
+            };
+            let Ok(created_at_ms) = ms_from_datetime(&v.created_at) else {
+                continue;
+            };
+            let key = rec.public.device_key_pub.0;
+            match bundles.entry(key) {
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    e.insert(None);
+                }
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(Some((rec, v, created_at_ms)));
+                }
+            }
+        }
+
         let mut out = Vec::new();
-        for v in mb.list_virtual_devices().await? {
-            let (rec, _) = v.to_bundle()?;
-            let created_at_ms = ms_from_datetime(&v.created_at)?;
+        let mut seen = BTreeSet::new();
+        for raw_member in mb.list_epoch_members(self.latest).await? {
+            let Ok(member) = raw_member.to_record() else {
+                continue;
+            };
+            if !seen.insert(member.device_key_pub.0) {
+                continue;
+            }
+            let Some(Some((rec, v, created_at_ms))) = bundles.get(&member.device_key_pub.0) else {
+                continue;
+            };
+            if verify_member(epoch, &member, true).is_err() {
+                continue;
+            }
+            let Some(dev) = mb.get_device(&rec.public.device_key_pub).await? else {
+                continue;
+            };
+            let Ok(dev_pub) = dev.to_public() else {
+                continue;
+            };
+            if !dev_pub.is_virtual
+                || dev.chat_binding.is_some()
+                || dev_pub != rec.public
+                || dev_pub.verify().is_err()
+            {
+                continue;
+            }
+            // `lastUsedAt` is an unsigned hint: malformed, pre-creation, or
+            // future-dated values are ignored so a store cannot stretch TTL
+            // past `created_at_ms + AUTO_RECOVERY_TTL_MS`.
             let last_used_at_ms = v
                 .last_used_at
                 .as_deref()
-                .map(ms_from_datetime)
-                .transpose()?;
-            let revoked = mb
-                .get_device(&rec.public.device_key_pub)
-                .await?
-                .is_some_and(|d| d.revoked_at.is_some());
+                .and_then(|ts| ms_from_datetime(ts).ok())
+                .filter(|&ts| ts >= *created_at_ms && ts <= now_ms);
+            let signed_revoked = matches!(
+                check_signed_revocation(
+                    &self.did,
+                    &dev,
+                    &rec.public.device_key_pub,
+                    &valid_revokers,
+                ),
+                Ok(true)
+            );
+            let revoked = signed_revoked || all_revoked.contains(&rec.public.device_key_pub.0);
             out.push(RecoveryMethod {
                 vdevice_id: rec.vdevice_id,
                 mechanism: rec.mechanism,
                 device_key: rec.public.device_key_pub,
-                created_at_ms,
+                created_at_ms: *created_at_ms,
                 last_used_at_ms,
-                stale_at_ms: recovery_stale_at(rec.mechanism, created_at_ms, last_used_at_ms),
+                stale_at_ms: recovery_stale_at(rec.mechanism, *created_at_ms, last_used_at_ms),
                 revoked,
             });
         }
+        out.sort_by_key(|m| m.vdevice_id);
         Ok(out)
     }
 
@@ -103,30 +179,29 @@ impl Labyrinth {
         &mut self,
         vdevice_id: &[u8; 16],
     ) -> Result<RotationReport> {
-        let method = self
-            .list_recovery_methods()
+        let v = self
+            .b
+            .mailbox
+            .get_virtual_device(vdevice_id)
             .await?
-            .into_iter()
-            .find(|m| m.vdevice_id == *vdevice_id)
             .ok_or(Error::NotFound("virtual device"))?;
-        if method.device_key == self.device.public().device_key_pub {
+        let (rec, _) = v.to_bundle()?;
+        if rec.public.device_key_pub == self.device.public().device_key_pub {
             return Err(Error::DeviceTampered);
         }
         let dev = self
             .b
             .mailbox
-            .get_device(&method.device_key)
+            .get_device(&rec.public.device_key_pub)
             .await?
             .ok_or(Error::DeviceTampered)?;
         let dev_pub = dev.to_public()?;
         dev_pub.verify()?;
-        if !dev_pub.is_virtual
-            || dev.chat_binding.is_some()
-            || dev_pub.device_key_pub != method.device_key
-        {
+        if !dev_pub.is_virtual || dev.chat_binding.is_some() || dev_pub != rec.public {
             return Err(Error::DeviceTampered);
         }
-        let report = self.revoke_device(&method.device_key).await?;
+        let _ = v.to_bundle_for_did(&self.did)?;
+        let report = self.revoke_device(&rec.public.device_key_pub).await?;
         self.b.mailbox.delete_virtual_device(vdevice_id).await?;
         Ok(report)
     }

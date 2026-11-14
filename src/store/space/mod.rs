@@ -240,7 +240,7 @@ pub fn map_space_error(e: SpaceError) -> Error {
     let is_not_found_status = e.status == 404 || e.status == 400;
     match e.error.as_deref() {
         Some("MethodNotImplemented") if e.status == 501 => Error::NotSupported("Space endpoint"),
-        Some("RecordAlreadyExists") => Error::Conflict,
+        Some("RecordAlreadyExists" | "InvalidSwap") => Error::Conflict,
         Some("RecordNotFound" | "BlobNotFound") if is_not_found_status => Error::NotFound("record"),
         Some("SpaceNotFound") if is_not_found_status => Error::NotFound("space"),
         Some("SpaceDeleted") => Error::Forbidden,
@@ -492,7 +492,10 @@ impl SpaceMailboxStore {
             .await
             .map_err(map_space_error)
         {
-            Ok(body) => decode(decode_body::<GetRecordOut>(&body)?.value).map(Some),
+            Ok(body) => {
+                let out: GetRecordOut = decode_body(&body)?;
+                Ok(Some(decode(out.value)?))
+            }
             Err(Error::NotFound("record" | "repo")) => Ok(None),
             Err(e) => Err(e),
         }
@@ -686,6 +689,33 @@ impl MailboxStore for SpaceMailboxStore {
         self.update(nsid::DEVICE, rkey, &d).await
     }
 
+    async fn set_device_revocation(
+        &self,
+        device_key: &XVerifyingKey,
+        revoked_at: &str,
+        revocation: &crate::records::DeviceRevocationDef,
+    ) -> Result<()> {
+        let rkey = hex::encode(device_key.0);
+        let mut d: Device = self
+            .get(nsid::DEVICE, &rkey)
+            .await?
+            .ok_or(Error::NotFound("device"))?;
+        let all_devices = self.list_devices().await?;
+        if !crate::records::should_replace_device_revocation(
+            self.owner(),
+            device_key,
+            &d,
+            &all_devices,
+            revoked_at,
+            revocation,
+        ) {
+            return Ok(());
+        }
+        d.revoked_at = Some(revoked_at.to_owned());
+        d.revocation = Some(revocation.clone());
+        self.update(nsid::DEVICE, rkey, &d).await
+    }
+
     async fn get_device(&self, device_key: &XVerifyingKey) -> Result<Option<Device>> {
         self.get(nsid::DEVICE, &hex::encode(device_key.0)).await
     }
@@ -730,15 +760,30 @@ impl MailboxStore for SpaceMailboxStore {
         if let Some(cleanup) = &bundle.cleanup {
             match cleanup {
                 EnrollCleanup::ConsumeOtcSession { rkey } => {
+                    if self
+                        .get::<OtcSession>(nsid::OTC_SESSION, rkey)
+                        .await?
+                        .is_none()
+                    {
+                        return Err(Error::Conflict);
+                    }
                     writes.push(WriteOp::Delete {
                         collection: nsid::OTC_SESSION,
                         rkey: rkey.clone(),
                     });
                 }
                 EnrollCleanup::TouchVirtualDevice { updated } => {
+                    let vkey = updated.rkey();
+                    if self
+                        .get::<VirtualDevice>(nsid::VIRTUAL_DEVICE, &vkey)
+                        .await?
+                        .is_none()
+                    {
+                        return Err(Error::NotFound("virtual device"));
+                    }
                     writes.push(WriteOp::Update {
                         collection: nsid::VIRTUAL_DEVICE,
-                        rkey: updated.rkey(),
+                        rkey: vkey,
                         value: encode(updated)?,
                     });
                 }
@@ -761,8 +806,11 @@ impl MailboxStore for SpaceMailboxStore {
                 value: encode(m)?,
             });
         }
-        self.apply(&writes).await?;
-        Ok(id)
+        match self.apply(&writes).await {
+            Ok(_) => Ok(id),
+            Err(Error::NotFound("record")) => Err(Error::Conflict),
+            Err(e) => Err(e),
+        }
     }
 
     async fn get_epoch(&self, seq: u64) -> Result<Option<Stored<Epoch>>> {
@@ -825,6 +873,21 @@ impl MailboxStore for SpaceMailboxStore {
             .await?
             .into_iter()
             .map(|(_, v)| v)
+            .collect())
+    }
+
+    async fn list_virtual_device_records(&self) -> Result<Vec<Result<VirtualDevice>>> {
+        Ok(self
+            .list_raw(nsid::VIRTUAL_DEVICE, true)
+            .await?
+            .into_iter()
+            .map(|(rkey, v)| {
+                let vd = decode::<VirtualDevice>(v)?;
+                if vd.rkey() != rkey {
+                    return Err(Error::Malformed("virtualDevice filed under wrong rkey"));
+                }
+                Ok(vd)
+            })
             .collect())
     }
 

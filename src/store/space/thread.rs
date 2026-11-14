@@ -384,16 +384,18 @@ impl ThreadStore for SpaceThreadStore {
         let repos = self.list_repos(&space).await?;
         let mut out = Vec::new();
         for did in repos {
-            if let Some(m) = self
+            match self
                 .get_from::<MekDistribution>(&space, &did, nsid::MEK, &rkey)
-                .await?
+                .await
             {
-                out.push(Stored {
+                Ok(Some(m)) => out.push(Stored {
                     author: did,
                     rkey: rkey.clone(),
                     value: m,
                     order: None,
-                });
+                }),
+                Ok(None) | Err(Error::Malformed(_)) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(out)
@@ -464,6 +466,113 @@ impl ThreadStore for SpaceThreadStore {
             }));
         }
         Ok(out)
+    }
+
+    async fn list_batches_quarantined(
+        &self,
+        thread_id: &str,
+        sender: Option<&str>,
+        range: TimeRange,
+    ) -> Result<(Vec<Stored<Batch>>, Vec<crate::store::AuthorQuarantine>)> {
+        use crate::store::{QuarantineReason, push_quarantine};
+        let is_listing_overflow = |e: &Error| match e {
+            Error::Backend(msg) => {
+                msg.starts_with("space listing")
+                    || msg.starts_with("space page")
+                    || msg.starts_with("space cursor")
+                    || msg.starts_with("space response exceeds")
+            }
+            _ => false,
+        };
+        let space = self.space_for(thread_id)?;
+        let repos = self.list_repos(&space).await?;
+        let mut out = Vec::new();
+        let mut quarantined = Vec::new();
+        for did in repos {
+            if sender.is_some_and(|s| s != did.as_str()) {
+                continue;
+            }
+            let raw_batches = match self.list_repo_raw(&space, &did, nsid::BATCH, true).await {
+                Ok(v) => v,
+                Err(e) if is_listing_overflow(&e) => {
+                    push_quarantine(
+                        &mut quarantined,
+                        did,
+                        QuarantineReason::RepositoryOverflow,
+                        e.to_string(),
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let mut batches = Vec::with_capacity(raw_batches.len());
+            for (rkey, raw) in raw_batches {
+                match decode::<Batch>(raw) {
+                    Ok(value) => batches.push(Stored {
+                        author: did.clone(),
+                        rkey,
+                        value,
+                        order: None,
+                    }),
+                    Err(e) => push_quarantine(
+                        &mut quarantined,
+                        did.clone(),
+                        QuarantineReason::MalformedRecord,
+                        format!("batch {rkey}: {e}"),
+                    ),
+                }
+            }
+            match self
+                .list_repo_raw(&space, &did, nsid::AUTHOR_REDACTION, true)
+                .await
+            {
+                Ok(raw_redactions) => {
+                    for (rkey, raw) in raw_redactions {
+                        match decode::<AuthorRedaction>(raw) {
+                            Ok(record) => {
+                                if let Err(e) = overlay_author_redactions(
+                                    thread_id,
+                                    &did,
+                                    &mut batches,
+                                    vec![(rkey.clone(), record)],
+                                ) {
+                                    push_quarantine(
+                                        &mut quarantined,
+                                        did.clone(),
+                                        QuarantineReason::InvalidRedaction,
+                                        format!("authorRedaction {rkey}: {e}"),
+                                    );
+                                }
+                            }
+                            Err(e) => push_quarantine(
+                                &mut quarantined,
+                                did.clone(),
+                                QuarantineReason::MalformedRecord,
+                                format!("authorRedaction {rkey}: {e}"),
+                            ),
+                        }
+                    }
+                }
+                Err(e) if is_listing_overflow(&e) => {
+                    push_quarantine(
+                        &mut quarantined,
+                        did.clone(),
+                        QuarantineReason::RepositoryOverflow,
+                        e.to_string(),
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+            out.extend(batches.into_iter().filter(|batch| {
+                batch.value.thread_id == thread_id
+                    && batch
+                        .value
+                        .items
+                        .iter()
+                        .any(|item| range.contains(item.timestamp))
+            }));
+        }
+        Ok((out, quarantined))
     }
 
     async fn list_threads(&self) -> Result<Vec<String>> {

@@ -17,9 +17,10 @@ pub mod mailbox;
 pub mod thread;
 
 pub use defs::{
-    BlobRefDef, CidLinkDef, EpochPublicDef, MekRecipientDef, OwnerMessageDef, RedactionDef,
-    SealedMessageDef, SequencerReceiptDef, TransportAttestationDef,
+    BlobRefDef, CidLinkDef, DeviceRevocationDef, EpochPublicDef, MekRecipientDef, OwnerMessageDef,
+    RedactionDef, SealedMessageDef, SequencerReceiptDef, TransportAttestationDef,
 };
+pub(crate) use mailbox::should_replace_device_revocation;
 pub use mailbox::{
     Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch, VirtualDevice,
 };

@@ -53,6 +53,61 @@ impl ChatBinding {
     }
 }
 
+/// Signature prefix of a [`DeviceRevocation`].
+const REVOCATION_PREFIX: &str = "catbird.labyrinth.device_revocation_v1:";
+
+/// Cryptographic revocation statement signed by a physical device's XEdDSA key:
+/// `XEdDSA(revokerDeviceKey, "catbird.labyrinth.device_revocation_v1:" || did || ":" || hex(targetDeviceKey) || ":" || revokedAt)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceRevocation {
+    pub revoked_by: XVerifyingKey,
+    pub sig: [u8; 64],
+}
+
+fn revocation_message(did: &str, target_device_key: &XVerifyingKey, revoked_at: &str) -> Vec<u8> {
+    format!(
+        "{REVOCATION_PREFIX}{did}:{}:{revoked_at}",
+        hex::encode(target_device_key.0)
+    )
+    .into_bytes()
+}
+
+impl DeviceRevocation {
+    /// Signs a revocation statement for `target_device_key` of `did` at `revoked_at`.
+    pub fn sign(
+        did: &str,
+        target_device_key: &XVerifyingKey,
+        revoked_at: &str,
+        revoker: &XSigningKey,
+    ) -> Result<Self> {
+        if revoked_at.is_empty() {
+            return Err(Error::Malformed("empty revokedAt"));
+        }
+        Ok(Self {
+            revoked_by: revoker.public(),
+            sig: revoker.sign(&revocation_message(did, target_device_key, revoked_at))?,
+        })
+    }
+
+    /// Checks the XEdDSA signature over `(did, target_device_key, revoked_at)`.
+    /// The caller separately checks that `revoked_by` is an authenticated physical
+    /// device of `did`.
+    pub fn verify(
+        &self,
+        did: &str,
+        target_device_key: &XVerifyingKey,
+        revoked_at: &str,
+    ) -> Result<()> {
+        if revoked_at.is_empty() {
+            return Err(Error::Malformed("empty revokedAt"));
+        }
+        self.revoked_by.verify(
+            &revocation_message(did, target_device_key, revoked_at),
+            &self.sig,
+        )
+    }
+}
+
 /// Use-case byte for physical `pk_sign(deviceKey, 0x30, epochStorageKeyPub)`.
 pub const USE_CASE_STORAGE: u8 = 0x30;
 /// Use-case byte for physical `pk_sign(deviceKey, 0x31, epochStorageAuthKeyPub)`.

@@ -118,11 +118,11 @@ impl Labyrinth {
             space_readable: true,
             ..ThreadHistory::default()
         };
-        let window = self.readable(
+        let window = self.readable_quarantined(
             &mut h,
             self.b
                 .threads
-                .list_batches_before(thread_id, before_ms, limit)
+                .list_batches_before_quarantined(thread_id, before_ms, limit)
                 .await,
         )?;
         let owner_window = self
@@ -141,7 +141,7 @@ impl Labyrinth {
         raw.extend(
             sender_items
                 .chain(owner_items)
-                .filter(|&(ts, id)| older(ts, id)),
+                .filter(|&(ts, id)| ts <= i64::MAX as u64 && older(ts, id)),
         );
         // A store returns at least the newest `limit + 1` copy positions
         // below `before_ms` in full; only that span is known to be complete.
@@ -155,7 +155,13 @@ impl Labyrinth {
         let mut ids: Vec<&str> = span.iter().map(|&(_, id)| id).collect();
         ids.sort_unstable();
         ids.dedup();
-        let batches = self.readable(&mut h, self.b.threads.get_messages(thread_id, &ids).await)?;
+        let batches = self.readable_quarantined(
+            &mut h,
+            self.b
+                .threads
+                .get_messages_quarantined(thread_id, &ids)
+                .await,
+        )?;
         let owner = self.b.mailbox.get_owner_messages(thread_id, &ids).await?;
         // (rank, timestamp) of each message's positioning copy.
         let mut rank: BTreeMap<&str, (u8, u64)> = BTreeMap::new();

@@ -25,8 +25,9 @@ pub fn epoch_rkey(seq: u64) -> String {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait PublicRepoBackend: MaybeSend + MaybeSync {
-    /// `putRecord` into `did`'s repo with optional `swapRecord` CAS CID.
-    /// Returns the new record CID, or [`Error::Conflict`] on `InvalidSwap`.
+    /// Writes `rkey` in `did`'s repo with compare-and-swap semantics:
+    /// - `swap_cid: None` enforces create-if-absent (`Conflict` if `rkey` exists);
+    /// - `swap_cid: Some(cid)` enforces `swapRecord` CAS (`Conflict` on `InvalidSwap`).
     async fn put_mailbox_keys(
         &self,
         did: &str,
@@ -261,10 +262,15 @@ impl PublicRepoBackend for PublicRepoClient {
         }
         let mut repos = self.host.repos.lock().unwrap();
         let key = (did.to_owned(), rkey.to_owned());
-        if let Some(expected_cid) = swap_cid {
-            match repos.get(&key) {
+        match swap_cid {
+            Some(expected_cid) => match repos.get(&key) {
                 Some((_, current_cid)) if current_cid == expected_cid => {}
                 _ => return Err(Error::Conflict),
+            },
+            None => {
+                if repos.contains_key(&key) {
+                    return Err(Error::Conflict);
+                }
             }
         }
         let cid = self.host.compute_cid(record);

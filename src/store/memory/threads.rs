@@ -7,7 +7,9 @@ use crate::records::{
     AttachmentManifest, AuthorRedaction, Batch, Bytes, MekDistribution, SealedMessageDef,
     ms_from_datetime, nsid,
 };
-use crate::store::{Stored, ThreadStore, TimeRange};
+use crate::store::{
+    AuthorQuarantine, QuarantineReason, Stored, ThreadStore, TimeRange, push_quarantine,
+};
 use crate::{Error, Result};
 
 /// [`ThreadStore`] handle bound to one DID.
@@ -190,6 +192,51 @@ impl ThreadStore for MemoryThreads {
         })
     }
 
+    async fn list_batches_quarantined(
+        &self,
+        thread_id: &str,
+        sender: Option<&str>,
+        range: TimeRange,
+    ) -> Result<(Vec<Stored<Batch>>, Vec<AuthorQuarantine>)> {
+        self.space(thread_id, |t| {
+            let mut quarantined = Vec::new();
+            let mut batches: Vec<Stored<Batch>> = t
+                .repos
+                .iter()
+                .filter(|(did, _)| sender.is_none_or(|s| s == did.as_str()))
+                .flat_map(|(did, repo)| {
+                    repo.batches.iter().map(|(rkey, (batch, order))| Stored {
+                        author: did.clone(),
+                        rkey: rkey.clone(),
+                        value: batch.clone(),
+                        order: *order,
+                    })
+                })
+                .collect();
+            for ((author, _), record) in &t.author_redactions {
+                if sender.is_none_or(|expected| expected == author)
+                    && let Err(e) =
+                        overlay_author_redaction(thread_id, author, &mut batches, record.clone())
+                {
+                    push_quarantine(
+                        &mut quarantined,
+                        author.clone(),
+                        QuarantineReason::InvalidRedaction,
+                        format!("authorRedaction {}: {e}", record.message_id),
+                    );
+                }
+            }
+            batches.retain(|batch| {
+                batch
+                    .value
+                    .items
+                    .iter()
+                    .any(|item| range.contains(item.timestamp))
+            });
+            Ok((batches, quarantined))
+        })
+    }
+
     async fn list_batches_before(
         &self,
         thread_id: &str,
@@ -233,6 +280,53 @@ impl ThreadStore for MemoryThreads {
             core::cmp::Reverse(batch.value.items.iter().map(|item| item.timestamp).max())
         });
         Ok(candidates)
+    }
+
+    async fn list_batches_before_quarantined(
+        &self,
+        thread_id: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<(Vec<Stored<Batch>>, Vec<AuthorQuarantine>)> {
+        let target = limit.max(1).saturating_add(1);
+        let (mut candidates, quarantined) = self
+            .list_batches_quarantined(thread_id, None, TimeRange::ALL)
+            .await?;
+        candidates.retain(|batch| {
+            batch
+                .value
+                .items
+                .iter()
+                .any(|item| before_ms.is_none_or(|until| item.timestamp < until))
+        });
+        candidates
+            .sort_by_key(|batch| core::cmp::Reverse(batch.order.map(|order| order.labyrinth_seq)));
+        let mut eligible = std::collections::BTreeSet::new();
+        for batch in &candidates {
+            for item in &batch.value.items {
+                if before_ms.is_none_or(|until| item.timestamp < until.saturating_sub(1)) {
+                    eligible.insert((item.timestamp, item.message_id.clone()));
+                }
+            }
+            if eligible.len() >= target {
+                break;
+            }
+        }
+        if let Some((floor, _)) = (eligible.len() >= target)
+            .then(|| eligible.iter().rev().nth(target - 1))
+            .flatten()
+        {
+            let floor = *floor;
+            candidates.retain(|batch| {
+                batch.value.items.iter().any(|item| {
+                    item.timestamp >= floor && before_ms.is_none_or(|until| item.timestamp < until)
+                })
+            });
+        }
+        candidates.sort_by_key(|batch| {
+            core::cmp::Reverse(batch.value.items.iter().map(|item| item.timestamp).max())
+        });
+        Ok((candidates, quarantined))
     }
 
     async fn list_threads(&self) -> Result<Vec<String>> {

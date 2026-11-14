@@ -482,6 +482,33 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
+    async fn set_device_revocation(
+        &self,
+        device_key: &XVerifyingKey,
+        revoked_at: &str,
+        revocation: &crate::records::DeviceRevocationDef,
+    ) -> Result<()> {
+        let owner = self.did.clone();
+        self.with(|m| {
+            let rkey = hex::encode(device_key.0);
+            let current = m.devices.get(&rkey).ok_or(Error::NotFound("device"))?;
+            let all_devices: Vec<Device> = m.devices.values().cloned().collect();
+            if crate::records::should_replace_device_revocation(
+                &owner,
+                device_key,
+                current,
+                &all_devices,
+                revoked_at,
+                revocation,
+            ) {
+                let d = m.devices.get_mut(&rkey).expect("checked above");
+                d.revoked_at = Some(revoked_at.to_owned());
+                d.revocation = Some(revocation.clone());
+            }
+            Ok(())
+        })
+    }
+
     async fn get_device(&self, device_key: &XVerifyingKey) -> Result<Option<Device>> {
         self.with(|m| Ok(m.devices.get(&hex::encode(device_key.0)).cloned()))
     }

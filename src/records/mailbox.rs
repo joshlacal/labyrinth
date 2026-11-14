@@ -2,9 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::defs::{EpochPublicDef, OwnerMessageDef, TransportAttestationDef};
+use super::defs::{DeviceRevocationDef, EpochPublicDef, OwnerMessageDef, TransportAttestationDef};
 use super::{Bytes, check_type, nsid};
-use crate::device::{ChatBinding, DevicePublic};
+use crate::device::{ChatBinding, DevicePublic, DeviceRevocation};
 use crate::epoch::{EpochMemberRecord, EpochRecord};
 use crate::hpke::X25519Public;
 use crate::hpke::hawk::HawkEncPublic;
@@ -33,6 +33,8 @@ pub struct Device {
     pub chat_binding: Option<TransportAttestationDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation: Option<DeviceRevocationDef>,
     pub created_at: String,
 }
 
@@ -50,6 +52,7 @@ impl Device {
             r#virtual: p.is_virtual,
             chat_binding: None,
             revoked_at: None,
+            revocation: None,
             created_at,
         }
     }
@@ -74,6 +77,14 @@ impl Device {
                     sig: b.sig.array("chatBinding sig length")?,
                 })
             })
+            .transpose()
+    }
+
+    /// The revocation statement, parsed (not verified).
+    pub fn revocation(&self) -> Result<Option<DeviceRevocation>> {
+        self.revocation
+            .as_ref()
+            .map(DeviceRevocationDef::to_revocation)
             .transpose()
     }
 
@@ -105,6 +116,57 @@ impl Device {
     }
 }
 
+/// Whether `set_device_revocation` should overwrite `current`'s `(revoked_at, revocation)`:
+/// - Identical `(revoked_at, revocation)` is a no-op (`false`).
+/// - Any missing, malformed, bad-signature, or unbound existing revocation is always replaced (`true`).
+/// - An existing revocation signed by a bound physical device in `all_devices` may only be
+///   replaced by another revocation signed by a bound physical device in `all_devices`.
+pub(crate) fn should_replace_device_revocation(
+    owner_did: &str,
+    device_key: &XVerifyingKey,
+    current: &Device,
+    all_devices: &[Device],
+    new_revoked_at: &str,
+    new_revocation: &DeviceRevocationDef,
+) -> bool {
+    if current.revoked_at.as_deref() == Some(new_revoked_at)
+        && current.revocation.as_ref() == Some(new_revocation)
+    {
+        return false;
+    }
+    let is_bound_revocation = |ts: &str, rev_def: &DeviceRevocationDef| -> bool {
+        if super::ms_from_datetime(ts).is_err() {
+            return false;
+        }
+        let Ok(rev) = rev_def.to_revocation() else {
+            return false;
+        };
+        if rev.verify(owner_did, device_key, ts).is_err() {
+            return false;
+        }
+        all_devices.iter().any(|cand| {
+            cand.to_public().is_ok_and(|p| {
+                !p.is_virtual
+                    && p.verify().is_ok()
+                    && p.device_key_pub == rev.revoked_by
+                    && cand
+                        .chat_binding()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|b| b.verify(owner_did, &p.device_key_pub).is_ok())
+            })
+        })
+    };
+    let existing_valid = match (&current.revoked_at, &current.revocation) {
+        (Some(ts), Some(rev_def)) => is_bound_revocation(ts, rev_def),
+        _ => false,
+    };
+    if !existing_valid {
+        return true;
+    }
+    is_bound_revocation(new_revoked_at, new_revocation)
+}
+
 /// `blue.catbird.labyrinth.epoch`, rkey = the backend's `epochID` ([CB-9]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -117,6 +179,10 @@ pub struct Epoch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_previous_epoch_root_key: Option<Bytes>,
     pub opened_by: Bytes,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revocations: Vec<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocations_sig: Option<Bytes>,
     pub created_at: String,
 }
 
@@ -128,17 +194,41 @@ impl Epoch {
             encrypted_previous_epoch_number: r.encrypted_prev_seq.clone().map(Bytes),
             encrypted_previous_epoch_root_key: r.encrypted_prev_root.clone().map(Bytes),
             opened_by: Bytes::from_slice(&r.opened_by.0),
+            revocations: r
+                .revocations
+                .iter()
+                .map(|k| Bytes::from_slice(&k.0))
+                .collect(),
+            revocations_sig: r.revocations_sig.map(|s| Bytes::from_slice(&s)),
             created_at,
         }
     }
 
     pub fn to_record(&self) -> Result<EpochRecord> {
         check_type(&self.type_, nsid::EPOCH)?;
+        if self.revocations.len() > 256 {
+            return Err(Error::Malformed("epoch revocations count"));
+        }
+        let revocations = self
+            .revocations
+            .iter()
+            .map(|b| b.array("epoch revocation key length").map(XVerifyingKey))
+            .collect::<Result<Vec<_>>>()?;
+        if !revocations.windows(2).all(|w| w[0].0 < w[1].0) {
+            return Err(Error::Malformed("unsorted epoch revocations"));
+        }
+        let revocations_sig = self
+            .revocations_sig
+            .as_ref()
+            .map(|b| b.array("epoch revocationsSig length"))
+            .transpose()?;
         let r = EpochRecord {
             public: self.public.to_public()?,
             encrypted_prev_seq: self.encrypted_previous_epoch_number.clone().map(|b| b.0),
             encrypted_prev_root: self.encrypted_previous_epoch_root_key.clone().map(|b| b.0),
             opened_by: XVerifyingKey(self.opened_by.array("openedBy length")?),
+            revocations,
+            revocations_sig,
         };
         let genesis = r.public.seq == 0;
         if genesis == r.encrypted_prev_seq.is_some() || genesis == r.encrypted_prev_root.is_some() {
@@ -228,6 +318,8 @@ pub struct VirtualDevice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passkey_credential_id: Option<Bytes>,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_sig: Option<Bytes>,
     /// Last successful restore or keep-alive ([CB-39]); stamped by the
     /// server (clients never write it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +347,7 @@ impl VirtualDevice {
             passkey_wrapped_code: passkey.map(|p| Bytes(p.wrapped_code.clone())),
             passkey_credential_id: passkey.map(|p| Bytes(p.credential_id.clone())),
             created_at,
+            metadata_sig: r.metadata_sig.map(|s| Bytes::from_slice(&s)),
             last_used_at: None,
         }
     }
@@ -281,6 +374,16 @@ impl VirtualDevice {
             (None, None) => None,
             _ => return Err(Error::Malformed("passkey fields must come together")),
         };
+        let metadata_sig = self
+            .metadata_sig
+            .as_ref()
+            .map(|b| b.array("virtualDevice metadataSig length"))
+            .transpose()?;
+        let bound_created_at = if metadata_sig.is_some() {
+            Some(self.created_at.clone())
+        } else {
+            None
+        };
         let record = VirtualDeviceRecord {
             vdevice_id: self.vdevice_id.array("vdeviceId length")?,
             public,
@@ -289,7 +392,21 @@ impl VirtualDevice {
             encrypted_epoch_root_key: self.encrypted_epoch_root_key.0.clone(),
             encrypted_epoch_number: self.encrypted_epoch_number.0.clone(),
             mechanism: Mechanism::parse(&self.mechanism)?,
+            bound_created_at,
+            metadata_sig,
         };
+        record.validate_shape(None)?;
+        Ok((record, passkey))
+    }
+
+    /// Parses and validates the bundle against `did` (including `metadataSig`
+    /// when present and AEAD ciphertext shape invariants).
+    pub fn to_bundle_for_did(
+        &self,
+        did: &str,
+    ) -> Result<(VirtualDeviceRecord, Option<PasskeyWrap>)> {
+        let (record, passkey) = self.to_bundle()?;
+        record.validate_shape(Some(did))?;
         Ok((record, passkey))
     }
 

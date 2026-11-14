@@ -7,7 +7,9 @@ use super::epochs::{
     chain_forward_healing_squats, check_candidate_integrity, clear_unanchored_invalid_successor,
     epoch_record, verified_own,
 };
-use super::members::audit_epoch_stores;
+use super::members::{
+    ExcludedMember, ExclusionReason, audit_epoch_stores, verify_epoch_members_hash,
+};
 use super::{Backends, Labyrinth};
 use crate::device::{ChatBinding, DevicePublic};
 use crate::epoch::{
@@ -26,6 +28,7 @@ use crate::{Error, Result};
 
 /// A new recovery bundle. Show `code` to the user (or store it in the
 /// keychain), then drop it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecoverySetup {
     pub code: RecoveryCode,
     pub vdevice_id: [u8; 16],
@@ -37,6 +40,11 @@ pub struct Enrollment {
     /// The restoring device's local clock considers this automatically
     /// stored recovery method stale. Advisory only; rotation is authoritative.
     pub stale_recovery_method: bool,
+    /// Revoked members of the previous epoch dropped by this enrollment rotation.
+    pub evicted_revoked: Vec<XVerifyingKey>,
+    /// Invalid, unbound, or expired members of the previous epoch dropped by
+    /// this enrollment rotation.
+    pub excluded: Vec<ExcludedMember>,
     /// The first error publishing the enrolled epoch head. The head then
     /// stays durably pending ([`Labyrinth::pending_directory_epoch`]): save
     /// the returned state, and opening it retries the publication.
@@ -55,6 +63,8 @@ impl core::fmt::Debug for Enrollment {
         f.debug_struct("Enrollment")
             .field("device_key", &self.device_key)
             .field("stale_recovery_method", &self.stale_recovery_method)
+            .field("evicted_revoked", &self.evicted_revoked)
+            .field("excluded", &self.excluded)
             .field("unfinished", &self.unfinished)
             .finish_non_exhaustive()
     }
@@ -90,13 +100,14 @@ fn prefer_passkey_error(current: &mut Option<Error>, candidate: Error) {
 pub(super) fn vdevice_stale_at_ms(
     mechanism: Mechanism,
     vdev: &VirtualDevice,
+    now_ms: u64,
 ) -> Result<Option<u64>> {
     let created_ms = crate::records::ms_from_datetime(&vdev.created_at)?;
     let last_used_ms = vdev
         .last_used_at
         .as_deref()
-        .map(crate::records::ms_from_datetime)
-        .transpose()?;
+        .and_then(|ts| crate::records::ms_from_datetime(ts).ok())
+        .filter(|&ts| ts >= created_ms && ts <= now_ms);
     Ok(super::recovery::recovery_stale_at(
         mechanism,
         created_ms,
@@ -135,7 +146,7 @@ fn select_passkey_bundles<'a>(
                 return Err(Error::Conflict);
             }
             let canonical_wrap = canonical
-                .to_bundle()?
+                .to_bundle_for_did(did)?
                 .1
                 .ok_or(Error::Malformed("passkey fields must come together"))?;
             if canonical_wrap.credential_id != credential_id {
@@ -170,6 +181,7 @@ struct PreparedRestore {
     restored: RestoredState,
     reached: Vec<EpochSecret>,
     latest_public: EpochPublic,
+    cumulative_revoked: BTreeSet<[u8; 32]>,
     stale_recovery_method: bool,
 }
 
@@ -200,8 +212,9 @@ impl Labyrinth {
         self.sync_epochs().await?;
         let current = self.epoch_secret(self.latest).await?;
         let code = RecoveryCode::generate()?;
+        let now = self.now();
         let (rec, member) =
-            virtual_device::create(&self.did, &code, &self.device, &current, mechanism)?;
+            virtual_device::create_at(&self.did, &code, &self.device, &current, mechanism, &now)?;
         let wrap = passkey
             .map(|(prf, cred)| {
                 Ok::<_, Error>(PasskeyWrap {
@@ -210,7 +223,6 @@ impl Labyrinth {
                 })
             })
             .transpose()?;
-        let now = self.now();
         let mb = self.b.mailbox.as_ref();
         let device = Device::from_public(&rec.public, now.clone());
         let bundle = VirtualDevice::from_bundle(&rec, wrap.as_ref(), now.clone());
@@ -231,7 +243,7 @@ impl Labyrinth {
             .get_virtual_device(&rec.vdevice_id)
             .await?
             .ok_or(Error::NotFound("persisted recovery bundle"))?;
-        let (persisted_record, persisted_wrap) = persisted_bundle.to_bundle()?;
+        let (persisted_record, persisted_wrap) = persisted_bundle.to_bundle_for_did(&self.did)?;
         let persisted_member = mb
             .get_epoch_member(current.seq(), &rec.public.device_key_pub)
             .await?
@@ -324,18 +336,18 @@ impl Labyrinth {
         code: &RecoveryCode,
         b: &Backends,
     ) -> Result<PreparedRestore> {
-        let (record, _) = bundle.to_bundle()?;
+        let (record, _) = bundle.to_bundle_for_did(did)?;
         let vdev = b
             .mailbox
             .get_virtual_device(&record.vdevice_id)
             .await?
             .ok_or(Error::NotFound("virtual device"))?;
         let now = b.clock.now_ms();
-        let stale_recovery_method = vdevice_stale_at_ms(record.mechanism, bundle)?
+        let stale_recovery_method = vdevice_stale_at_ms(record.mechanism, bundle, now)?
             .is_some_and(|stale_at| now >= stale_at)
-            || vdevice_stale_at_ms(record.mechanism, &vdev)?
+            || vdevice_stale_at_ms(record.mechanism, &vdev, now)?
                 .is_some_and(|stale_at| now >= stale_at);
-        let (fresh_record, _) = vdev.to_bundle()?;
+        let (fresh_record, _) = vdev.to_bundle_for_did(did)?;
         if fresh_record != record {
             return Err(Error::Conflict);
         }
@@ -345,6 +357,8 @@ impl Labyrinth {
         let start = PendingEpoch::new(seq, *restored.epoch.root()).assign_id(id);
         verify_public(&start, &start_record.public)?;
         start_record.public.verify(did, None)?;
+        start_record.verify_revocations(did)?;
+        verify_epoch_members_hash(b.mailbox.as_ref(), &start, &start_record.public).await?;
         let reached = chain_forward_healing_squats(
             b.mailbox.as_ref(),
             b.directory.as_ref(),
@@ -355,6 +369,16 @@ impl Labyrinth {
             &Default::default(),
         )
         .await?;
+        let mut cumulative_revoked = BTreeSet::new();
+        for s in &reached {
+            let (_, rec) = epoch_record(b.mailbox.as_ref(), s.seq).await?;
+            rec.verify_revocations(did)?;
+            verify_epoch_members_hash(b.mailbox.as_ref(), s, &rec.public).await?;
+            cumulative_revoked.extend(rec.revocations.iter().map(|k| k.0));
+        }
+        if cumulative_revoked.contains(&restored.device.public().device_key_pub.0) {
+            return Err(Error::NotEpochMember);
+        }
         let latest = reached.last().expect("non-empty");
         let latest_public =
             verified_own(b.mailbox.as_ref(), b.directory.as_ref(), did, latest).await?;
@@ -371,6 +395,7 @@ impl Labyrinth {
             restored,
             reached,
             latest_public,
+            cumulative_revoked,
             stale_recovery_method,
         })
     }
@@ -386,6 +411,7 @@ impl Labyrinth {
             restored,
             mut reached,
             latest_public,
+            mut cumulative_revoked,
             stale_recovery_method,
         } = prepared;
         let mine = transport.transport_public_key();
@@ -397,15 +423,30 @@ impl Labyrinth {
         let (device, public, _) = virtual_device::enroll_from_virtual(&restored, latest)?;
         let audit =
             audit_epoch_stores(b.mailbox.as_ref(), b.directory.as_ref(), did, latest).await?;
+        audit.verify_members_hash(latest.seq, &latest_public)?;
+        if audit
+            .excluded
+            .iter()
+            .any(|x| x.reason == ExclusionReason::UnsignedRevocation)
+        {
+            return Err(Error::DeviceTampered);
+        }
+        let mut evicted_revoked = Vec::new();
+        for v in &audit.valid {
+            if v.revoked || cumulative_revoked.contains(&v.record.device_key_pub.0) {
+                evicted_revoked.push(v.record.device_key_pub);
+                cumulative_revoked.insert(v.record.device_key_pub.0);
+            }
+        }
         let continuing: Vec<DevicePublic> = audit
             .valid
             .iter()
-            .filter(|v| !v.revoked)
+            .filter(|v| !v.revoked && !cumulative_revoked.contains(&v.record.device_key_pub.0))
             .map(|v| v.public.clone())
             .collect();
         let prev_members: Vec<EpochMemberRecord> =
             audit.valid.iter().map(|v| v.record.clone()).collect();
-        let (pending_next, new_next) = open_next_enrolling(
+        let (pending_next, mut new_next) = open_next_enrolling(
             did,
             latest,
             &latest_public,
@@ -414,6 +455,13 @@ impl Labyrinth {
             &device,
             transport.as_ref(),
         )?;
+        if !cumulative_revoked.is_empty() {
+            new_next.record.sign_revocations(
+                did,
+                &device.device_key,
+                cumulative_revoked.iter().copied().map(XVerifyingKey),
+            )?;
+        }
         let now = datetime_from_ms(b.clock.now_ms());
         vdev.last_used_at = Some(now.clone());
         let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());
@@ -432,6 +480,7 @@ impl Labyrinth {
         let next_seq = next_secret.seq;
         reached.push(next_secret);
         let mut me = Self::assemble(did, device, transport, b, reached)?;
+        me.revoked = cumulative_revoked;
         me.adopted(new_next.record.public.clone());
         me.remember_verified(
             next_seq,
@@ -445,6 +494,8 @@ impl Labyrinth {
             Enrollment {
                 device_key: public.device_key_pub,
                 stale_recovery_method,
+                evicted_revoked,
+                excluded: audit.excluded,
                 unfinished,
             },
         ))
@@ -522,18 +573,37 @@ impl Labyrinth {
             &epoch_public.head,
         )
         .await?;
+        let (_, current_epoch_rec) = epoch_record(b.mailbox.as_ref(), epoch.seq).await?;
+        current_epoch_rec.verify_revocations(did)?;
+        let mut cumulative_revoked: BTreeSet<[u8; 32]> =
+            current_epoch_rec.revocations.iter().map(|k| k.0).collect();
         let (device, public, _) = payload.enroll()?;
         let audit =
             audit_epoch_stores(b.mailbox.as_ref(), b.directory.as_ref(), did, epoch).await?;
+        audit.verify_members_hash(epoch.seq, &epoch_public)?;
+        if audit
+            .excluded
+            .iter()
+            .any(|x| x.reason == ExclusionReason::UnsignedRevocation)
+        {
+            return Err(Error::DeviceTampered);
+        }
+        let mut evicted_revoked = Vec::new();
+        for v in &audit.valid {
+            if v.revoked || cumulative_revoked.contains(&v.record.device_key_pub.0) {
+                evicted_revoked.push(v.record.device_key_pub);
+                cumulative_revoked.insert(v.record.device_key_pub.0);
+            }
+        }
         let continuing: Vec<DevicePublic> = audit
             .valid
             .iter()
-            .filter(|v| !v.revoked)
+            .filter(|v| !v.revoked && !cumulative_revoked.contains(&v.record.device_key_pub.0))
             .map(|v| v.public.clone())
             .collect();
         let prev_members: Vec<EpochMemberRecord> =
             audit.valid.iter().map(|v| v.record.clone()).collect();
-        let (pending_next, new_next) = open_next_enrolling(
+        let (pending_next, mut new_next) = open_next_enrolling(
             did,
             epoch,
             &epoch_public,
@@ -542,6 +612,13 @@ impl Labyrinth {
             &device,
             transport.as_ref(),
         )?;
+        if !cumulative_revoked.is_empty() {
+            new_next.record.sign_revocations(
+                did,
+                &device.device_key,
+                cumulative_revoked.iter().copied().map(XVerifyingKey),
+            )?;
+        }
         let now = datetime_from_ms(b.clock.now_ms());
         let binding = ChatBinding::sign(did, &public.device_key_pub, transport.as_ref());
         let bundle = AtomicEnrollBundle {
@@ -571,6 +648,7 @@ impl Labyrinth {
             b,
             [payload.epoch.clone(), next_secret],
         )?;
+        me.revoked = cumulative_revoked;
         me.adopted(new_next.record.public.clone());
         me.remember_verified(
             next_seq,
@@ -583,6 +661,8 @@ impl Labyrinth {
             Enrollment {
                 device_key: public.device_key_pub,
                 stale_recovery_method: false,
+                evicted_revoked,
+                excluded: audit.excluded,
                 unfinished,
             },
         ))

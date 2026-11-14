@@ -131,6 +131,11 @@ impl MailboxStore for IgnoresRevoke {
     async fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
         self.0.list_virtual_devices().await
     }
+    async fn list_virtual_device_records(
+        &self,
+    ) -> labyrinth::Result<Vec<labyrinth::Result<VirtualDevice>>> {
+        self.0.list_virtual_device_records().await
+    }
     async fn put_otc_session(&self, s: &OtcSession) -> labyrinth::Result<()> {
         self.0.put_otc_session(s).await
     }
@@ -460,9 +465,12 @@ fn recovery_rejects_an_older_published_head_from_another_branch() {
         backends(&net, &clock, A, Box::new(net.mailbox(A))),
     ))
     .unwrap();
-    let recovery = block_on(phone.create_recovery_code(Mechanism::Code)).unwrap();
+    let _initial_recovery = block_on(phone.create_recovery_code(Mechanism::Code)).unwrap();
     let sibling = enroll_sibling(&net, &clock, &mut phone, 2, Box::new(net.mailbox(A)));
-    block_on(phone.revoke_device(&sibling.device_public().device_key_pub)).unwrap();
+    let rot = block_on(phone.revoke_device(&sibling.device_public().device_key_pub)).unwrap();
+    let recovery = rot
+        .rekeyed_recovery
+        .expect("physical revocation re-keys recovery methods");
     assert_eq!(phone.latest_epoch(), 2);
 
     let controls = DirectoryControls::default();
@@ -1208,15 +1216,14 @@ fn reached_epoch_readmitting_a_revoked_device_is_not_activated() {
         seq: 3,
         reason: "it re-admits a device this client revoked",
     };
-    assert_eq!(
-        block_on(laptop.archive_owner("blocked", "m", 1, b"must not encrypt")).unwrap_err(),
-        blocked
-    );
-    assert_eq!(block_on(laptop.resolve_roster(&[A])).unwrap_err(), blocked);
-    assert_eq!(
-        block_on(laptop.archive_outgoing("blocked", &[], "m", 1, b"must not encrypt")).unwrap_err(),
-        blocked
-    );
+    // Archiving and roster resolution stay non-wedging against already-adopted
+    // epochs while the revocation remains uncommitted; directory key publication
+    // and full epoch sync still refuse to activate or advertise an epoch that
+    // re-admits the revoked device.
+    block_on(laptop.archive_owner("blocked", "m", 1, b"archive stays available")).unwrap();
+    assert!(block_on(laptop.resolve_roster(&[A])).is_ok());
+    block_on(laptop.archive_outgoing("blocked", &[], "m", 1, b"archive stays available")).unwrap();
+    laptop.discard_pending("blocked");
     assert_eq!(block_on(laptop.publish_latest_keys()).unwrap_err(), blocked);
     let latest = laptop.latest_epoch();
     let before_same_epoch = laptop.export_state().unwrap();
@@ -1684,6 +1691,14 @@ impl MailboxStore for Tampered {
     async fn set_device_revoked(&self, k: &XVerifyingKey, at: &str) -> labyrinth::Result<()> {
         self.0.set_device_revoked(k, at).await
     }
+    async fn set_device_revocation(
+        &self,
+        k: &XVerifyingKey,
+        at: &str,
+        rev: &labyrinth::records::DeviceRevocationDef,
+    ) -> labyrinth::Result<()> {
+        self.0.set_device_revocation(k, at, rev).await
+    }
     async fn get_device(&self, k: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
         self.0.get_device(k).await
     }
@@ -1739,6 +1754,11 @@ impl MailboxStore for Tampered {
     }
     async fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
         self.0.list_virtual_devices().await
+    }
+    async fn list_virtual_device_records(
+        &self,
+    ) -> labyrinth::Result<Vec<labyrinth::Result<VirtualDevice>>> {
+        self.0.list_virtual_device_records().await
     }
     async fn put_otc_session(&self, s: &OtcSession) -> labyrinth::Result<()> {
         self.0.put_otc_session(s).await

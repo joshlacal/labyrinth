@@ -40,11 +40,11 @@ pub mod state;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-pub use crate::store::LeaveArchiveReport;
+pub use crate::store::{AuthorQuarantine, LeaveArchiveReport, QuarantineReason};
 pub use composite::CompositeDirectory;
 pub use delete::{PurgeReport, delete_account_remote};
 pub use enroll::{Enrollment, OtcResponse, RecoverySetup};
-pub use epochs::{RotationReport, SyncReport};
+pub use epochs::{InvalidatedRecoveryMethod, RotationReport, SyncReport};
 pub use lookup::{ThreadCursor, ThreadList, ThreadPage, ThreadSummary};
 pub use members::{ExcludedMember, ExclusionReason};
 pub use pins::{PeerPin, RepinProposal};
@@ -136,9 +136,15 @@ pub struct Labyrinth {
     own_attester_checked: bool,
     /// My epoch heads → sequence numbers (filled lazily from the store).
     heads: HashMap<[u8; 32], u64>,
-    /// `deviceKeyPub`s this client revoked; every rotation excludes them,
-    /// whatever the store says about `revokedAt`.
+    /// `deviceKeyPub`s whose exclusion rotation has committed; every rotation
+    /// and sync excludes them, whatever the store says about `revokedAt`.
     revoked: BTreeSet<[u8; 32]>,
+    /// `deviceKeyPub`s marked for revocation locally whose exclusion rotation
+    /// has not yet committed, mapped to the `latest` epoch seq at decision time.
+    pending_revocations: BTreeMap<[u8; 32], u64>,
+    /// Most recent rotation report whose mailbox write committed while its
+    /// directory publication remained pending.
+    last_unanchored_rotation: Option<RotationReport>,
     /// Members of one epoch (the sequence number) this client verified;
     /// a later verification failure for one of them is store tampering
     /// ([`Error::MemberTampered`]), not a planted row.
@@ -159,6 +165,7 @@ pub struct Labyrinth {
     /// cannot cross a later device/account rotation.
     outbox_rosters: BTreeMap<String, Vec<(String, [u8; 32])>>,
     owner_outbox: BTreeMap<String, Vec<OwnerMessage>>,
+    flush_cache: send::FlushDirectoryCache,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -202,6 +209,8 @@ impl Labyrinth {
             own_attester_checked: false,
             heads: HashMap::new(),
             revoked: BTreeSet::new(),
+            pending_revocations: BTreeMap::new(),
+            last_unanchored_rotation: None,
             verified: (latest, BTreeSet::new()),
             pins: BTreeMap::new(),
             meks: BTreeMap::new(),
@@ -209,6 +218,7 @@ impl Labyrinth {
             outbox: BTreeMap::new(),
             outbox_rosters: BTreeMap::new(),
             owner_outbox: BTreeMap::new(),
+            flush_cache: send::FlushDirectoryCache::default(),
         })
     }
 
@@ -367,14 +377,29 @@ impl Labyrinth {
         self.own_attester_checked = true;
     }
 
+    pub(super) fn all_revoked_keys(&self) -> BTreeSet<[u8; 32]> {
+        self.revoked
+            .iter()
+            .copied()
+            .chain(self.pending_revocations.keys().copied())
+            .collect()
+    }
+
     /// [`latest_public`](Self::latest_public) after finishing a deferred
     /// attester check: the copy that goes into a roster.
+    #[allow(dead_code)]
     async fn own_latest_checked(&mut self) -> Result<EpochPublic> {
-        // A failed revocation deliberately remains in the persisted local
-        // revoked set. Before this account contributes a recipient epoch to
-        // any new archive, prove that the active epoch excludes every such
-        // device; otherwise it may still know the encryption root.
         self.sync_epochs().await?;
+        self.adopt_latest().await?;
+        self.latest_public()
+    }
+
+    /// [`latest_public`](Self::latest_public) for archiving and roster
+    /// resolution: permits uncommitted pending revocations only at or below
+    /// their local decision epoch while rejecting any re-admission or any
+    /// previously committed revocation.
+    pub(super) async fn own_latest_for_archive(&mut self) -> Result<EpochPublic> {
+        self.sync_epochs_for_archive().await?;
         self.adopt_latest().await?;
         self.latest_public()
     }

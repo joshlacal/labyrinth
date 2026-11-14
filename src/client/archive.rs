@@ -26,7 +26,7 @@ impl Labyrinth {
         if self.receipt_required(thread_id).await? {
             return Err(Error::ReceiptCommitmentMismatch);
         }
-        self.sync_epochs().await?;
+        self.sync_epochs_for_archive().await?;
         self.archive_owner_synced(thread_id, message_id, timestamp, frame)
             .await
     }
@@ -45,7 +45,7 @@ impl Labyrinth {
         if self.receipt_required(thread_id).await? {
             return Err(Error::ReceiptCommitmentMismatch);
         }
-        self.sync_epochs().await?;
+        self.sync_epochs_for_archive().await?;
         let e = self.epoch_secret(self.latest).await?;
         let m = seal_owner_attributed(
             e.root(),
@@ -94,7 +94,7 @@ impl Labyrinth {
             .map_err(|_| Error::ReceiptCommitmentMismatch)?;
         self.verify_and_remember_receipt(thread_id, &receipt.signed)
             .await?;
-        self.sync_epochs().await?;
+        self.sync_epochs_for_archive().await?;
         let e = self.epoch_secret(self.latest).await?;
         let m = seal_owner_committed(
             e.root(),
@@ -206,7 +206,7 @@ impl Labyrinth {
     }
 
     async fn rearchive_messages_before_leave_inner(&mut self, thread_id: &str) -> Result<usize> {
-        self.sync_epochs().await?;
+        self.sync_epochs_for_archive().await?;
         if self
             .owner_outbox
             .values()
@@ -222,11 +222,11 @@ impl Labyrinth {
             space_readable: true,
             ..ThreadHistory::default()
         };
-        let batches = self.readable(
+        let batches = self.readable_quarantined(
             &mut h,
             self.b
                 .threads
-                .list_batches(thread_id, None, TimeRange::ALL)
+                .list_batches_quarantined(thread_id, None, TimeRange::ALL)
                 .await,
         )?;
         let owner_batches = self

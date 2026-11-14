@@ -74,6 +74,100 @@ pub struct VirtualDeviceRecord {
     /// Sealed `base64(decimal(seq))`.
     pub encrypted_epoch_number: Vec<u8>,
     pub mechanism: Mechanism,
+    /// When `Some`, `(did, vdevice_id, mechanism, created_at)` is bound into
+    /// all four field AADs and signed in `metadata_sig` by `public.device_key_pub`.
+    pub bound_created_at: Option<String>,
+    /// XEdDSA signature by `public.device_key_pub` over the bundle metadata.
+    pub metadata_sig: Option<[u8; 64]>,
+}
+
+const METADATA_SIG_PREFIX: &str = "catbird.labyrinth.virtual_device_meta_v2:";
+const DNDK_OVERHEAD: usize = 1 + 24 + 16 + 32;
+
+fn bundle_aad(
+    base: &[u8],
+    did: &str,
+    vdevice_id: &[u8; 16],
+    mechanism: Mechanism,
+    created_at: Option<&str>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(base.len() + did.len() + 96);
+    out.extend_from_slice(base);
+    out.extend_from_slice(b"|v2|did=");
+    out.extend_from_slice(did.as_bytes());
+    out.extend_from_slice(b"|vid=");
+    out.extend_from_slice(hex::encode(vdevice_id).as_bytes());
+    out.extend_from_slice(b"|mech=");
+    out.extend_from_slice(mechanism.as_str().as_bytes());
+    if let Some(ts) = created_at {
+        out.extend_from_slice(b"|created=");
+        out.extend_from_slice(ts.as_bytes());
+    }
+    out
+}
+
+fn bundle_metadata_message(
+    did: &str,
+    vdevice_id: &[u8; 16],
+    mechanism: Mechanism,
+    created_at: &str,
+) -> Vec<u8> {
+    format!(
+        "{METADATA_SIG_PREFIX}{did}:{}:{}:{created_at}",
+        hex::encode(vdevice_id),
+        mechanism.as_str()
+    )
+    .into_bytes()
+}
+
+impl VirtualDeviceRecord {
+    /// Verifies public keys, AEAD suite tags, ciphertext field lengths, and
+    /// `metadata_sig` (when `did` is provided and `metadata_sig` is present)
+    /// without needing the recovery code.
+    pub fn validate_shape(&self, did: Option<&str>) -> Result<()> {
+        if !self.public.is_virtual {
+            return Err(Error::DeviceTampered);
+        }
+        self.public.verify()?;
+        let check_ct = |ct: &[u8], min_pt: usize, max_pt: usize| -> Result<()> {
+            if ct.first() != Some(&(Suite::DndkGcm as u8)) {
+                return Err(Error::Malformed("virtual device ciphertext suite"));
+            }
+            let min_len = DNDK_OVERHEAD + min_pt;
+            let max_len = DNDK_OVERHEAD + max_pt;
+            if ct.len() < min_len || ct.len() > max_len {
+                return Err(Error::Malformed("virtual device ciphertext length"));
+            }
+            Ok(())
+        };
+        check_ct(&self.encrypted_device_key_priv, 32, 32)?;
+        check_ct(
+            &self.encrypted_epoch_storage_key_priv,
+            HAWK_ENC_SECRET_LEN,
+            HAWK_ENC_SECRET_LEN,
+        )?;
+        check_ct(&self.encrypted_epoch_root_key, 32, 32)?;
+        // `b64_decimal(0)` is 4 bytes ("MA=="); 11 decimal digits base64-encode to 16 bytes.
+        check_ct(&self.encrypted_epoch_number, 4, 24)?;
+        match (&self.bound_created_at, &self.metadata_sig) {
+            (Some(ts), Some(sig)) => {
+                let _ = crate::records::ms_from_datetime(ts)?;
+                if let Some(did) = did {
+                    self.public.device_key_pub.verify(
+                        &bundle_metadata_message(did, &self.vdevice_id, self.mechanism, ts),
+                        sig,
+                    )?;
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(Error::Malformed(
+                    "virtual device metadata signature presence",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What a recovery code unlocks.
@@ -81,6 +175,56 @@ pub struct RestoredState {
     pub device: DeviceSecrets,
     /// The epoch the bundle was made in.
     pub epoch: PendingEpoch,
+}
+
+/// Seal a pre-generated virtual device `v` into a [`VirtualDeviceRecord`] for
+/// `epoch`, binding `(did, vdevice_id, mechanism, created_at)` into every field
+/// AAD and signing metadata when `created_at` is `Some`.
+pub fn seal_virtual_device(
+    did: &str,
+    code: &RecoveryCode,
+    v: &DeviceSecrets,
+    epoch: &impl EpochKeys,
+    mechanism: Mechanism,
+    created_at: Option<&str>,
+) -> Result<VirtualDeviceRecord> {
+    if !v.is_virtual() {
+        return Err(Error::DeviceTampered);
+    }
+    if let Some(ts) = created_at {
+        let _ = crate::records::ms_from_datetime(ts)?;
+    }
+    let (vdevice_id, key) = code.derive(did);
+    let seal = |base: &[u8], pt: &[u8]| {
+        let aad = bundle_aad(base, did, &vdevice_id, mechanism, created_at);
+        aead::seal(&key, &aad, pt)
+    };
+    let metadata_sig = match created_at {
+        Some(ts) => {
+            Some(
+                v.device_key
+                    .sign(&bundle_metadata_message(did, &vdevice_id, mechanism, ts))?,
+            )
+        }
+        None => None,
+    };
+    Ok(VirtualDeviceRecord {
+        vdevice_id,
+        public: v.public().clone(),
+        encrypted_device_key_priv: seal(
+            aad::DEVICE_KEY,
+            Zeroizing::new(v.device_key.to_bytes()).as_slice(),
+        )?,
+        encrypted_epoch_storage_key_priv: seal(
+            aad::STORAGE_KEY,
+            Zeroizing::new(v.storage.to_bytes()).as_slice(),
+        )?,
+        encrypted_epoch_root_key: seal(aad::EPOCH_ROOT, epoch.root())?,
+        encrypted_epoch_number: seal(aad::EPOCH_SEQ, b64_decimal(epoch.seq()).as_bytes())?,
+        mechanism,
+        bound_created_at: created_at.map(str::to_owned),
+        metadata_sig,
+    })
 }
 
 /// Create a virtual device from the enrolled physical device `me` in
@@ -92,27 +236,35 @@ pub fn create(
     current: &EpochSecret,
     mechanism: Mechanism,
 ) -> Result<(VirtualDeviceRecord, EpochMemberRecord)> {
+    create_inner(did, code, me, current, mechanism, None)
+}
+
+/// Create a virtual device from `me` in `current`, binding `created_at` into
+/// every field AAD and signing `(did, vdevice_id, mechanism, created_at)`.
+pub fn create_at(
+    did: &str,
+    code: &RecoveryCode,
+    me: &DeviceSecrets,
+    current: &EpochSecret,
+    mechanism: Mechanism,
+    created_at: &str,
+) -> Result<(VirtualDeviceRecord, EpochMemberRecord)> {
+    create_inner(did, code, me, current, mechanism, Some(created_at))
+}
+
+fn create_inner(
+    did: &str,
+    code: &RecoveryCode,
+    me: &DeviceSecrets,
+    current: &EpochSecret,
+    mechanism: Mechanism,
+    created_at: Option<&str>,
+) -> Result<(VirtualDeviceRecord, EpochMemberRecord)> {
     if me.is_virtual() {
         return Err(Error::Malformed("virtual devices cannot create bundles"));
     }
     let v = DeviceSecrets::generate_virtual()?;
-    let (vdevice_id, key) = code.derive(did);
-    let seal = |aad: &[u8], pt: &[u8]| aead::seal(&key, aad, pt);
-    let record = VirtualDeviceRecord {
-        vdevice_id,
-        public: v.public().clone(),
-        encrypted_device_key_priv: seal(
-            aad::DEVICE_KEY,
-            Zeroizing::new(v.device_key.to_bytes()).as_slice(),
-        )?,
-        encrypted_epoch_storage_key_priv: seal(
-            aad::STORAGE_KEY,
-            Zeroizing::new(v.storage.to_bytes()).as_slice(),
-        )?,
-        encrypted_epoch_root_key: seal(aad::EPOCH_ROOT, current.root())?,
-        encrypted_epoch_number: seal(aad::EPOCH_SEQ, b64_decimal(current.seq).as_bytes())?,
-        mechanism,
-    };
+    let record = seal_virtual_device(did, code, &v, current, mechanism, created_at)?;
     let member = member_record(current, &v.public().device_key_pub, true, None);
     Ok((record, member))
 }
@@ -147,21 +299,29 @@ pub fn open(record: &VirtualDeviceRecord, code: &RecoveryCode, did: &str) -> Res
     if !record.public.is_virtual {
         return Err(Error::DeviceTampered);
     }
+    record.validate_shape(Some(did))?;
+    let created_at = record.bound_created_at.as_deref();
+    let aad_of =
+        |base: &[u8]| bundle_aad(base, did, &record.vdevice_id, record.mechanism, created_at);
     let device_key = XSigningKey::from_bytes(*open_fixed::<32>(
         &key,
-        aad::DEVICE_KEY,
+        &aad_of(aad::DEVICE_KEY),
         &record.encrypted_device_key_priv,
     )?);
     let storage = HawkEncSecret::from_bytes(*open_fixed::<HAWK_ENC_SECRET_LEN>(
         &key,
-        aad::STORAGE_KEY,
+        &aad_of(aad::STORAGE_KEY),
         &record.encrypted_epoch_storage_key_priv,
     )?);
-    let root = open_fixed::<32>(&key, aad::EPOCH_ROOT, &record.encrypted_epoch_root_key)?;
+    let root = open_fixed::<32>(
+        &key,
+        &aad_of(aad::EPOCH_ROOT),
+        &record.encrypted_epoch_root_key,
+    )?;
     let seq_b64 = Zeroizing::new(aead::decrypt_suite(
         Suite::DndkGcm,
         &key,
-        aad::EPOCH_SEQ,
+        &aad_of(aad::EPOCH_SEQ),
         &record.encrypted_epoch_number,
     )?);
     let seq_dec = base64::engine::general_purpose::STANDARD

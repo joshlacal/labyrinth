@@ -138,31 +138,55 @@ impl PublicRepoBackend for PublicRepo {
         }
         let record: Value =
             serde_json::from_slice(record).map_err(|e| Error::Backend(e.to_string()))?;
-        let mut body = json!({
-            "repo": self.did,
-            "collection": nsid::MAILBOX_KEYS,
-            "rkey": rkey,
-            "record": record,
-            "validate": false,
-        });
-        if let Some(cid) = swap_cid {
-            body["swapRecord"] = Value::String(cid.to_owned());
-        }
+        let (nsid_proc, body, from_apply_writes) = if let Some(cid) = swap_cid {
+            (
+                "com.atproto.repo.putRecord",
+                json!({
+                    "repo": self.did,
+                    "collection": nsid::MAILBOX_KEYS,
+                    "rkey": rkey,
+                    "record": record,
+                    "validate": false,
+                    "swapRecord": cid,
+                }),
+                false,
+            )
+        } else {
+            (
+                "com.atproto.repo.applyWrites",
+                json!({
+                    "repo": self.did,
+                    "validate": false,
+                    "writes": [{
+                        "$type": "com.atproto.repo.applyWrites#create",
+                        "collection": nsid::MAILBOX_KEYS,
+                        "rkey": rkey,
+                        "value": record,
+                    }],
+                }),
+                true,
+            )
+        };
         let out = self
             .http
-            .procedure_sync(
-                "com.atproto.repo.putRecord",
-                &serde_json::to_vec(&body).unwrap(),
-            )
+            .procedure_sync(nsid_proc, &serde_json::to_vec(&body).unwrap())
             .map_err(|e| {
-                if e.error.as_deref() == Some("InvalidSwap") {
+                if matches!(
+                    e.error.as_deref(),
+                    Some("InvalidSwap" | "RecordAlreadyExists")
+                ) {
                     Error::Conflict
                 } else {
                     Error::Backend(format!("{e:?}"))
                 }
             })?;
         let v: Value = serde_json::from_slice(&out).map_err(|e| Error::Backend(e.to_string()))?;
-        Ok(v["cid"].as_str().unwrap_or_default().to_owned())
+        let cid = if from_apply_writes {
+            v["results"][0]["cid"].as_str().unwrap_or_default()
+        } else {
+            v["cid"].as_str().unwrap_or_default()
+        };
+        Ok(cid.to_owned())
     }
 
     async fn get_mailbox_keys(
@@ -395,12 +419,11 @@ fn lifecycle_on_a_live_space_pds() {
         w.ts + 1,
     );
     let phone_key = phone.device_public().device_key_pub;
-    assert_eq!(
-        block_on(laptop.revoke_device(&phone_key))
-            .unwrap()
-            .new_epoch,
-        2
-    );
+    let rot = block_on(laptop.revoke_device(&phone_key)).unwrap();
+    assert_eq!(rot.new_epoch, 2);
+    let recovery = rot
+        .rekeyed_recovery
+        .expect("physical revocation re-keys recovery methods");
     assert!(
         block_on(mb.get_device(&phone_key))
             .unwrap()

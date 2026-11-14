@@ -4,7 +4,7 @@ pub mod chain;
 pub mod open;
 
 pub use chain::{OpenedEpoch, backward_chain, forward_chain};
-pub use open::{NewEpoch, open_genesis, open_next, open_next_enrolling};
+pub use open::{NewEpoch, open_genesis, open_next, open_next_enrolling, open_next_with_additions};
 
 use subtle::ConstantTimeEq as _;
 use zeroize::Zeroizing;
@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use crate::device::DevicePublic;
 use crate::encoding::{b64_decimal, kdf, kdf32, mac};
 use crate::mailbox::{EpochPublic, MailboxKeys};
-use crate::sign::XVerifyingKey;
+use crate::sign::{XSigningKey, XVerifyingKey};
 use crate::{Error, Result};
 
 /// AAD for the encrypted previous-epoch fields (p.28).
@@ -171,6 +171,81 @@ pub struct EpochRecord {
     pub encrypted_prev_root: Option<Vec<u8>>,
     /// `deviceKeyPub` of the opening device.
     pub opened_by: XVerifyingKey,
+    /// Canonical sorted cumulative set of evicted device keys bound to this epoch.
+    pub revocations: Vec<XVerifyingKey>,
+    /// XEdDSA signature by `opened_by` over `(did, seq, head, revocations)`.
+    pub revocations_sig: Option<[u8; 64]>,
+}
+
+const EPOCH_REVOCATIONS_PREFIX: &str = "catbird.labyrinth.epoch_revocations_v1:";
+
+fn epoch_revocations_message(
+    did: &str,
+    seq: u64,
+    head: &[u8; 32],
+    revocations: &[XVerifyingKey],
+) -> Vec<u8> {
+    let mut out = format!(
+        "{EPOCH_REVOCATIONS_PREFIX}{did}:{seq}:{}:",
+        hex::encode(head)
+    )
+    .into_bytes();
+    out.reserve(revocations.len() * 32);
+    for k in revocations {
+        out.extend_from_slice(&k.0);
+    }
+    out
+}
+
+impl EpochRecord {
+    /// Attaches a canonical sorted revocation set signed by `opener` (`opened_by`).
+    pub fn sign_revocations(
+        &mut self,
+        did: &str,
+        opener: &XSigningKey,
+        revoked: impl IntoIterator<Item = XVerifyingKey>,
+    ) -> Result<()> {
+        if opener.public() != self.opened_by {
+            return Err(Error::Malformed("epoch opener mismatch"));
+        }
+        let mut list: Vec<XVerifyingKey> = revoked.into_iter().collect();
+        list.sort_unstable_by_key(|a| a.0);
+        list.dedup_by(|a, b| a.0 == b.0);
+        if list.is_empty() {
+            self.revocations.clear();
+            self.revocations_sig = None;
+            return Ok(());
+        }
+        let sig = opener.sign(&epoch_revocations_message(
+            did,
+            self.public.seq,
+            &self.public.head,
+            &list,
+        ))?;
+        self.revocations = list;
+        self.revocations_sig = Some(sig);
+        Ok(())
+    }
+
+    /// Verifies canonical ordering and `opened_by` signature on `revocations`.
+    pub fn verify_revocations(&self, did: &str) -> Result<()> {
+        if !self.revocations.windows(2).all(|w| w[0].0 < w[1].0) {
+            return Err(Error::Malformed("unsorted epoch revocations"));
+        }
+        match (&self.revocations.is_empty(), &self.revocations_sig) {
+            (true, None) => Ok(()),
+            (false, None) => Err(Error::BadSignature),
+            (_, Some(sig)) => self.opened_by.verify(
+                &epoch_revocations_message(
+                    did,
+                    self.public.seq,
+                    &self.public.head,
+                    &self.revocations,
+                ),
+                sig,
+            ),
+        }
+    }
 }
 
 /// One device's membership of one epoch (`blue.catbird.labyrinth.epochMember`).

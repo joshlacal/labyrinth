@@ -283,17 +283,31 @@ fn purge_account_redacts_authored_items_and_erases_the_mailbox() {
 #[test]
 fn server_removals_never_read_as_unsends() {
     // G16: no server-written redaction is evidence of anything. A bare
-    // `{redactedAt}` removal fails closed instead of reading as removed.
+    // `{redactedAt}` removal is quarantined per-author and reported as
+    // undecryptable (`BadSignature`) without ever appearing in `redacted` or `messages`,
+    // while honest peers in the same thread still restore cleanly.
     let net = MemoryBackend::new();
     let clock = TestClock::default();
     let mut alice = init(&net, &clock, A, 1);
     let mut bob = init(&net, &clock, B, 2);
     send(&mut alice, T, &[A, B], "m1", 10);
     block_on(alice.flush()).unwrap();
+    send(&mut bob, T, &[A, B], "b1", 20);
+    block_on(bob.flush()).unwrap();
     assert_eq!(net.strip_items_for_test(A), 1);
-    assert_eq!(
-        block_on(bob.load_thread(T, TimeRange::ALL)).unwrap_err(),
-        Error::BadSignature
+    let h = block_on(bob.load_thread(T, TimeRange::ALL)).unwrap();
+    assert_eq!(ids(&h), ["b1"]);
+    assert!(h.redacted.is_empty());
+    assert!(
+        h.quarantined
+            .iter()
+            .any(|q| q.author == A
+                && q.reason == labyrinth::store::QuarantineReason::InvalidRedaction)
+    );
+    assert!(
+        h.undecryptable
+            .iter()
+            .any(|u| u.sender.as_deref() == Some(A) && u.error == Error::BadSignature)
     );
 }
 

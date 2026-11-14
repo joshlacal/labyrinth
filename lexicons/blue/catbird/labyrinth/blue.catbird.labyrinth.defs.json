@@ -98,6 +98,28 @@
         }
       }
     },
+    "deviceRevocation": {
+      "type": "object",
+      "description": "Authenticated device revocation statement signed by a physical mailbox device over the target device key and revocation timestamp.",
+      "required": [
+        "revokedBy",
+        "sig"
+      ],
+      "properties": {
+        "revokedBy": {
+          "type": "bytes",
+          "description": "XEdDSA deviceKeyPubkey of the physical device that signed this revocation.",
+          "maxLength": 32,
+          "minLength": 32
+        },
+        "sig": {
+          "type": "bytes",
+          "description": "XEdDSA signature over the domain-separated (did, targetDeviceKey, revokedAt) revocation statement.",
+          "maxLength": 64,
+          "minLength": 64
+        }
+      }
+    },
     "originalSenderArchiveAttestation": {
       "type": "object",
       "description": "Original sender device signature over the domain-separated canonical (threadId, messageId, archiveCommitment) tuple. Stored beside, never inside, the commitment input.",

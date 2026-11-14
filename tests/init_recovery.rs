@@ -61,6 +61,14 @@ impl MailboxStore for FlakyMailboxPublish {
     async fn set_device_revoked(&self, k: &XVerifyingKey, at: &str) -> labyrinth::Result<()> {
         self.inner.set_device_revoked(k, at).await
     }
+    async fn set_device_revocation(
+        &self,
+        k: &XVerifyingKey,
+        at: &str,
+        rev: &labyrinth::records::DeviceRevocationDef,
+    ) -> labyrinth::Result<()> {
+        self.inner.set_device_revocation(k, at, rev).await
+    }
     async fn get_device(&self, k: &XVerifyingKey) -> labyrinth::Result<Option<Device>> {
         self.inner.get_device(k).await
     }
@@ -93,6 +101,17 @@ impl MailboxStore for FlakyMailboxPublish {
     }
     async fn list_virtual_devices(&self) -> labyrinth::Result<Vec<VirtualDevice>> {
         self.inner.list_virtual_devices().await
+    }
+    async fn list_virtual_device_records(
+        &self,
+    ) -> labyrinth::Result<Vec<labyrinth::Result<VirtualDevice>>> {
+        self.inner.list_virtual_device_records().await
+    }
+    async fn touch_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<()> {
+        self.inner.touch_virtual_device(id).await
+    }
+    async fn delete_virtual_device(&self, id: &[u8; 16]) -> labyrinth::Result<()> {
+        self.inner.delete_virtual_device(id).await
     }
     async fn append_owner_batch(&self, b: &OwnerBatch) -> labyrinth::Result<String> {
         self.inner.append_owner_batch(b).await

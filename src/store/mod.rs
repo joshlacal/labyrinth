@@ -138,6 +138,16 @@ pub trait MailboxStore: MaybeSend + MaybeSync {
     async fn create_device(&self, device: &Device) -> Result<()>;
     /// Sets `revokedAt` once; a no-op if already set.
     async fn set_device_revoked(&self, device_key: &XVerifyingKey, revoked_at: &str) -> Result<()>;
+    /// Sets `revokedAt` together with a signed [`crate::records::DeviceRevocationDef`].
+    async fn set_device_revocation(
+        &self,
+        device_key: &XVerifyingKey,
+        revoked_at: &str,
+        revocation: &crate::records::DeviceRevocationDef,
+    ) -> Result<()> {
+        let _ = revocation;
+        self.set_device_revoked(device_key, revoked_at).await
+    }
     async fn get_device(&self, device_key: &XVerifyingKey) -> Result<Option<Device>>;
     async fn list_devices(&self) -> Result<Vec<Device>>;
 
@@ -171,6 +181,16 @@ pub trait MailboxStore: MaybeSend + MaybeSync {
     async fn create_virtual_device(&self, vdevice: &VirtualDevice) -> Result<()>;
     async fn get_virtual_device(&self, vdevice_id: &[u8; 16]) -> Result<Option<VirtualDevice>>;
     async fn list_virtual_devices(&self) -> Result<Vec<VirtualDevice>>;
+    /// Per-record tolerant listing of `virtualDevice` records so a single
+    /// malformed bundle in storage can be excluded without aborting audits.
+    async fn list_virtual_device_records(&self) -> Result<Vec<Result<VirtualDevice>>> {
+        Ok(self
+            .list_virtual_devices()
+            .await?
+            .into_iter()
+            .map(Ok)
+            .collect())
+    }
 
     /// Ephemeral hybrid PQ OTC pairing session (`blue.catbird.labyrinth.otcSession`, `I16`).
     async fn put_otc_session(&self, session: &OtcSession) -> Result<()> {
@@ -295,6 +315,48 @@ pub struct ThreadListing {
     pub incomplete: Vec<String>,
 }
 
+/// Why an author's records in a conversation Space were quarantined during restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QuarantineReason {
+    /// An unsigned or invalidly signed redaction record or overlay was found.
+    InvalidRedaction,
+    /// A record in the author's repository failed schema or structural parsing.
+    MalformedRecord,
+    /// Listing the author's repository exceeded pagination, cursor, or size bounds.
+    RepositoryOverflow,
+    /// The repository belongs to an account with no authorized device in the conversation.
+    NonParticipant,
+    /// A message timestamp exceeded the signed 64-bit millisecond bound (`i64::MAX`).
+    TimestampOutOfRange,
+    /// Uncached MEK lookup misses from this author exceeded the per-restore budget.
+    ExcessiveMekMisses,
+}
+
+/// Per-author quarantine entry reported on [`crate::client::ThreadHistory`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorQuarantine {
+    pub author: String,
+    pub reason: QuarantineReason,
+    pub detail: String,
+}
+
+/// Push a quarantine entry unless `(author, reason)` is already recorded.
+pub fn push_quarantine(
+    out: &mut Vec<AuthorQuarantine>,
+    author: impl Into<String>,
+    reason: QuarantineReason,
+    detail: impl Into<String>,
+) {
+    let author = author.into();
+    if !out.iter().any(|q| q.author == author && q.reason == reason) {
+        out.push(AuthorQuarantine {
+            author,
+            reason,
+            detail: detail.into(),
+        });
+    }
+}
+
 /// The conversation Spaces the caller belongs to. Writes go to the caller's own
 /// repo in the thread's Space; reads see every member's repo.
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -323,6 +385,22 @@ pub trait ThreadStore: MaybeSend + MaybeSync {
         range: TimeRange,
     ) -> Result<Vec<Stored<Batch>>>;
 
+    /// Per-author quarantined variant of [`Self::list_batches`]. Malformed
+    /// records, invalid redactions, or bounded-listing overflows in one
+    /// author's repository are isolated into [`AuthorQuarantine`] entries so
+    /// sibling authors continue restoring.
+    async fn list_batches_quarantined(
+        &self,
+        thread_id: &str,
+        sender: Option<&str>,
+        range: TimeRange,
+    ) -> Result<(Vec<Stored<Batch>>, Vec<AuthorQuarantine>)> {
+        Ok((
+            self.list_batches(thread_id, sender, range).await?,
+            Vec::new(),
+        ))
+    }
+
     /// Batches of `thread_id` holding any of `message_ids`.
     async fn get_messages(
         &self,
@@ -342,6 +420,27 @@ pub trait ThreadStore: MaybeSend + MaybeSync {
             .collect())
     }
 
+    /// Per-author quarantined variant of [`Self::get_messages`].
+    async fn get_messages_quarantined(
+        &self,
+        thread_id: &str,
+        message_ids: &[&str],
+    ) -> Result<(Vec<Stored<Batch>>, Vec<AuthorQuarantine>)> {
+        let (batches, quarantined) = self
+            .list_batches_quarantined(thread_id, None, TimeRange::ALL)
+            .await?;
+        let filtered = batches
+            .into_iter()
+            .filter(|b| {
+                b.value
+                    .items
+                    .iter()
+                    .any(|i| message_ids.contains(&i.message_id.as_str()))
+            })
+            .collect();
+        Ok((filtered, quarantined))
+    }
+
     /// Newest-first paging.
     async fn list_batches_before(
         &self,
@@ -357,6 +456,25 @@ pub trait ThreadStore: MaybeSend + MaybeSync {
         let mut v = self.list_batches(thread_id, None, range).await?;
         v.sort_by_key(|b| core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max()));
         Ok(v)
+    }
+
+    /// Per-author quarantined variant of [`Self::list_batches_before`].
+    async fn list_batches_before_quarantined(
+        &self,
+        thread_id: &str,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<(Vec<Stored<Batch>>, Vec<AuthorQuarantine>)> {
+        let _ = limit;
+        let range = TimeRange {
+            from_ms: None,
+            until_ms: before_ms,
+        };
+        let (mut v, quarantined) = self
+            .list_batches_quarantined(thread_id, None, range)
+            .await?;
+        v.sort_by_key(|b| core::cmp::Reverse(b.value.items.iter().map(|i| i.timestamp).max()));
+        Ok((v, quarantined))
     }
 
     /// Every thread in which this DID wrote a MEK or is a MEK recipient.

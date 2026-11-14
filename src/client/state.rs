@@ -31,6 +31,7 @@
 //! pendingPublication       opt(u64)
 //! epochs   u32 × (seq u64, epochID str16, root 32)
 //! revoked  u32 × 32
+//! pendingRevocations u32 × (key 32, decisionSeq u64)
 //! verified seq u64, u32 × 32          members verified in epoch seq ([CB-25])
 //! pins     u32 × (did str16, seq u64, head 32, sigKey 32)
 //! receipts u32 × (threadId str16, authority str16,
@@ -231,6 +232,11 @@ impl Labyrinth {
         for k in &self.revoked {
             w.bytes(k);
         }
+        w.u32(self.pending_revocations.len())?;
+        for (k, decision_seq) in &self.pending_revocations {
+            w.bytes(k);
+            w.u64(*decision_seq);
+        }
         w.u64(self.verified.0);
         w.u32(self.verified.1.len())?;
         for k in &self.verified.1 {
@@ -338,7 +344,17 @@ impl Labyrinth {
         }
         let mut revoked = BTreeSet::new();
         for _ in 0..r.count(32)? {
-            revoked.insert(r.arr::<32>()?);
+            if !revoked.insert(r.arr::<32>()?) {
+                return Err(Error::Malformed("duplicate state revocation"));
+            }
+        }
+        let mut pending_revocations = BTreeMap::new();
+        for _ in 0..r.count(32 + 8)? {
+            let key = r.arr::<32>()?;
+            let decision_seq = r.u64()?;
+            if revoked.contains(&key) || pending_revocations.insert(key, decision_seq).is_some() {
+                return Err(Error::Malformed("duplicate state pending revocation"));
+            }
         }
         let mut verified = (r.u64()?, BTreeSet::new());
         for _ in 0..r.count(32)? {
@@ -419,22 +435,37 @@ impl Labyrinth {
         // work offline, and nothing is addressed to this epoch until a
         // sync or roster resolution finishes the check.
         let newest = me.epoch_secret(latest).await?;
-        let public =
-            super::epochs::verified_own_signatures(me.b.mailbox.as_ref(), &me.did, &newest).await?;
-        me.own_latest = Some(public.clone());
-        me.own_attester_checked = match super::epochs::check_own_attester(
-            me.b.directory.as_ref(),
-            &me.did,
-            &public,
-        )
-        .await
+        match super::epochs::verified_own_signatures(me.b.mailbox.as_ref(), &me.did, &newest).await
         {
-            Ok(()) => true,
-            Err(Error::Unattested) => return Err(Error::Unattested),
-            Err(_) => false,
-        };
+            Ok(public) => {
+                me.own_latest = Some(public.clone());
+                me.own_attester_checked = match super::epochs::check_own_attester(
+                    me.b.directory.as_ref(),
+                    &me.did,
+                    &public,
+                )
+                .await
+                {
+                    Ok(()) => true,
+                    Err(Error::Unattested) => return Err(Error::Unattested),
+                    Err(_) => false,
+                };
+            }
+            Err(
+                Error::Malformed("epoch public keys do not match root") | Error::NotFound("epoch"),
+            ) if pending_directory_publication == Some(latest) && latest > 0 => {
+                let base = me.epoch_secret(latest - 1).await?;
+                let _ =
+                    super::epochs::verified_own_signatures(me.b.mailbox.as_ref(), &me.did, &base)
+                        .await?;
+                me.own_latest = None;
+                me.own_attester_checked = false;
+            }
+            Err(err) => return Err(err),
+        }
         me.pending_directory_publication = pending_directory_publication;
         me.revoked = revoked;
+        me.pending_revocations = pending_revocations;
         me.verified = verified;
         me.pins = pins;
         me.receipt_trust = receipt_trust;

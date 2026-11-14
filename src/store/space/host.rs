@@ -447,8 +447,13 @@ impl SpaceClient {
                     repo.insert(uri, (collection, rkey, v));
                 }
                 "com.atproto.space.applyWrites#update" => {
-                    if !repo.contains_key(&uri) {
+                    let Some((_, _, existing)) = repo.get(&uri) else {
                         return Err(err(400, "RecordNotFound", &uri));
+                    };
+                    if let Some(expected_cid) = w["swapRecord"].as_str()
+                        && cid(existing) != expected_cid
+                    {
+                        return Err(err(400, "InvalidSwap", &uri));
                     }
                     let v = w["value"].clone();
                     collect_blob_cids(&v, &mut promoted_cids);
@@ -459,9 +464,15 @@ impl SpaceClient {
                     repo.insert(uri, (collection, rkey, v));
                 }
                 "com.atproto.space.applyWrites#delete" => {
-                    if repo.remove(&uri).is_none() {
+                    let Some((_, _, existing)) = repo.get(&uri) else {
                         return Err(err(400, "RecordNotFound", &uri));
+                    };
+                    if let Some(expected_cid) = w["swapRecord"].as_str()
+                        && cid(existing) != expected_cid
+                    {
+                        return Err(err(400, "InvalidSwap", &uri));
                     }
+                    repo.remove(&uri);
                     results.push(json!({
                         "$type": "com.atproto.space.applyWrites#deleteResult",
                     }));
