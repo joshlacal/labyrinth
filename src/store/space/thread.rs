@@ -199,6 +199,7 @@ pub struct SpaceThreadStore {
     t: Arc<dyn SpaceRpc>,
     spaces: Mutex<HashMap<String, SpaceRef>>,
     default_authority_did: Option<String>,
+    host_kem_did_key: Option<String>,
     tid_counter: AtomicU64,
     now_ms: crate::store::ClockFn,
     page: usize,
@@ -218,6 +219,7 @@ impl SpaceThreadStore {
             t: transport.into(),
             spaces: Mutex::new(HashMap::new()),
             default_authority_did: None,
+            host_kem_did_key: None,
             tid_counter: AtomicU64::new(1),
             now_ms: Arc::new(system_now_ms),
             page: LIST_LIMIT,
@@ -228,6 +230,13 @@ impl SpaceThreadStore {
 
     pub fn with_authority_did(mut self, authority_did: impl Into<String>) -> Self {
         self.default_authority_did = Some(authority_did.into());
+        self
+    }
+
+    /// Configures an explicit host P-256 `#atproto_kem` `did:key:zDn...` for RFC 9421 +
+    /// HPKE `0xFFFF` Export MAC verification on `getRecord` and `getRepo` STAR reads.
+    pub fn with_host_kem_did_key(mut self, host_kem_did_key: impl Into<String>) -> Self {
+        self.host_kem_did_key = Some(host_kem_did_key.into());
         self
     }
 
@@ -273,12 +282,16 @@ impl SpaceThreadStore {
 
     /// Lists every conversation Space via this store while enforcing `(space_uri, did)` `repoRev` floors.
     pub async fn list_owned_spaces(&self) -> Result<Vec<String>> {
-        Self::owned_spaces_inner(self.t.as_ref(), Some((&self.did, &self.floors))).await
+        Self::owned_spaces_inner(
+            self.t.as_ref(),
+            Some((&self.did, &self.floors, self.host_kem_did_key.as_deref())),
+        )
+        .await
     }
 
     async fn owned_spaces_inner(
         transport: &dyn SpaceRpc,
-        floor_ctx: Option<(&str, &WriterRevFloors)>,
+        floor_ctx: Option<(&str, &WriterRevFloors, Option<&str>)>,
     ) -> Result<Vec<String>> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
@@ -297,8 +310,31 @@ impl SpaceThreadStore {
                 .map_err(map_space_error)?;
             let page: ListSpacesOut = decode_body(&body)?;
             for entry in page.spaces {
-                if let (Some((did, floors)), Some(rev)) = (floor_ctx, entry.repo_rev.as_deref()) {
-                    floors.observe(&entry.space, did, rev)?;
+                if let Some((did, floors, explicit_kem)) = floor_ctx {
+                    if let Some(rev) = entry.repo_rev.as_deref() {
+                        floors.check_not_rolled_back(&entry.space, did, rev)?;
+                    }
+                    let kem = match explicit_kem {
+                        Some(k) => Some(k.to_owned()),
+                        None => transport
+                            .host_kem_did_key(&entry.space)
+                            .await
+                            .map_err(map_space_error)?,
+                    };
+                    if let Some(kem_key) = kem {
+                        match Self::fetch_repo_star_authenticated_raw(
+                            transport,
+                            floors,
+                            &entry.space,
+                            did,
+                            &kem_key,
+                        )
+                        .await
+                        {
+                            Ok(_) | Err(Error::NotFound("repo" | "record")) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
                 }
                 out.push(entry.space);
             }
@@ -413,17 +449,24 @@ impl SpaceThreadStore {
         Err(Error::Backend("space listing too long".into()))
     }
 
-    /// Fetches a foreign Space record and authenticates `(uri, cid)` via Nov-12 RFC 9421 +
-    /// HPKE `0xFFFF` Export MAC (`Atproto-Space-Record`).
-    pub async fn get_record_authenticated<T: DeserializeOwned>(
+    async fn resolve_host_kem_did_key(&self, space_str: &str) -> Result<Option<String>> {
+        if let Some(ref k) = self.host_kem_did_key {
+            return Ok(Some(k.clone()));
+        }
+        self.t
+            .host_kem_did_key(space_str)
+            .await
+            .map_err(map_member_repo_space_error)
+    }
+
+    async fn get_record_authenticated_in_space<T: DeserializeOwned>(
         &self,
-        thread_id: &str,
+        space: &SpaceRef,
         repo: &str,
         collection: &str,
         rkey: &str,
         host_kem_did_key: &str,
     ) -> Result<Option<(String, T)>> {
-        let space = self.space_for(thread_id)?;
         let space_str = space.to_string();
         let enc = atproto_spaces::kem::encapsulate_p256(host_kem_did_key)
             .map_err(|_| Error::BadPublicKey)?;
@@ -474,17 +517,13 @@ impl SpaceThreadStore {
         }
     }
 
-    /// Downloads a writer's repository as a Nov-12 `STAR` v0.2 archive (`com.atproto.space.getRepo`),
-    /// verifying the RFC 9421 + HPKE `0xFFFF` `Atproto-Space-Commit` MAC and `WriterRevFloors`
-    /// BEFORE parsing any record frames, then verifying canonical DAG-CBOR + `LtHash`.
-    pub async fn get_repo_star_authenticated(
-        &self,
-        thread_id: &str,
+    async fn fetch_repo_star_authenticated_raw(
+        transport: &dyn SpaceRpc,
+        floors: &WriterRevFloors,
+        space_str: &str,
         repo: &str,
         host_kem_did_key: &str,
     ) -> Result<atproto_spaces::star::ParsedStarRepo> {
-        let space = self.space_for(thread_id)?;
-        let space_str = space.to_string();
         let enc = atproto_spaces::kem::encapsulate_p256(host_kem_did_key)
             .map_err(|_| Error::BadPublicKey)?;
         let accept = atproto_spaces::mac::format_accept_signature(
@@ -492,13 +531,12 @@ impl SpaceThreadStore {
             &enc.key_share_did_key,
         )
         .map_err(|_| Error::Malformed("accept-signature"))?;
-        let p = [("space", space_str.clone()), ("repo", repo.to_owned())];
+        let p = [("space", space_str.to_owned()), ("repo", repo.to_owned())];
         let req_headers = [(
             atproto_spaces::mac::ACCEPT_SIGNATURE_HEADER.to_owned(),
             accept,
         )];
-        let (resp_headers, body) = self
-            .t
+        let (resp_headers, body) = transport
             .query_with_headers(endpoint::GET_REPO, &p, &req_headers)
             .await
             .map_err(map_member_repo_space_error)?;
@@ -507,7 +545,7 @@ impl SpaceThreadStore {
             .map_err(|_| Error::BadSignature)?;
         let mut rollback_err: Option<Error> = None;
         let parsed =
-            atproto_spaces::star::read_star_repo_authenticated(&body, &space_str, repo, |meta| {
+            atproto_spaces::star::read_star_repo_authenticated(&body, space_str, repo, |meta| {
                 atproto_spaces::mac::verify_commit_mac(
                     &enc.shared_secret,
                     &enc.key_share_did_key,
@@ -517,7 +555,7 @@ impl SpaceThreadStore {
                     &meta.rev,
                     &meta.data,
                 )?;
-                if let Err(e) = self.floors.observe(&meta.space, &meta.repo, &meta.rev) {
+                if let Err(e) = floors.observe(&meta.space, &meta.repo, &meta.rev) {
                     rollback_err = Some(e);
                     return Err(atproto_spaces::SpacesError::FutureRev(meta.rev.clone()));
                 }
@@ -531,6 +569,42 @@ impl SpaceThreadStore {
             | atproto_spaces::SpacesError::BadSpaceSignature(_) => Error::BadSignature,
             _ => Error::Malformed("STAR repository archive"),
         })
+    }
+
+    /// Fetches a foreign Space record and authenticates `(uri, cid)` via Nov-12 RFC 9421 +
+    /// HPKE `0xFFFF` Export MAC (`Atproto-Space-Record`).
+    pub async fn get_record_authenticated<T: DeserializeOwned>(
+        &self,
+        thread_id: &str,
+        repo: &str,
+        collection: &str,
+        rkey: &str,
+        host_kem_did_key: &str,
+    ) -> Result<Option<(String, T)>> {
+        let space = self.space_for(thread_id)?;
+        self.get_record_authenticated_in_space(&space, repo, collection, rkey, host_kem_did_key)
+            .await
+    }
+
+    /// Downloads a writer's repository as a Nov-12 `STAR` v0.2 archive (`com.atproto.space.getRepo`),
+    /// verifying the RFC 9421 + HPKE `0xFFFF` `Atproto-Space-Commit` MAC and `WriterRevFloors`
+    /// BEFORE parsing any record frames, then verifying canonical DAG-CBOR + `LtHash`.
+    pub async fn get_repo_star_authenticated(
+        &self,
+        thread_id: &str,
+        repo: &str,
+        host_kem_did_key: &str,
+    ) -> Result<atproto_spaces::star::ParsedStarRepo> {
+        let space = self.space_for(thread_id)?;
+        let space_str = space.to_string();
+        Self::fetch_repo_star_authenticated_raw(
+            self.t.as_ref(),
+            &self.floors,
+            &space_str,
+            repo,
+            host_kem_did_key,
+        )
+        .await
     }
 
     pub fn register_thread_space(&mut self, thread_id: &str, space: SpaceRef) {
@@ -687,13 +761,47 @@ impl SpaceThreadStore {
         let updates = self.list_writers(space).await?;
         let space_str = space.to_string();
         let mut active = std::collections::BTreeSet::new();
+        let mut seen_in_stream: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         for update in updates {
             match update {
-                WriterUpdate::RepoWrite { repo, repo_rev, .. } => {
-                    self.floors.observe(&space_str, &repo, &repo_rev)?;
+                WriterUpdate::RepoWrite {
+                    repo,
+                    repo_rev,
+                    space_rev,
+                    ..
+                } => {
+                    // Validate structure & check against authenticated floors without
+                    // mutating persistent floors from unauthenticated listWriters JSON.
+                    self.floors
+                        .check_not_rolled_back(&space_str, &repo, &repo_rev)?;
+                    if !crate::store::is_valid_atproto_tid(&space_rev) {
+                        return Err(Error::Malformed("invalid writer spaceRev"));
+                    }
+                    if let Some(prev_in_stream) = seen_in_stream.get(&repo)
+                        && repo_rev.as_str() < prev_in_stream.as_str()
+                    {
+                        return Err(Error::WriterRollback {
+                            space: space_str.clone(),
+                            author: repo,
+                            pinned_rev: prev_in_stream.clone(),
+                            offered_rev: repo_rev,
+                        });
+                    }
+                    seen_in_stream.insert(repo.clone(), repo_rev);
                     active.insert(repo);
                 }
-                WriterUpdate::RepoRemoved { repo, .. } => {
+                WriterUpdate::RepoRemoved {
+                    repo, space_rev, ..
+                } => {
+                    if !atproto_spaces::is_valid_did(&repo)
+                        || repo.len() > crate::store::MAX_WRITER_FLOOR_AUTHOR_LEN
+                    {
+                        return Err(Error::Malformed("invalid writer revision author"));
+                    }
+                    if !crate::store::is_valid_atproto_tid(&space_rev) {
+                        return Err(Error::Malformed("invalid writer spaceRev"));
+                    }
                     active.remove(&repo);
                 }
             }
@@ -805,10 +913,22 @@ impl SpaceThreadStore {
         did: &str,
         rkey: &str,
     ) -> Result<Option<Stored<MekDistribution>>> {
-        match self
-            .get_from::<MekDistribution>(space, did, nsid::MEK, rkey)
+        let space_str = space.to_string();
+        let fetched = if let Some(kem_key) = self.resolve_host_kem_did_key(&space_str).await? {
+            self.get_record_authenticated_in_space::<MekDistribution>(
+                space,
+                did,
+                nsid::MEK,
+                rkey,
+                &kem_key,
+            )
             .await
-        {
+            .map(|opt| opt.map(|(_, m)| m))
+        } else {
+            self.get_from::<MekDistribution>(space, did, nsid::MEK, rkey)
+                .await
+        };
+        match fetched {
             Ok(Some(m)) => Ok(Some(Stored {
                 author: did.to_owned(),
                 rkey: rkey.to_owned(),
@@ -985,29 +1105,72 @@ impl ThreadStore for SpaceThreadStore {
         range: TimeRange,
     ) -> Result<Vec<Stored<Batch>>> {
         let space = self.space_for(thread_id)?;
+        let space_str = space.to_string();
+        let host_kem = self.resolve_host_kem_did_key(&space_str).await?;
         let repos = self.list_repos(&space).await?;
         let mut out = Vec::new();
         for did in repos {
             if sender.is_some_and(|s| s != did.as_str()) {
                 continue;
             }
-            let mut batches: Vec<Stored<Batch>> = self
-                .list_repo::<Batch>(&space, &did, nsid::BATCH)
-                .await?
-                .into_iter()
-                .map(|(rkey, value)| Stored {
-                    author: did.clone(),
-                    rkey,
-                    value,
-                    order: None,
-                })
-                .collect();
-            overlay_author_redactions(
-                thread_id,
-                &did,
-                &mut batches,
-                self.list_repo(&space, &did, nsid::AUTHOR_REDACTION).await?,
-            )?;
+            let (mut batches, redactions) = if let Some(ref kem_key) = host_kem {
+                let parsed = match Self::fetch_repo_star_authenticated_raw(
+                    self.t.as_ref(),
+                    &self.floors,
+                    &space_str,
+                    &did,
+                    kem_key,
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(Error::NotFound("repo" | "record")) => continue,
+                    Err(e) => return Err(e),
+                };
+                if parsed.records.len() > MAX_SPACE_LIST_ITEMS {
+                    return Err(Error::Backend(format!(
+                        "space listing exceeds {MAX_SPACE_LIST_ITEMS} records"
+                    )));
+                }
+                let mut batches = Vec::new();
+                let mut redactions = Vec::new();
+                for entry in parsed.records {
+                    let Some((collection, rkey)) = entry.path.split_once('/') else {
+                        return Err(Error::Malformed("space record"));
+                    };
+                    if collection == nsid::BATCH {
+                        let value: Batch = serde_ipld_dagcbor::from_slice(&entry.record_dagcbor)
+                            .map_err(|_| Error::Malformed("space record"))?;
+                        batches.push(Stored {
+                            author: did.clone(),
+                            rkey: rkey.to_owned(),
+                            value,
+                            order: None,
+                        });
+                    } else if collection == nsid::AUTHOR_REDACTION {
+                        let record: AuthorRedaction =
+                            serde_ipld_dagcbor::from_slice(&entry.record_dagcbor)
+                                .map_err(|_| Error::Malformed("space record"))?;
+                        redactions.push((rkey.to_owned(), record));
+                    }
+                }
+                (batches, redactions)
+            } else {
+                let batches: Vec<Stored<Batch>> = self
+                    .list_repo::<Batch>(&space, &did, nsid::BATCH)
+                    .await?
+                    .into_iter()
+                    .map(|(rkey, value)| Stored {
+                        author: did.clone(),
+                        rkey,
+                        value,
+                        order: None,
+                    })
+                    .collect();
+                let redactions = self.list_repo(&space, &did, nsid::AUTHOR_REDACTION).await?;
+                (batches, redactions)
+            };
+            overlay_author_redactions(thread_id, &did, &mut batches, redactions)?;
             out.extend(batches.into_iter().filter(|batch| {
                 batch.value.thread_id == thread_id
                     && batch
@@ -1037,11 +1200,102 @@ impl ThreadStore for SpaceThreadStore {
             _ => false,
         };
         let space = self.space_for(thread_id)?;
+        let space_str = space.to_string();
+        let host_kem = self.resolve_host_kem_did_key(&space_str).await?;
         let repos = self.list_repos(&space).await?;
         let mut out = Vec::new();
         let mut quarantined = Vec::new();
         for did in repos {
             if sender.is_some_and(|s| s != did.as_str()) {
+                continue;
+            }
+            if let Some(ref kem_key) = host_kem {
+                let parsed = match Self::fetch_repo_star_authenticated_raw(
+                    self.t.as_ref(),
+                    &self.floors,
+                    &space_str,
+                    &did,
+                    kem_key,
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(Error::NotFound("repo" | "record")) => continue,
+                    Err(e) => return Err(e),
+                };
+                if parsed.records.len() > MAX_SPACE_LIST_ITEMS {
+                    push_quarantine(
+                        &mut quarantined,
+                        did,
+                        QuarantineReason::RepositoryOverflow,
+                        format!("space listing exceeds {MAX_SPACE_LIST_ITEMS} records"),
+                    );
+                    continue;
+                }
+                let mut batches = Vec::new();
+                let mut raw_redactions = Vec::new();
+                for entry in parsed.records {
+                    let Some((collection, rkey)) = entry.path.split_once('/') else {
+                        push_quarantine(
+                            &mut quarantined,
+                            did.clone(),
+                            QuarantineReason::MalformedRecord,
+                            format!("invalid STAR record path {}", entry.path),
+                        );
+                        continue;
+                    };
+                    if collection == nsid::BATCH {
+                        match serde_ipld_dagcbor::from_slice::<Batch>(&entry.record_dagcbor) {
+                            Ok(value) => batches.push(Stored {
+                                author: did.clone(),
+                                rkey: rkey.to_owned(),
+                                value,
+                                order: None,
+                            }),
+                            Err(e) => push_quarantine(
+                                &mut quarantined,
+                                did.clone(),
+                                QuarantineReason::MalformedRecord,
+                                format!("batch {rkey}: {e}"),
+                            ),
+                        }
+                    } else if collection == nsid::AUTHOR_REDACTION {
+                        raw_redactions.push((rkey.to_owned(), entry.record_dagcbor));
+                    }
+                }
+                for (rkey, raw_cbor) in raw_redactions {
+                    match serde_ipld_dagcbor::from_slice::<AuthorRedaction>(&raw_cbor) {
+                        Ok(record) => {
+                            if let Err(e) = overlay_author_redactions(
+                                thread_id,
+                                &did,
+                                &mut batches,
+                                vec![(rkey.clone(), record)],
+                            ) {
+                                push_quarantine(
+                                    &mut quarantined,
+                                    did.clone(),
+                                    QuarantineReason::InvalidRedaction,
+                                    format!("authorRedaction {rkey}: {e}"),
+                                );
+                            }
+                        }
+                        Err(e) => push_quarantine(
+                            &mut quarantined,
+                            did.clone(),
+                            QuarantineReason::MalformedRecord,
+                            format!("authorRedaction {rkey}: {e}"),
+                        ),
+                    }
+                }
+                out.extend(batches.into_iter().filter(|batch| {
+                    batch.value.thread_id == thread_id
+                        && batch
+                            .value
+                            .items
+                            .iter()
+                            .any(|item| range.contains(item.timestamp))
+                }));
                 continue;
             }
             let raw_batches = match self.list_repo_raw(&space, &did, nsid::BATCH, true).await {

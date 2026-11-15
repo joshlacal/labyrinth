@@ -14,12 +14,48 @@ use crate::message::{
 use crate::sign::XVerifyingKey;
 use crate::{Error, Result};
 
-/// CID link wrapper inside an ATProto blob reference (`{"$link": "<cid>"}`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// CID link wrapper inside an ATProto blob reference (`{"$link": "<cid>"}` in JSON, tag-42 CID in DAG-CBOR).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CidLinkDef {
-    #[serde(rename = "$link")]
     pub link: String,
+}
+
+impl serde::Serialize for CidLinkDef {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> core::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        if !serializer.is_human_readable()
+            && let Ok(parsed) = self.link.parse::<cid::Cid>()
+        {
+            return parsed.serialize(serializer);
+        }
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("$link", &self.link)?;
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CidLinkDef {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> core::result::Result<Self, D::Error> {
+        if !deserializer.is_human_readable() {
+            let parsed = cid::Cid::deserialize(deserializer)?;
+            return Ok(Self {
+                link: parsed.to_string(),
+            });
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(rename = "$link")]
+            link: String,
+        }
+        let w = Wire::deserialize(deserializer)?;
+        Ok(Self { link: w.link })
+    }
 }
 
 /// Standard ATProto blob reference (`{"$type": "blob", "ref": {"$link": cid}, "mimeType": ..., "size": ...}`).

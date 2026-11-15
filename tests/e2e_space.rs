@@ -136,6 +136,10 @@ impl SpaceRpc for Validating {
     async fn get_blob(&self, space: &str, did: &str, cid: &str) -> Result<Vec<u8>, SpaceError> {
         self.inner.get_blob(space, did, cid).await
     }
+
+    async fn host_kem_did_key(&self, space: &str) -> Result<Option<String>, SpaceError> {
+        self.inner.host_kem_did_key(space).await
+    }
 }
 
 struct World {

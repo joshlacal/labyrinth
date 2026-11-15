@@ -34,8 +34,8 @@ struct Mailbox {
     members: BTreeMap<String, EpochMember>,
     vdevices: BTreeMap<String, VirtualDevice>,
     otc_sessions: BTreeMap<String, OtcSession>,
-    read_states: BTreeMap<String, (ReadStateRecord, String)>,
-    circle_owner_states: BTreeMap<String, (CircleOwnerStateRecord, String)>,
+    read_states: BTreeMap<String, (ReadStateRecord, String, u64)>,
+    circle_owner_states: BTreeMap<String, (CircleOwnerStateRecord, String, u64)>,
     owner_batches: BTreeMap<String, (OwnerBatch, Option<ServerOrder>)>,
     attachments: BTreeMap<String, AttachmentManifest>,
     next_seq: u64,
@@ -179,6 +179,7 @@ impl MemoryBackend {
         MemoryMailbox {
             did: did.to_owned(),
             backend: self.clone(),
+            version_floors: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -442,12 +443,45 @@ impl MemoryBackend {
 pub struct MemoryMailbox {
     did: String,
     backend: MemoryBackend,
+    version_floors: Arc<Mutex<BTreeMap<(String, String), u64>>>,
 }
 
 impl MemoryMailbox {
     fn with<T>(&self, f: impl FnOnce(&mut Mailbox) -> Result<T>) -> Result<T> {
         let mut s = self.backend.lock();
         f(s.mailboxes.entry(self.did.clone()).or_default())
+    }
+
+    fn pinned_version(&self, collection: &str, id: &str) -> u64 {
+        self.version_floors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(collection.to_owned(), id.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn observe_version(&self, collection: &str, id: &str, ver: u64) -> Result<()> {
+        crate::store::validate_owner_state_version_floor(collection, id, ver)?;
+        let mut guard = self
+            .version_floors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = (collection.to_owned(), id.to_owned());
+        if let Some(&pinned) = guard.get(&key) {
+            if ver < pinned {
+                return Err(Error::Malformed("owner state version rollback"));
+            }
+            if ver > pinned {
+                guard.insert(key, ver);
+            }
+            return Ok(());
+        }
+        if guard.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES {
+            return Err(Error::Malformed("owner state version floor table full"));
+        }
+        guard.insert(key, ver);
+        Ok(())
     }
 }
 
@@ -832,15 +866,37 @@ impl MailboxStore for MemoryMailbox {
         })
     }
 
+    async fn get_read_state_versioned(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(ReadStateRecord, Option<String>, u64)>> {
+        let row = self.with(|m| {
+            Ok(m.read_states
+                .get(conversation_id)
+                .map(|(rec, cid, ver)| (rec.clone(), Some(cid.clone()), *ver)))
+        })?;
+        match row {
+            Some((rec, cid, ver)) => {
+                self.observe_version(crate::records::nsid::READ_STATE, conversation_id, ver)?;
+                Ok(Some((rec, cid, ver)))
+            }
+            None => {
+                if self.pinned_version(crate::records::nsid::READ_STATE, conversation_id) > 0 {
+                    return Err(Error::Malformed("owner state version rollback"));
+                }
+                Ok(None)
+            }
+        }
+    }
+
     async fn get_read_state(
         &self,
         conversation_id: &str,
     ) -> Result<Option<(ReadStateRecord, Option<String>)>> {
-        self.with(|m| {
-            Ok(m.read_states
-                .get(conversation_id)
-                .map(|(rec, cid)| (rec.clone(), Some(cid.clone()))))
-        })
+        Ok(self
+            .get_read_state_versioned(conversation_id)
+            .await?
+            .map(|(rec, cid, _)| (rec, cid)))
     }
 
     async fn put_read_state(
@@ -851,37 +907,117 @@ impl MailboxStore for MemoryMailbox {
     ) -> Result<String> {
         record.check()?;
         let cid = record_cid_json(record)?;
-        self.with(|m| {
-            match (m.read_states.get(conversation_id), expected_cid) {
+        let pinned = self.pinned_version(crate::records::nsid::READ_STATE, conversation_id);
+        let next_ver = self.with(|m| {
+            let next_ver = match (m.read_states.get(conversation_id), expected_cid) {
                 (Some(_), None) => return Err(Error::Conflict),
-                (None, Some(_)) => return Err(Error::Conflict),
-                (Some((_, cur_cid)), Some(exp)) if cur_cid != exp => return Err(Error::Conflict),
-                _ => {}
+                (None, Some(_)) => {
+                    if pinned > 0 {
+                        return Err(Error::Malformed("owner state version rollback"));
+                    }
+                    return Err(Error::Conflict);
+                }
+                (None, None) => {
+                    if pinned > 0 {
+                        return Err(Error::Malformed("owner state version rollback"));
+                    }
+                    1
+                }
+                (Some((_, cur_cid, cur_ver)), Some(exp)) => {
+                    if *cur_ver < pinned {
+                        return Err(Error::Malformed("owner state version rollback"));
+                    }
+                    if cur_cid != exp {
+                        return Err(Error::Conflict);
+                    }
+                    cur_ver
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Backend("cas version overflow".into()))?
+                }
+            };
+            m.read_states.insert(
+                conversation_id.to_owned(),
+                (record.clone(), cid.clone(), next_ver),
+            );
+            Ok(next_ver)
+        })?;
+        self.observe_version(crate::records::nsid::READ_STATE, conversation_id, next_ver)?;
+        Ok(cid)
+    }
+
+    async fn list_read_states_versioned(
+        &self,
+    ) -> Result<Vec<(String, ReadStateRecord, Option<String>, u64)>> {
+        let rows = self.with(|m| {
+            Ok(m.read_states
+                .iter()
+                .map(|(k, (rec, cid, ver))| (k.clone(), rec.clone(), Some(cid.clone()), *ver))
+                .collect::<Vec<_>>())
+        })?;
+        let seen: BTreeMap<&str, u64> = rows
+            .iter()
+            .map(|(id, _, _, ver)| (id.as_str(), *ver))
+            .collect();
+        {
+            let guard = self
+                .version_floors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for ((col, id), &pinned) in guard.iter() {
+                if col == crate::records::nsid::READ_STATE
+                    && pinned > 0
+                    && seen.get(id.as_str()).is_none_or(|&v| v < pinned)
+                {
+                    return Err(Error::Malformed("owner state version rollback"));
+                }
             }
-            m.read_states
-                .insert(conversation_id.to_owned(), (record.clone(), cid.clone()));
-            Ok(cid)
-        })
+        }
+        for (id, _, _, ver) in &rows {
+            self.observe_version(crate::records::nsid::READ_STATE, id, *ver)?;
+        }
+        Ok(rows)
     }
 
     async fn list_read_states(&self) -> Result<Vec<(String, ReadStateRecord, Option<String>)>> {
-        self.with(|m| {
-            Ok(m.read_states
-                .iter()
-                .map(|(k, (rec, cid))| (k.clone(), rec.clone(), Some(cid.clone())))
-                .collect())
-        })
+        Ok(self
+            .list_read_states_versioned()
+            .await?
+            .into_iter()
+            .map(|(k, rec, cid, _)| (k, rec, cid))
+            .collect())
+    }
+
+    async fn get_circle_owner_state_versioned(
+        &self,
+        circle_id: &str,
+    ) -> Result<Option<(CircleOwnerStateRecord, Option<String>, u64)>> {
+        let row = self.with(|m| {
+            Ok(m.circle_owner_states
+                .get(circle_id)
+                .map(|(rec, cid, ver)| (rec.clone(), Some(cid.clone()), *ver)))
+        })?;
+        match row {
+            Some((rec, cid, ver)) => {
+                self.observe_version(crate::records::nsid::CIRCLE_OWNER_STATE, circle_id, ver)?;
+                Ok(Some((rec, cid, ver)))
+            }
+            None => {
+                if self.pinned_version(crate::records::nsid::CIRCLE_OWNER_STATE, circle_id) > 0 {
+                    return Err(Error::Malformed("owner state version rollback"));
+                }
+                Ok(None)
+            }
+        }
     }
 
     async fn get_circle_owner_state(
         &self,
         circle_id: &str,
     ) -> Result<Option<(CircleOwnerStateRecord, Option<String>)>> {
-        self.with(|m| {
-            Ok(m.circle_owner_states
-                .get(circle_id)
-                .map(|(rec, cid)| (rec.clone(), Some(cid.clone()))))
-        })
+        Ok(self
+            .get_circle_owner_state_versioned(circle_id)
+            .await?
+            .map(|(rec, cid, _)| (rec, cid)))
     }
 
     async fn put_circle_owner_state(
@@ -892,32 +1028,146 @@ impl MailboxStore for MemoryMailbox {
     ) -> Result<String> {
         record.check()?;
         let cid = record_cid_json(record)?;
-        self.with(|m| {
-            match (m.circle_owner_states.get(circle_id), expected_cid) {
+        let pinned = self.pinned_version(crate::records::nsid::CIRCLE_OWNER_STATE, circle_id);
+        let next_ver = self.with(|m| {
+            let next_ver = match (m.circle_owner_states.get(circle_id), expected_cid) {
                 (Some(_), None) => return Err(Error::Conflict),
-                (None, Some(_)) => return Err(Error::Conflict),
-                (Some((_, cur_cid)), Some(exp)) if cur_cid != exp => return Err(Error::Conflict),
-                _ => {}
+                (None, Some(_)) => {
+                    if pinned > 0 {
+                        return Err(Error::Malformed("owner state version rollback"));
+                    }
+                    return Err(Error::Conflict);
+                }
+                (None, None) => {
+                    if pinned > 0 {
+                        return Err(Error::Malformed("owner state version rollback"));
+                    }
+                    1
+                }
+                (Some((_, cur_cid, cur_ver)), Some(exp)) => {
+                    if *cur_ver < pinned {
+                        return Err(Error::Malformed("owner state version rollback"));
+                    }
+                    if cur_cid != exp {
+                        return Err(Error::Conflict);
+                    }
+                    cur_ver
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Backend("cas version overflow".into()))?
+                }
+            };
+            m.circle_owner_states.insert(
+                circle_id.to_owned(),
+                (record.clone(), cid.clone(), next_ver),
+            );
+            Ok(next_ver)
+        })?;
+        self.observe_version(
+            crate::records::nsid::CIRCLE_OWNER_STATE,
+            circle_id,
+            next_ver,
+        )?;
+        Ok(cid)
+    }
+
+    async fn list_circle_owner_states_versioned(
+        &self,
+    ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>, u64)>> {
+        let rows = self.with(|m| {
+            Ok(m.circle_owner_states
+                .iter()
+                .map(|(k, (rec, cid, ver))| (k.clone(), rec.clone(), Some(cid.clone()), *ver))
+                .collect::<Vec<_>>())
+        })?;
+        let seen: BTreeMap<&str, u64> = rows
+            .iter()
+            .map(|(id, _, _, ver)| (id.as_str(), *ver))
+            .collect();
+        {
+            let guard = self
+                .version_floors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for ((col, id), &pinned) in guard.iter() {
+                if col == crate::records::nsid::CIRCLE_OWNER_STATE
+                    && pinned > 0
+                    && seen.get(id.as_str()).is_none_or(|&v| v < pinned)
+                {
+                    return Err(Error::Malformed("owner state version rollback"));
+                }
             }
-            m.circle_owner_states
-                .insert(circle_id.to_owned(), (record.clone(), cid.clone()));
-            Ok(cid)
-        })
+        }
+        for (id, _, _, ver) in &rows {
+            self.observe_version(crate::records::nsid::CIRCLE_OWNER_STATE, id, *ver)?;
+        }
+        Ok(rows)
     }
 
     async fn list_circle_owner_states(
         &self,
     ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>)>> {
-        self.with(|m| {
-            Ok(m.circle_owner_states
-                .iter()
-                .map(|(k, (rec, cid))| (k.clone(), rec.clone(), Some(cid.clone())))
-                .collect())
-        })
+        Ok(self
+            .list_circle_owner_states_versioned()
+            .await?
+            .into_iter()
+            .map(|(k, rec, cid, _)| (k, rec, cid))
+            .collect())
+    }
+
+    fn seed_owner_state_version_floors(&self, floors: &BTreeMap<(String, String), u64>) {
+        let mut guard = self
+            .version_floors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for ((col, id), &ver) in floors {
+            if crate::store::validate_owner_state_version_floor(col, id, ver).is_err() {
+                continue;
+            }
+            let key = (col.clone(), id.clone());
+            match guard.get(&key) {
+                Some(&cur) if cur >= ver => {}
+                Some(_) => {
+                    guard.insert(key, ver);
+                }
+                None if guard.len() < crate::store::MAX_WRITER_FLOOR_ENTRIES => {
+                    guard.insert(key, ver);
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn replace_owner_state_version_floors(&self, floors: &BTreeMap<(String, String), u64>) {
+        let mut next = BTreeMap::new();
+        for ((col, id), &ver) in floors {
+            if crate::store::validate_owner_state_version_floor(col, id, ver).is_err() {
+                continue;
+            }
+            let key = (col.clone(), id.clone());
+            if next.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES && !next.contains_key(&key) {
+                continue;
+            }
+            next.insert(key, ver);
+        }
+        *self
+            .version_floors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = next;
+    }
+
+    fn export_owner_state_version_floors(&self) -> BTreeMap<(String, String), u64> {
+        self.version_floors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     async fn purge_mailbox(&self) -> Result<()> {
         self.backend.lock().purge(&self.did);
+        self.version_floors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         Ok(())
     }
 }

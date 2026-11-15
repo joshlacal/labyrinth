@@ -267,6 +267,13 @@ impl Labyrinth {
             w.str(author)?;
             w.str(rev)?;
         }
+        let owner_state_floors = self.merged_owner_state_floors()?;
+        w.u32(owner_state_floors.len())?;
+        for ((collection, logical_id), &ver) in &owner_state_floors {
+            w.str(collection)?;
+            w.str(logical_id)?;
+            w.u64(ver);
+        }
         w.u32(self.meks.len())?;
         for (thread, meks) in &self.meks {
             w.str(thread)?;
@@ -418,6 +425,27 @@ impl Labyrinth {
                 return Err(Error::Malformed("duplicate state writer revision floor"));
             }
         }
+        let owner_floor_count = r.count(2 + 2 + 8)?;
+        if owner_floor_count > crate::store::MAX_WRITER_FLOOR_ENTRIES {
+            return Err(Error::Malformed(
+                "state owner state version floor table full",
+            ));
+        }
+        let mut owner_state_floors = BTreeMap::new();
+        for _ in 0..owner_floor_count {
+            let collection = r.str()?;
+            let logical_id = r.str()?;
+            let ver = r.u64()?;
+            crate::store::validate_owner_state_version_floor(&collection, &logical_id, ver)?;
+            if owner_state_floors
+                .insert((collection, logical_id), ver)
+                .is_some()
+            {
+                return Err(Error::Malformed(
+                    "duplicate state owner state version floor",
+                ));
+            }
+        }
         let mut meks = BTreeMap::new();
         for _ in 0..r.count(2 + 4)? {
             let thread = r.str()?;
@@ -476,6 +504,25 @@ impl Labyrinth {
             }
         }
         me.replace_store_writer_floors();
+        for ((col, id), pinned) in owner_state_floors {
+            let key = (col, id);
+            match me.owner_state_floors.get(&key) {
+                Some(&existing) if existing < pinned => {
+                    return Err(Error::Malformed("owner state version rollback"));
+                }
+                Some(&existing) if existing >= pinned => {}
+                None => {
+                    if me.owner_state_floors.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES {
+                        return Err(Error::Malformed("owner state version floor table full"));
+                    }
+                    me.owner_state_floors.insert(key, pinned);
+                }
+                Some(_) => {
+                    me.owner_state_floors.insert(key, pinned);
+                }
+            }
+        }
+        me.replace_store_owner_state_floors();
         // [CB-43] Everything the mailbox alone can prove is checked now.
         // The attester lookup may wait for the directory: a restart must
         // work offline, and nothing is addressed to this epoch until a

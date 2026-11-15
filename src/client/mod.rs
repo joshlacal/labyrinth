@@ -49,8 +49,8 @@ pub use epochs::{InvalidatedRecoveryMethod, RotationReport, SyncReport};
 pub use lookup::{ThreadCursor, ThreadList, ThreadPage, ThreadSummary};
 pub use members::{ExcludedMember, ExclusionReason};
 pub use owner_state::{
-    ACL_REMOVE_PENDING, ACL_REMOVE_PENDING_ROTATED, ACL_TOMBSTONE_PREFIX, CircleOwnerState,
-    ReadState,
+    ACL_CLEARED_TOMBSTONE_PREFIX, ACL_REMOVE_PENDING, ACL_REMOVE_PENDING_ROTATED,
+    ACL_TOMBSTONE_PREFIX, ACL_TOMBSTONE_VER_PREFIX, CircleOwnerState, ReadState,
 };
 pub use pins::{PeerPin, RepinProposal};
 pub use read::{
@@ -167,6 +167,11 @@ pub struct Labyrinth {
     /// Monotonic `(spaceUri, authorDid) -> repoRev` floor persisted across
     /// restarts so a Space host cannot roll back a writer's commit head.
     writer_floors: BTreeMap<(String, String), String>,
+    /// Monotonic `(collection, logicalId) -> casVersion` floor persisted across
+    /// restarts so a Space host cannot roll back account-private owner state.
+    owner_state_floors: BTreeMap<(String, String), u64>,
+    /// Cached `(circleId, recordCid) -> casVersion` hints for explicit CAS puts.
+    circle_cas_versions: HashMap<(String, String), u64>,
     outbox: BTreeMap<String, Vec<SealedMessage>>,
     /// Canonical `(DID, epoch head)` roster under which each sender buffer's
     /// MEK was distributed. Flush revalidates it so a queued ciphertext
@@ -228,6 +233,25 @@ impl Labyrinth {
         }
         b.mailbox.replace_writer_rev_floors(&writer_floors);
         b.threads.replace_writer_rev_floors(&writer_floors);
+        let mut owner_state_floors: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for ((col, id), ver) in b.mailbox.export_owner_state_version_floors() {
+            crate::store::validate_owner_state_version_floor(&col, &id, ver)?;
+            let key = (col, id);
+            match owner_state_floors.get(&key) {
+                Some(&cur) if cur >= ver => {}
+                Some(_) => {
+                    owner_state_floors.insert(key, ver);
+                }
+                None => {
+                    if owner_state_floors.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES {
+                        return Err(Error::Malformed("owner state version floor table full"));
+                    }
+                    owner_state_floors.insert(key, ver);
+                }
+            }
+        }
+        b.mailbox
+            .replace_owner_state_version_floors(&owner_state_floors);
         Ok(Self {
             did: did.to_owned(),
             device,
@@ -248,6 +272,8 @@ impl Labyrinth {
             meks: BTreeMap::new(),
             receipt_trust: BTreeMap::new(),
             writer_floors,
+            owner_state_floors,
+            circle_cas_versions: HashMap::new(),
             outbox: BTreeMap::new(),
             outbox_rosters: BTreeMap::new(),
             owner_outbox: BTreeMap::new(),
@@ -341,6 +367,69 @@ impl Labyrinth {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn seed_store_owner_state_floors(&self) {
+        self.b
+            .mailbox
+            .seed_owner_state_version_floors(&self.owner_state_floors);
+    }
+
+    pub(super) fn replace_store_owner_state_floors(&self) {
+        self.b
+            .mailbox
+            .replace_owner_state_version_floors(&self.owner_state_floors);
+    }
+
+    pub(super) fn merged_owner_state_floors(&self) -> Result<BTreeMap<(String, String), u64>> {
+        let mut merged = self.owner_state_floors.clone();
+        for ((col, id), offered) in self.b.mailbox.export_owner_state_version_floors() {
+            crate::store::validate_owner_state_version_floor(&col, &id, offered)?;
+            let key = (col, id);
+            match merged.get(&key) {
+                Some(&pinned) if offered < pinned => {
+                    return Err(Error::Malformed("owner state version rollback"));
+                }
+                Some(&pinned) if offered == pinned => {}
+                Some(_) => {
+                    merged.insert(key, offered);
+                }
+                None => {
+                    if merged.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES {
+                        return Err(Error::Malformed("owner state version floor table full"));
+                    }
+                    merged.insert(key, offered);
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    pub(super) fn sync_store_owner_state_floors(&mut self) -> Result<()> {
+        let merged = match self.merged_owner_state_floors() {
+            Ok(m) => m,
+            Err(err) => {
+                self.replace_store_owner_state_floors();
+                return Err(err);
+            }
+        };
+        if merged != self.owner_state_floors {
+            let previous = core::mem::replace(&mut self.owner_state_floors, merged);
+            self.replace_store_owner_state_floors();
+            if let Err(err) = self.checkpoint_state() {
+                self.owner_state_floors = previous;
+                self.replace_store_owner_state_floors();
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Pinned CAS version floor for `(collection, logical_id)`, if one has been observed.
+    pub fn owner_state_version_floor(&self, collection: &str, logical_id: &str) -> Option<u64> {
+        self.owner_state_floors
+            .get(&(collection.to_owned(), logical_id.to_owned()))
+            .copied()
     }
 
     /// Pinned commit revision floor for `(space, author)`, if one has been observed.

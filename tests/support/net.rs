@@ -251,6 +251,12 @@ impl MailboxStore for Faulty {
     ) -> labyrinth::Result<Option<(labyrinth::records::ReadStateRecord, Option<String>)>> {
         self.inner.get_read_state(conversation_id).await
     }
+    async fn get_read_state_versioned(
+        &self,
+        conversation_id: &str,
+    ) -> labyrinth::Result<Option<(labyrinth::records::ReadStateRecord, Option<String>, u64)>> {
+        self.inner.get_read_state_versioned(conversation_id).await
+    }
     async fn put_read_state(
         &self,
         conversation_id: &str,
@@ -266,12 +272,36 @@ impl MailboxStore for Faulty {
     ) -> labyrinth::Result<Vec<(String, labyrinth::records::ReadStateRecord, Option<String>)>> {
         self.inner.list_read_states().await
     }
+    async fn list_read_states_versioned(
+        &self,
+    ) -> labyrinth::Result<
+        Vec<(
+            String,
+            labyrinth::records::ReadStateRecord,
+            Option<String>,
+            u64,
+        )>,
+    > {
+        self.inner.list_read_states_versioned().await
+    }
     async fn get_circle_owner_state(
         &self,
         circle_id: &str,
     ) -> labyrinth::Result<Option<(labyrinth::records::CircleOwnerStateRecord, Option<String>)>>
     {
         self.inner.get_circle_owner_state(circle_id).await
+    }
+    async fn get_circle_owner_state_versioned(
+        &self,
+        circle_id: &str,
+    ) -> labyrinth::Result<
+        Option<(
+            labyrinth::records::CircleOwnerStateRecord,
+            Option<String>,
+            u64,
+        )>,
+    > {
+        self.inner.get_circle_owner_state_versioned(circle_id).await
     }
     async fn put_circle_owner_state(
         &self,
@@ -293,5 +323,34 @@ impl MailboxStore for Faulty {
         )>,
     > {
         self.inner.list_circle_owner_states().await
+    }
+    async fn list_circle_owner_states_versioned(
+        &self,
+    ) -> labyrinth::Result<
+        Vec<(
+            String,
+            labyrinth::records::CircleOwnerStateRecord,
+            Option<String>,
+            u64,
+        )>,
+    > {
+        self.inner.list_circle_owner_states_versioned().await
+    }
+    fn seed_owner_state_version_floors(
+        &self,
+        floors: &std::collections::BTreeMap<(String, String), u64>,
+    ) {
+        self.inner.seed_owner_state_version_floors(floors);
+    }
+    fn replace_owner_state_version_floors(
+        &self,
+        floors: &std::collections::BTreeMap<(String, String), u64>,
+    ) {
+        self.inner.replace_owner_state_version_floors(floors);
+    }
+    fn export_owner_state_version_floors(
+        &self,
+    ) -> std::collections::BTreeMap<(String, String), u64> {
+        self.inner.export_owner_state_version_floors()
     }
 }

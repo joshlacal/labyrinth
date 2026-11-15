@@ -203,10 +203,10 @@ fn json_to_canonical_dagcbor(v: &Value) -> Vec<u8> {
                 }
                 Value::Object(map) => {
                     if map.len() == 1 {
-                        if let Some(b64) = map.get("$bytes").and_then(Value::as_str) {
-                            let raw = STANDARD_NO_PAD
-                                .decode(b64.trim_end_matches('=').as_bytes())
-                                .map_err(serde::ser::Error::custom)?;
+                        if let Some(b64) = map.get("$bytes").and_then(Value::as_str)
+                            && let Ok(raw) =
+                                STANDARD_NO_PAD.decode(b64.trim_end_matches('=').as_bytes())
+                        {
                             return serializer.serialize_bytes(&raw);
                         }
                         if let Some(link) = map.get("$link").and_then(Value::as_str)
@@ -1132,5 +1132,12 @@ impl SpaceRpc for SpaceClient {
             BlobVisibility::SpaceScoped(spaces) if spaces.contains(space) => Ok(blob.bytes.clone()),
             _ => Err(err(404, "BlobNotFound", cid)),
         }
+    }
+
+    async fn host_kem_did_key(
+        &self,
+        _space: &str,
+    ) -> core::result::Result<Option<String>, SpaceError> {
+        Ok(Some(self.host.kem_did_key()))
     }
 }

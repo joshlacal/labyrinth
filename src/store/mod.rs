@@ -40,25 +40,70 @@ use crate::{Error, Result};
 pub const MAX_WRITER_FLOOR_SPACE_LEN: usize = 512;
 /// Maximum byte length of an author DID key in a persisted writer revision floor.
 pub const MAX_WRITER_FLOOR_AUTHOR_LEN: usize = 256;
+/// Exact character length of a canonical ATProto base32-sortable TID.
+pub const ATPROTO_TID_LEN: usize = 13;
 /// Maximum byte length of a repository commit `repoRev` string in a writer revision floor.
-pub const MAX_WRITER_FLOOR_REV_LEN: usize = 128;
+pub const MAX_WRITER_FLOOR_REV_LEN: usize = ATPROTO_TID_LEN;
 /// Maximum number of `(space_uri, author_did)` entries in a writer revision floor table.
 pub const MAX_WRITER_FLOOR_ENTRIES: usize = 65_536;
+/// Maximum byte length of an owner-state collection NSID in a persisted version floor.
+pub const MAX_OWNER_STATE_COLLECTION_LEN: usize = 128;
+/// Maximum byte length of an owner-state logical identifier in a persisted version floor.
+pub const MAX_OWNER_STATE_ID_LEN: usize = 256;
 
-/// Validate that `(space, author, offered_rev)` are non-empty, printable ASCII,
-/// and within wire/state size bounds (`512` / `256` / `128` bytes).
+/// Returns `true` iff `s` is a canonical 13-character ATProto base32-sortable TID
+/// (`[2-7ab][2-7a-z]{12}`, top bit of the 64-bit integer clear).
+pub fn is_valid_atproto_tid(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != ATPROTO_TID_LEN {
+        return false;
+    }
+    if !matches!(bytes[0], b'2'..=b'7' | b'a' | b'b') {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| matches!(b, b'2'..=b'7' | b'a'..=b'z'))
+}
+
+/// Validate that `space` is a valid Space URI (`<= 512` bytes), `author` is a valid
+/// ATProto DID (`<= 256` bytes), and `offered_rev` is a canonical 13-char ATProto TID.
 pub fn validate_writer_rev_floor(space: &str, author: &str, offered_rev: &str) -> Result<()> {
-    let valid_token = |s: &str, max_len: usize| {
-        !s.is_empty() && s.len() <= max_len && s.bytes().all(|b| b.is_ascii_graphic())
-    };
-    if !valid_token(space, MAX_WRITER_FLOOR_SPACE_LEN) {
+    if space.is_empty()
+        || space.len() > MAX_WRITER_FLOOR_SPACE_LEN
+        || atproto_spaces::SpaceUri::parse_hedged(space).is_err()
+    {
         return Err(Error::Malformed("invalid writer revision space"));
     }
-    if !valid_token(author, MAX_WRITER_FLOOR_AUTHOR_LEN) {
+    if author.is_empty()
+        || author.len() > MAX_WRITER_FLOOR_AUTHOR_LEN
+        || !atproto_spaces::is_valid_did(author)
+    {
         return Err(Error::Malformed("invalid writer revision author"));
     }
-    if !valid_token(offered_rev, MAX_WRITER_FLOOR_REV_LEN) {
+    if !is_valid_atproto_tid(offered_rev) {
         return Err(Error::Malformed("invalid writer revision"));
+    }
+    Ok(())
+}
+
+/// Validate `(collection, logical_id, version)` for monotonic owner-state CAS floors.
+pub fn validate_owner_state_version_floor(
+    collection: &str,
+    logical_id: &str,
+    _version: u64,
+) -> Result<()> {
+    if collection.is_empty()
+        || collection.len() > MAX_OWNER_STATE_COLLECTION_LEN
+        || !atproto_spaces::is_valid_nsid(collection)
+    {
+        return Err(Error::Malformed("invalid owner state collection"));
+    }
+    if logical_id.is_empty()
+        || logical_id.len() > MAX_OWNER_STATE_ID_LEN
+        || logical_id.bytes().any(|b| !b.is_ascii_graphic())
+    {
+        return Err(Error::Malformed("invalid owner state identifier"));
     }
     Ok(())
 }
@@ -231,6 +276,17 @@ pub trait MailboxStore: MaybeSend + MaybeSync {
         Err(Error::NotSupported("getOtcSession"))
     }
 
+    /// Encrypted per-conversation UI read-watermark state (`blue.catbird.labyrinth.readState`),
+    /// returning `(record, cid, cas_version)`.
+    async fn get_read_state_versioned(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(ReadStateRecord, Option<String>, u64)>> {
+        Ok(self
+            .get_read_state(conversation_id)
+            .await?
+            .map(|(rec, cid)| (rec, cid, 1)))
+    }
     /// Encrypted per-conversation UI read-watermark state (`blue.catbird.labyrinth.readState`).
     async fn get_read_state(
         &self,
@@ -251,10 +307,31 @@ pub trait MailboxStore: MaybeSend + MaybeSync {
         let _ = (conversation_id, record, expected_cid);
         Err(Error::NotSupported("putReadState"))
     }
+    async fn list_read_states_versioned(
+        &self,
+    ) -> Result<Vec<(String, ReadStateRecord, Option<String>, u64)>> {
+        Ok(self
+            .list_read_states()
+            .await?
+            .into_iter()
+            .map(|(id, rec, cid)| (id, rec, cid, 1))
+            .collect())
+    }
     async fn list_read_states(&self) -> Result<Vec<(String, ReadStateRecord, Option<String>)>> {
         Err(Error::NotSupported("listReadStates"))
     }
 
+    /// Encrypted per-circle owner state (`blue.catbird.labyrinth.circleOwnerState`),
+    /// returning `(record, cid, cas_version)`.
+    async fn get_circle_owner_state_versioned(
+        &self,
+        circle_id: &str,
+    ) -> Result<Option<(CircleOwnerStateRecord, Option<String>, u64)>> {
+        Ok(self
+            .get_circle_owner_state(circle_id)
+            .await?
+            .map(|(rec, cid)| (rec, cid, 1)))
+    }
     /// Encrypted per-circle owner state (`blue.catbird.labyrinth.circleOwnerState`).
     async fn get_circle_owner_state(
         &self,
@@ -275,6 +352,16 @@ pub trait MailboxStore: MaybeSend + MaybeSync {
         let _ = (circle_id, record, expected_cid);
         Err(Error::NotSupported("putCircleOwnerState"))
     }
+    async fn list_circle_owner_states_versioned(
+        &self,
+    ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>, u64)>> {
+        Ok(self
+            .list_circle_owner_states()
+            .await?
+            .into_iter()
+            .map(|(id, rec, cid)| (id, rec, cid, 1))
+            .collect())
+    }
     async fn list_circle_owner_states(
         &self,
     ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>)>> {
@@ -290,6 +377,17 @@ pub trait MailboxStore: MaybeSend + MaybeSync {
     }
     /// Export the highest `(space_uri, author_did) -> rev` floors observed by this store.
     fn export_writer_rev_floors(&self) -> BTreeMap<(String, String), String> {
+        BTreeMap::new()
+    }
+
+    /// Install persisted `(collection, logical_id) -> max_seen_ver` owner-state CAS floors.
+    fn seed_owner_state_version_floors(&self, _floors: &BTreeMap<(String, String), u64>) {}
+    /// Atomically replace the store's `(collection, logical_id) -> max_seen_ver` floor table.
+    fn replace_owner_state_version_floors(&self, floors: &BTreeMap<(String, String), u64>) {
+        self.seed_owner_state_version_floors(floors);
+    }
+    /// Export the highest `(collection, logical_id) -> max_seen_ver` floors observed by this store.
+    fn export_owner_state_version_floors(&self) -> BTreeMap<(String, String), u64> {
         BTreeMap::new()
     }
 

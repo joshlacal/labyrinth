@@ -101,6 +101,29 @@ impl WriterRevFloors {
         out
     }
 
+    /// Read-only check verifying `(space, author, offered_rev)` is well-formed and not
+    /// older than any previously authenticated revision floor, without mutating floors.
+    pub fn check_not_rolled_back(
+        &self,
+        space: &str,
+        author: &str,
+        offered_rev: &str,
+    ) -> Result<()> {
+        crate::store::validate_writer_rev_floor(space, author, offered_rev)?;
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pinned) = guard.get(&(space.to_owned(), author.to_owned()))
+            && offered_rev < pinned.as_str()
+        {
+            return Err(Error::WriterRollback {
+                space: space.to_owned(),
+                author: author.to_owned(),
+                pinned_rev: pinned.clone(),
+                offered_rev: offered_rev.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn observe(&self, space: &str, author: &str, offered_rev: &str) -> Result<()> {
         crate::store::validate_writer_rev_floor(space, author, offered_rev)?;
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -173,6 +196,94 @@ impl WriterRevFloors {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(space.to_owned(), author.to_owned()))
             .cloned()
+    }
+}
+
+/// Monotonic per-`(collection, logical_id)` CAS version floors for account-private
+/// owner-state records (`readState` and `circleOwnerState`).
+#[derive(Clone, Default, Debug)]
+pub struct OwnerStateVersionFloors {
+    inner: Arc<Mutex<BTreeMap<(String, String), u64>>>,
+}
+
+impl OwnerStateVersionFloors {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn pinned(&self, collection: &str, logical_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(collection.to_owned(), logical_id.to_owned()))
+            .copied()
+    }
+
+    pub fn observe(&self, collection: &str, logical_id: &str, ver: u64) -> Result<()> {
+        crate::store::validate_owner_state_version_floor(collection, logical_id, ver)?;
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (collection.to_owned(), logical_id.to_owned());
+        if let Some(&pinned) = guard.get(&key) {
+            if ver < pinned {
+                return Err(Error::Malformed("owner state version rollback"));
+            }
+            if ver > pinned {
+                guard.insert(key, ver);
+            }
+            return Ok(());
+        }
+        if guard.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES {
+            return Err(Error::Malformed("owner state version floor table full"));
+        }
+        guard.insert(key, ver);
+        Ok(())
+    }
+
+    pub fn seed(&self, floors: &BTreeMap<(String, String), u64>) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for ((collection, logical_id), &ver) in floors {
+            if crate::store::validate_owner_state_version_floor(collection, logical_id, ver)
+                .is_err()
+            {
+                continue;
+            }
+            let key = (collection.clone(), logical_id.clone());
+            match guard.get(&key) {
+                Some(&cur) if cur >= ver => {}
+                Some(_) => {
+                    guard.insert(key, ver);
+                }
+                None if guard.len() < crate::store::MAX_WRITER_FLOOR_ENTRIES => {
+                    guard.insert(key, ver);
+                }
+                None => {}
+            }
+        }
+    }
+
+    pub fn replace(&self, floors: &BTreeMap<(String, String), u64>) {
+        let mut next = BTreeMap::new();
+        for ((collection, logical_id), &ver) in floors {
+            if crate::store::validate_owner_state_version_floor(collection, logical_id, ver)
+                .is_err()
+            {
+                continue;
+            }
+            let key = (collection.clone(), logical_id.clone());
+            if next.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES && !next.contains_key(&key) {
+                continue;
+            }
+            next.insert(key, ver);
+        }
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<(String, String), u64> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn clear(&self) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -289,6 +400,15 @@ pub trait SpaceRpc: MaybeSend + MaybeSync {
             "space.getBlob not configured",
         ))
     }
+
+    /// Optional host `#atproto_kem` P-256 `did:key:zDn...` for RFC 9421 + HPKE `0xFFFF`
+    /// Export MAC negotiation on `com.atproto.space.{getRecord,getRepo}`.
+    async fn host_kem_did_key(
+        &self,
+        _space: &str,
+    ) -> core::result::Result<Option<String>, SpaceError> {
+        Ok(None)
+    }
 }
 
 /// A Space reference, `at://{spaceDid}/space/{spaceType}/{skey}`.
@@ -318,33 +438,21 @@ impl SpaceRef {
         }
     }
 
-    /// Parses the three-part form; a record URI inside a Space is refused.
+    /// Parses the canonical `at://{did}/space/{type}/{skey}` form via
+    /// [`atproto_spaces::SpaceUri::parse`]; a record URI inside a Space is refused.
     pub fn parse(s: &str) -> Result<Self> {
-        let rest = s
-            .strip_prefix("at://")
-            .ok_or(Error::Malformed("space ref"))?;
-        let parts: Vec<&str> = rest.split('/').collect();
-        match parts[..] {
-            [did, "space", ty, skey]
-                if did.starts_with("did:") && !ty.is_empty() && !skey.is_empty() =>
-            {
-                Ok(Self {
-                    space_did: did.to_owned(),
-                    space_type: ty.to_owned(),
-                    skey: skey.to_owned(),
-                })
-            }
-            _ => Err(Error::Malformed("space ref")),
-        }
+        atproto_spaces::SpaceUri::parse(s)
+            .map(Self::from)
+            .map_err(|_| Error::Malformed("space ref"))
     }
 
     /// Parses canonical `at://{did}/space/{type}/{skey}` or hedged
     /// `at:space/{did}/{type}/{skey}` / `at://space/{did}/{type}/{skey}` via
     /// [`atproto_spaces::SpaceUri::parse_hedged`].
     pub fn parse_hedged(s: &str) -> Result<Self> {
-        let uri =
-            atproto_spaces::SpaceUri::parse_hedged(s).map_err(|_| Error::Malformed("space ref"))?;
-        Ok(Self::from(uri))
+        atproto_spaces::SpaceUri::parse_hedged(s)
+            .map(Self::from)
+            .map_err(|_| Error::Malformed("space ref"))
     }
 
     /// Converts to a validated [`atproto_spaces::SpaceUri`].
@@ -366,11 +474,15 @@ impl From<atproto_spaces::SpaceUri> for SpaceRef {
 
 impl core::fmt::Display for SpaceRef {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "at://{}/space/{}/{}",
-            self.space_did, self.space_type, self.skey
-        )
+        if let Ok(uri) = self.to_space_uri() {
+            f.write_str(uri.as_str())
+        } else {
+            write!(
+                f,
+                "at://{}/space/{}/{}",
+                self.space_did, self.space_type, self.skey
+            )
+        }
     }
 }
 
@@ -573,6 +685,7 @@ pub struct SpaceMailboxStore {
     now_ms: crate::store::ClockFn,
     page: usize,
     floors: WriterRevFloors,
+    version_floors: OwnerStateVersionFloors,
 }
 
 impl SpaceMailboxStore {
@@ -591,6 +704,7 @@ impl SpaceMailboxStore {
             now_ms: Arc::new(system_now_ms),
             page: LIST_LIMIT,
             floors: WriterRevFloors::new(),
+            version_floors: OwnerStateVersionFloors::new(),
         }
     }
 
@@ -983,7 +1097,7 @@ impl SpaceMailboxStore {
         &self,
         collection: &'static str,
         logical_id: &str,
-    ) -> Result<Option<(T, Option<String>)>> {
+    ) -> Result<Option<(T, Option<String>, u64)>> {
         let best = self
             .list_raw_with_cid(collection, true)
             .await?
@@ -992,16 +1106,24 @@ impl SpaceMailboxStore {
                 Self::match_versioned_rkey(logical_id, &rkey).map(|ver| (ver, cid, value))
             })
             .max_by_key(|(ver, _, _)| *ver);
-        let Some((_, cid, value)) = best else {
+        let Some((ver, cid, value)) = best else {
+            if self
+                .version_floors
+                .pinned(collection, logical_id)
+                .is_some_and(|pinned| pinned > 0)
+            {
+                return Err(Error::Malformed("owner state version rollback"));
+            }
             return Ok(None);
         };
-        Ok(Some((decode(value)?, cid)))
+        self.version_floors.observe(collection, logical_id, ver)?;
+        Ok(Some((decode(value)?, cid, ver)))
     }
 
     async fn list_versioned_cas<T: DeserializeOwned>(
         &self,
         collection: &'static str,
-    ) -> Result<Vec<(String, T, Option<String>)>> {
+    ) -> Result<Vec<(String, T, Option<String>, u64)>> {
         let mut by_logical: BTreeMap<String, (u64, T, Option<String>)> = BTreeMap::new();
         for (rkey, rec, cid) in self.list_with_cid::<T>(collection).await? {
             let (logical_id, ver) = Self::split_versioned_rkey(&rkey);
@@ -1012,9 +1134,22 @@ impl SpaceMailboxStore {
                 }
             }
         }
+        for ((pinned_col, pinned_id), pinned_ver) in self.version_floors.snapshot() {
+            if pinned_col == collection
+                && pinned_ver > 0
+                && by_logical
+                    .get(&pinned_id)
+                    .is_none_or(|(ver, _, _)| *ver < pinned_ver)
+            {
+                return Err(Error::Malformed("owner state version rollback"));
+            }
+        }
+        for (logical_id, (ver, _, _)) in &by_logical {
+            self.version_floors.observe(collection, logical_id, *ver)?;
+        }
         Ok(by_logical
             .into_iter()
-            .map(|(logical_id, (_, rec, cid))| (logical_id, rec, cid))
+            .map(|(logical_id, (ver, rec, cid))| (logical_id, rec, cid, ver))
             .collect())
     }
 
@@ -1034,19 +1169,32 @@ impl SpaceMailboxStore {
                 Self::match_versioned_rkey(logical_id, &rkey).map(|ver| (ver, rkey, cid))
             })
             .collect();
+        let pinned = self
+            .version_floors
+            .pinned(collection, logical_id)
+            .unwrap_or(0);
 
         let next_ver = match expected_cid {
             None => {
                 if !existing.is_empty() {
                     return Err(Error::Conflict);
                 }
+                if pinned > 0 {
+                    return Err(Error::Malformed("owner state version rollback"));
+                }
                 1
             }
             Some(expected) => {
                 let Some((max_ver, _, max_cid)) = existing.iter().max_by_key(|(ver, _, _)| *ver)
                 else {
+                    if pinned > 0 {
+                        return Err(Error::Malformed("owner state version rollback"));
+                    }
                     return Err(Error::Conflict);
                 };
+                if *max_ver < pinned {
+                    return Err(Error::Malformed("owner state version rollback"));
+                }
                 if max_cid.as_deref() != Some(expected) {
                     return Err(Error::Conflict);
                 }
@@ -1069,27 +1217,8 @@ impl SpaceMailboxStore {
             .next()
             .and_then(|r| r.cid)
             .ok_or_else(|| Error::Backend("space create result missing cid".into()))?;
-
-        let stale_rkeys: Vec<String> = existing
-            .into_iter()
-            .filter(|(ver, _, _)| *ver < next_ver)
-            .map(|(_, rkey, _)| rkey)
-            .collect();
-        for chunk in stale_rkeys.chunks(MAX_WRITES) {
-            let deletes: Vec<WriteOp> = chunk
-                .iter()
-                .map(|rkey| WriteOp::Delete {
-                    collection,
-                    rkey: rkey.clone(),
-                })
-                .collect();
-            if let Err(Error::NotFound("record")) = self.apply(&deletes).await {
-                for rkey in chunk {
-                    let _ = self.delete_record_idempotent(collection, rkey).await;
-                }
-            }
-        }
-
+        self.version_floors
+            .observe(collection, logical_id, next_ver)?;
         Ok(written_cid)
     }
 
@@ -1511,21 +1640,32 @@ impl MailboxStore for SpaceMailboxStore {
                 self.apply(&writes).await?;
             }
         }
+        self.version_floors.clear();
         self.keys.retract().await
     }
 
-    async fn get_read_state(
+    async fn get_read_state_versioned(
         &self,
         conversation_id: &str,
-    ) -> Result<Option<(ReadStateRecord, Option<String>)>> {
-        let Some((rec, cid)) = self
+    ) -> Result<Option<(ReadStateRecord, Option<String>, u64)>> {
+        let Some((rec, cid, ver)) = self
             .get_versioned_cas::<ReadStateRecord>(nsid::READ_STATE, conversation_id)
             .await?
         else {
             return Ok(None);
         };
         rec.check()?;
-        Ok(Some((rec, cid)))
+        Ok(Some((rec, cid, ver)))
+    }
+
+    async fn get_read_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(ReadStateRecord, Option<String>)>> {
+        Ok(self
+            .get_read_state_versioned(conversation_id)
+            .await?
+            .map(|(rec, cid, _)| (rec, cid)))
     }
 
     async fn put_read_state(
@@ -1539,28 +1679,49 @@ impl MailboxStore for SpaceMailboxStore {
             .await
     }
 
-    async fn list_read_states(&self) -> Result<Vec<(String, ReadStateRecord, Option<String>)>> {
+    async fn list_read_states_versioned(
+        &self,
+    ) -> Result<Vec<(String, ReadStateRecord, Option<String>, u64)>> {
         let rows = self
             .list_versioned_cas::<ReadStateRecord>(nsid::READ_STATE)
             .await?;
-        for (_, rec, _) in &rows {
+        for (_, rec, _, _) in &rows {
             rec.check()?;
         }
         Ok(rows)
     }
 
-    async fn get_circle_owner_state(
+    async fn list_read_states(&self) -> Result<Vec<(String, ReadStateRecord, Option<String>)>> {
+        Ok(self
+            .list_read_states_versioned()
+            .await?
+            .into_iter()
+            .map(|(id, rec, cid, _)| (id, rec, cid))
+            .collect())
+    }
+
+    async fn get_circle_owner_state_versioned(
         &self,
         circle_id: &str,
-    ) -> Result<Option<(CircleOwnerStateRecord, Option<String>)>> {
-        let Some((rec, cid)) = self
+    ) -> Result<Option<(CircleOwnerStateRecord, Option<String>, u64)>> {
+        let Some((rec, cid, ver)) = self
             .get_versioned_cas::<CircleOwnerStateRecord>(nsid::CIRCLE_OWNER_STATE, circle_id)
             .await?
         else {
             return Ok(None);
         };
         rec.check()?;
-        Ok(Some((rec, cid)))
+        Ok(Some((rec, cid, ver)))
+    }
+
+    async fn get_circle_owner_state(
+        &self,
+        circle_id: &str,
+    ) -> Result<Option<(CircleOwnerStateRecord, Option<String>)>> {
+        Ok(self
+            .get_circle_owner_state_versioned(circle_id)
+            .await?
+            .map(|(rec, cid, _)| (rec, cid)))
     }
 
     async fn put_circle_owner_state(
@@ -1574,16 +1735,27 @@ impl MailboxStore for SpaceMailboxStore {
             .await
     }
 
-    async fn list_circle_owner_states(
+    async fn list_circle_owner_states_versioned(
         &self,
-    ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>)>> {
+    ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>, u64)>> {
         let rows = self
             .list_versioned_cas::<CircleOwnerStateRecord>(nsid::CIRCLE_OWNER_STATE)
             .await?;
-        for (_, rec, _) in &rows {
+        for (_, rec, _, _) in &rows {
             rec.check()?;
         }
         Ok(rows)
+    }
+
+    async fn list_circle_owner_states(
+        &self,
+    ) -> Result<Vec<(String, CircleOwnerStateRecord, Option<String>)>> {
+        Ok(self
+            .list_circle_owner_states_versioned()
+            .await?
+            .into_iter()
+            .map(|(id, rec, cid, _)| (id, rec, cid))
+            .collect())
     }
 
     fn seed_writer_rev_floors(&self, floors: &BTreeMap<(String, String), String>) {
@@ -1596,6 +1768,18 @@ impl MailboxStore for SpaceMailboxStore {
 
     fn export_writer_rev_floors(&self) -> BTreeMap<(String, String), String> {
         self.floors.snapshot()
+    }
+
+    fn seed_owner_state_version_floors(&self, floors: &BTreeMap<(String, String), u64>) {
+        self.version_floors.seed(floors);
+    }
+
+    fn replace_owner_state_version_floors(&self, floors: &BTreeMap<(String, String), u64>) {
+        self.version_floors.replace(floors);
+    }
+
+    fn export_owner_state_version_floors(&self) -> BTreeMap<(String, String), u64> {
+        self.version_floors.snapshot()
     }
 }
 

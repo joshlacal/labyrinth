@@ -154,6 +154,10 @@ impl SpaceRpc for Validating {
     async fn get_blob(&self, space: &str, did: &str, cid: &str) -> Result<Vec<u8>, SpaceError> {
         self.inner.get_blob(space, did, cid).await
     }
+
+    async fn host_kem_did_key(&self, space: &str) -> Result<Option<String>, SpaceError> {
+        self.inner.host_kem_did_key(space).await
+    }
 }
 
 struct SpaceHarness {
@@ -677,7 +681,7 @@ fn persisted_writer_revision_floor_rejects_rollback_across_restart() {
     );
 
     // Space host rolls back Bob's writer revision below Alice's persisted floor.
-    let rolled_back_rev = "000000000001";
+    let rolled_back_rev = "2222222222223";
     assert!(rolled_back_rev < pinned_bob_rev.as_str());
     h.host
         .rollback_writer_rev(&h.conv_space, BOB, rolled_back_rev);
@@ -710,7 +714,7 @@ fn persisted_writer_revision_floor_rejects_rollback_across_restart() {
     let spaces = block_on(alice_threads.list_owned_spaces()).unwrap();
     assert!(spaces.contains(&conv_uri));
     h.host
-        .rollback_writer_rev(&h.conv_space, ALICE, "000000000000");
+        .rollback_writer_rev(&h.conv_space, ALICE, "2222222222222");
     let list_err = block_on(alice_threads.list_owned_spaces()).unwrap_err();
     assert!(matches!(list_err, Error::WriterRollback { .. }));
 }
@@ -944,6 +948,10 @@ impl SpaceRpc for AdvWritersRpc {
     async fn get_blob(&self, space: &str, did: &str, cid: &str) -> Result<Vec<u8>, SpaceError> {
         self.inner.get_blob(space, did, cid).await
     }
+
+    async fn host_kem_did_key(&self, space: &str) -> Result<Option<String>, SpaceError> {
+        self.inner.host_kem_did_key(space).await
+    }
 }
 
 #[derive(Clone)]
@@ -1153,22 +1161,22 @@ fn intra_list_writers_stream_rollback_and_pre_removal_floor_pinning_rejected() {
     ))
     .unwrap();
 
-    // Case A: [RepoWrite(bob, rev-0005), RepoWrite(bob, rev-0003)] in one listWriters stream must reject R5 -> R3.
+    // Case A: [RepoWrite(bob, 3k22222222225), RepoWrite(bob, 3k22222222223)] in one listWriters stream must reject R5 -> R3.
     *override_writers.lock().unwrap() = Some(serde_json::json!({
         "repos": [
             {
                 "$type": "com.atproto.space.defs#repoWrite",
                 "repo": BOB,
-                "repoRev": "rev-0005",
+                "repoRev": "3k22222222225",
                 "data": { "$bytes": "AAEC" },
-                "spaceRev": "3k00000000005",
+                "spaceRev": "3k22222222225",
             },
             {
                 "$type": "com.atproto.space.defs#repoWrite",
                 "repo": BOB,
-                "repoRev": "rev-0003",
+                "repoRev": "3k22222222223",
                 "data": { "$bytes": "AAEC" },
-                "spaceRev": "3k00000000006",
+                "spaceRev": "3k22222222226",
             }
         ]
     }));
@@ -1179,56 +1187,92 @@ fn intra_list_writers_stream_rollback_and_pre_removal_floor_pinning_rejected() {
         Error::WriterRollback {
             space: h.conv_space.to_string(),
             author: BOB.to_owned(),
-            pinned_rev: "rev-0005".to_owned(),
-            offered_rev: "rev-0003".to_owned(),
+            pinned_rev: "3k22222222225".to_owned(),
+            offered_rev: "3k22222222223".to_owned(),
         }
     );
 
-    // Case B: [RepoWrite(carol, rev-0008), RepoRemoved(carol)] pins rev-0008 before removal,
-    // so a subsequent [RepoWrite(carol, rev-0007)] re-admission at an older rev fails closed.
+    // Phase 1: Unauthenticated listWriters advertising non-TID strings fails closed with Malformed,
+    // and advertising a valid high TID ("bzzzzzzzzzzzz") without an authenticated STAR commit NEVER poisons floors.
     *override_writers.lock().unwrap() = Some(serde_json::json!({
         "repos": [
             {
                 "$type": "com.atproto.space.defs#repoWrite",
                 "repo": CAROL,
-                "repoRev": "rev-0008",
+                "repoRev": "~~~~~~~~~~~~~",
                 "data": { "$bytes": "AAEC" },
-                "spaceRev": "3k00000000008",
+                "spaceRev": "3k22222222227",
+            }
+        ]
+    }));
+    assert!(matches!(
+        block_on(alice.load_thread(THREAD, TimeRange::ALL)).unwrap_err(),
+        Error::Malformed("invalid writer revision")
+    ));
+    assert_eq!(
+        alice.writer_rev_floor(&h.conv_space.to_string(), CAROL),
+        None
+    );
+
+    *override_writers.lock().unwrap() = Some(serde_json::json!({
+        "repos": [
+            {
+                "$type": "com.atproto.space.defs#repoWrite",
+                "repo": CAROL,
+                "repoRev": "bzzzzzzzzzzzz",
+                "data": { "$bytes": "AAEC" },
+                "spaceRev": "3k22222222232",
             },
             {
                 "$type": "com.atproto.space.defs#repoRemoved",
                 "repo": CAROL,
-                "spaceRev": "3k00000000009",
+                "spaceRev": "3k22222222233",
             }
         ]
     }));
     let _ = block_on(alice.load_thread(THREAD, TimeRange::ALL))
-        .expect("clean write + removal succeeds and pins rev-0008");
+        .expect("unauthenticated listWriters write+remove must not poison floor");
     assert_eq!(
         alice.writer_rev_floor(&h.conv_space.to_string(), CAROL),
-        Some("rev-0008")
+        None,
+        "unauthenticated listWriters JSON must never pin writer_rev_floor"
     );
+
+    // Phase 2: Once CAROL publishes an authentic STAR repo (verified via HPKE Commit MAC),
+    // CAROL's real TID is pinned, so removing CAROL and later offering a lower rev fails closed.
+    *override_writers.lock().unwrap() = None;
+    let mut carol = h.init(CAROL, 33);
+    let roster_c = block_on(carol.resolve_roster(&[ALICE, BOB, CAROL])).unwrap();
+    block_on(carol.archive_outgoing(THREAD, &roster_c, "c1", 4_000, b"carol authentic")).unwrap();
+    block_on(carol.flush()).unwrap();
+
+    let loaded_carol = block_on(alice.load_thread(THREAD, TimeRange::ALL)).unwrap();
+    assert_eq!(loaded_carol.messages.len(), 1);
+    let pinned_carol = alice
+        .writer_rev_floor(&h.conv_space.to_string(), CAROL)
+        .expect("authenticated STAR sync must pin CAROL's writer_rev_floor")
+        .to_owned();
 
     *override_writers.lock().unwrap() = Some(serde_json::json!({
         "repos": [
             {
                 "$type": "com.atproto.space.defs#repoWrite",
                 "repo": CAROL,
-                "repoRev": "rev-0007",
+                "repoRev": "2222222222222",
                 "data": { "$bytes": "AAEC" },
-                "spaceRev": "3k00000000010",
+                "spaceRev": "3k22222222234",
             }
         ]
     }));
     let err_b = block_on(alice.load_thread(THREAD, TimeRange::ALL))
-        .expect_err("post-removal re-add below rev-0008 floor must fail closed");
+        .expect_err("post-sync rollback below authenticated floor must fail closed");
     assert_eq!(
         err_b,
         Error::WriterRollback {
             space: h.conv_space.to_string(),
             author: CAROL.to_owned(),
-            pinned_rev: "rev-0008".to_owned(),
-            offered_rev: "rev-0007".to_owned(),
+            pinned_rev: pinned_carol,
+            offered_rev: "2222222222222".to_owned(),
         }
     );
 }
@@ -1274,6 +1318,17 @@ impl SpaceRpc for SpySpaceRpc {
         params: &[(&str, String)],
         headers: &[(String, String)],
     ) -> Result<(Vec<(String, String)>, Vec<u8>), SpaceError> {
+        if nsid == "com.atproto.space.getRecord" {
+            let collection = params
+                .iter()
+                .find(|(k, _)| *k == "collection")
+                .map(|(_, v)| v.as_str());
+            if collection == Some(nsid::MEK)
+                && let Some((_, repo)) = params.iter().find(|(k, _)| *k == "repo")
+            {
+                self.log.lock().unwrap().mek_get_repos.push(repo.clone());
+            }
+        }
         self.inner.query_with_headers(nsid, params, headers).await
     }
 
@@ -1307,6 +1362,10 @@ impl SpaceRpc for SpySpaceRpc {
 
     async fn get_blob(&self, space: &str, did: &str, cid: &str) -> Result<Vec<u8>, SpaceError> {
         self.inner.get_blob(space, did, cid).await
+    }
+
+    async fn host_kem_did_key(&self, space: &str) -> Result<Option<String>, SpaceError> {
+        self.inner.host_kem_did_key(space).await
     }
 }
 
@@ -1418,19 +1477,20 @@ fn versioned_circle_owner_state_create_cas_eliminates_toctou_and_preserves_acl_t
     );
 
     // Now simulate the exact TOCTOU race inside `put_versioned_cas` itself:
-    // inject `circle_id-000000000003` onto the Space host right before tablet's `#create` for v3 lands!
+    // a concurrent sibling wins `#create` for `circle_id-000000000003` right before tablet's `#create` for v3 lands!
     let pre_v3_rkey = format!("{circle_id}-000000000003");
-    let raw_v2 = block_on(h.mailbox(ALICE).get_circle_owner_state(circle_id))
-        .unwrap()
-        .unwrap()
-        .0;
-    let host_client = h.host.client(ALICE);
+    let winning_sibling = Arc::new(Mutex::new(h.enroll_sibling(
+        &mut phone,
+        ALICE,
+        5,
+        h.backends(ALICE, 5),
+    )));
+    let winning_sibling_cl = winning_sibling.clone();
     let race_log = Arc::new(Mutex::new(RpcAuditLog::default()));
     let raced_once = Arc::new(Mutex::new(true));
     let raced_once_cl = raced_once.clone();
     let pre_v3_rkey_cl = pre_v3_rkey.clone();
-    let mailbox_space_str = SpaceRef::mailbox(ALICE).to_string();
-    let raw_v2_json = serde_json::to_value(&raw_v2).unwrap();
+    let circle_id_cl = circle_id.to_owned();
     let racing_rpc: Arc<dyn SpaceRpc> = Arc::new(SpySpaceRpc {
         inner: h.transport(ALICE),
         log: race_log.clone(),
@@ -1438,22 +1498,13 @@ fn versioned_circle_owner_state_create_cas_eliminates_toctou_and_preserves_acl_t
             let mut should_race = raced_once_cl.lock().unwrap();
             if *should_race && collection == nsid::CIRCLE_OWNER_STATE && rkey == pre_v3_rkey_cl {
                 *should_race = false;
-                // Concurrent device wins `#create` on version 000000000003 first!
-                let payload = serde_json::to_vec(&serde_json::json!({
-                    "space": mailbox_space_str,
-                    "repo": ALICE,
-                    "validate": false,
-                    "writes": [{
-                        "$type": "com.atproto.space.applyWrites#create",
-                        "collection": nsid::CIRCLE_OWNER_STATE,
-                        "rkey": pre_v3_rkey_cl,
-                        "value": raw_v2_json,
-                    }]
-                }))
-                .unwrap();
                 std::thread::scope(|s| {
                     s.spawn(|| {
-                        block_on(host_client.procedure("com.atproto.space.applyWrites", &payload))
+                        let mut winner = winning_sibling_cl.lock().unwrap();
+                        let (cur, cur_cid) = block_on(winner.get_circle_owner_state(&circle_id_cl))
+                            .unwrap()
+                            .expect("v2 present before race");
+                        block_on(winner.put_circle_owner_state(&cur, cur_cid.as_deref()))
                             .expect("winning concurrent #create on v3 succeeds");
                     })
                     .join()
@@ -1483,7 +1534,7 @@ fn versioned_circle_owner_state_create_cas_eliminates_toctou_and_preserves_acl_t
     );
 
     // `merge_circle_owner_state` hits atomic RecordAlreadyExists on v3, re-reads v3, merges CRDT,
-    // and commits v4 while lazily deleting < v4!
+    // and commits append-only v4 without deleting older versions!
     let (merged, _cid_v4) = block_on(racing_tablet.merge_circle_owner_state(&tablet_candidate))
         .expect("merge retries onto v4 after atomic #create conflict on v3");
     assert_eq!(merged.current_key_version, 3);
@@ -1500,7 +1551,7 @@ fn versioned_circle_owner_state_create_cas_eliminates_toctou_and_preserves_acl_t
         Some(ACL_REMOVE_PENDING_ROTATED)
     );
 
-    // Verify ZERO `#update` ops were ever emitted on circleOwnerState, and only the head versioned rkey remains!
+    // Verify ZERO `#update` or `#delete` ops were emitted on circleOwnerState, and all append-only rkeys v1..=v4 remain!
     let audit = race_log.lock().unwrap();
     assert!(
         !audit
@@ -1521,7 +1572,6 @@ fn versioned_circle_owner_state_create_cas_eliminates_toctou_and_preserves_acl_t
     );
     drop(audit);
 
-    // Check raw collection rows: older versions (< v4) were lazily cleaned up, leaving only v4.
     let list_params = [
         ("space", SpaceRef::mailbox(ALICE).to_string()),
         ("repo", ALICE.to_owned()),
@@ -1536,28 +1586,97 @@ fn versioned_circle_owner_state_create_cas_eliminates_toctou_and_preserves_acl_t
         .unwrap(),
     )
     .unwrap();
-    let remaining_rkeys: Vec<&str> = raw_list["records"]
+    let mut remaining_rkeys: Vec<&str> = raw_list["records"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|r| r["rkey"].as_str())
         .collect();
+    remaining_rkeys.sort_unstable();
     assert_eq!(
         remaining_rkeys,
-        vec![format!("{circle_id}-000000000004").as_str()]
+        vec![
+            format!("{circle_id}-000000000001").as_str(),
+            format!("{circle_id}-000000000002").as_str(),
+            format!("{circle_id}-000000000003").as_str(),
+            format!("{circle_id}-000000000004").as_str(),
+        ]
     );
 
-    // Legacy unversioned rkey fallback (including 36-char UUID ending in 12 decimal digits):
+    // Replaying v1 ciphertext into v5 fails AEAD (`cas_version` bound in AAD),
+    // and deleting v4 after racing_tablet observed v4 fails closed with version rollback (even across restart)!
+    let v1_rkey = format!("{circle_id}-000000000001");
+    let v1_value = raw_list["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["rkey"].as_str() == Some(v1_rkey.as_str()))
+        .unwrap()["value"]
+        .clone();
+    let plant_v5_replay = serde_json::to_vec(&serde_json::json!({
+        "space": SpaceRef::mailbox(ALICE).to_string(),
+        "repo": ALICE,
+        "validate": false,
+        "writes": [{
+            "$type": "com.atproto.space.applyWrites#create",
+            "collection": nsid::CIRCLE_OWNER_STATE,
+            "rkey": format!("{circle_id}-000000000005"),
+            "value": v1_value,
+        }]
+    }))
+    .unwrap();
+    block_on(
+        h.host
+            .client(ALICE)
+            .procedure("com.atproto.space.applyWrites", &plant_v5_replay),
+    )
+    .unwrap();
+    assert!(matches!(
+        block_on(racing_tablet.get_circle_owner_state(circle_id)).unwrap_err(),
+        Error::Decrypt
+    ));
+
+    // Delete tampered v5 and v4 so head regresses to v3; persisted monotonic floor rejects rollback!
+    for suffix in ["000000000005", "000000000004"] {
+        let del = serde_json::to_vec(&serde_json::json!({
+            "space": SpaceRef::mailbox(ALICE).to_string(),
+            "repo": ALICE,
+            "collection": nsid::CIRCLE_OWNER_STATE,
+            "rkey": format!("{circle_id}-{suffix}"),
+        }))
+        .unwrap();
+        block_on(
+            h.host
+                .client(ALICE)
+                .procedure("com.atproto.space.deleteRecord", &del),
+        )
+        .unwrap();
+    }
+    let exported_tablet = racing_tablet.export_state().unwrap();
+    let mut restarted_tablet = block_on(Labyrinth::from_state(
+        &exported_tablet,
+        ALICE,
+        Box::new(signer(3)),
+        h.backends(ALICE, 3),
+    ))
+    .unwrap();
+    assert!(matches!(
+        block_on(restarted_tablet.get_circle_owner_state(circle_id)).unwrap_err(),
+        Error::Malformed("owner state version rollback")
+    ));
+
+    // 36-char UUID ending in 12 decimal digits parses as unversioned `ver = 0`,
+    // and planting a `v1` ciphertext under `ver = 0` is rejected by `cas_version` AAD binding!
     let legacy_id = "123e4567-e89b-12d3-a456-123456789012";
     let mut legacy_state = initial;
     legacy_state.circle_id = legacy_id.to_owned();
-    legacy_state.space_uri = format!("at://{ALICE}/space/blue.catbird.circles.circle/{legacy_id}");
-    // Write a versioned record via temp phone, extract ciphertext, and plant under unversioned rkey.
-    let tmp_cid = block_on(phone.put_circle_owner_state(&legacy_state, None)).unwrap();
-    let (legacy_rec, _) = block_on(h.mailbox(ALICE).get_circle_owner_state(legacy_id))
-        .unwrap()
-        .unwrap();
-    let _ = tmp_cid;
+    legacy_state.space_uri = format!("at://{ALICE}/com.atproto.space.space/3k00000000099");
+    let _ = block_on(phone.put_circle_owner_state(&legacy_state, None)).unwrap();
+    let (v1_rec, _, parsed_v1) =
+        block_on(h.mailbox(ALICE).get_circle_owner_state_versioned(legacy_id))
+            .unwrap()
+            .unwrap();
+    assert_eq!(parsed_v1, 1);
     let del_v1 = serde_json::to_vec(&serde_json::json!({
         "space": SpaceRef::mailbox(ALICE).to_string(),
         "repo": ALICE,
@@ -1571,7 +1690,7 @@ fn versioned_circle_owner_state_create_cas_eliminates_toctou_and_preserves_acl_t
             .procedure("com.atproto.space.deleteRecord", &del_v1),
     )
     .unwrap();
-    let plant_legacy = serde_json::to_vec(&serde_json::json!({
+    let plant_unversioned = serde_json::to_vec(&serde_json::json!({
         "space": SpaceRef::mailbox(ALICE).to_string(),
         "repo": ALICE,
         "validate": false,
@@ -1579,34 +1698,31 @@ fn versioned_circle_owner_state_create_cas_eliminates_toctou_and_preserves_acl_t
             "$type": "com.atproto.space.applyWrites#create",
             "collection": nsid::CIRCLE_OWNER_STATE,
             "rkey": legacy_id,
-            "value": serde_json::to_value(&legacy_rec).unwrap(),
+            "value": serde_json::to_value(&v1_rec).unwrap(),
         }]
     }))
     .unwrap();
     block_on(
         h.host
             .client(ALICE)
-            .procedure("com.atproto.space.applyWrites", &plant_legacy),
+            .procedure("com.atproto.space.applyWrites", &plant_unversioned),
     )
     .unwrap();
-
-    // Legacy unversioned row is readable via both get and list, and upgrades cleanly to `-000000000001`.
-    let (loaded_legacy, legacy_cid) = block_on(phone.get_circle_owner_state(legacy_id))
+    let (_, _, parsed_v0) = block_on(h.mailbox(ALICE).get_circle_owner_state_versioned(legacy_id))
         .unwrap()
-        .expect("legacy unversioned rkey must remain readable");
-    assert_eq!(loaded_legacy.circle_id, legacy_id);
-    let listed_ids: BTreeSet<String> = block_on(phone.list_circle_owner_states())
-        .unwrap()
-        .into_iter()
-        .map(|s| s.circle_id)
-        .collect();
-    assert!(listed_ids.contains(legacy_id));
-
-    let mut upgraded = loaded_legacy;
-    upgraded.current_key_version = 2;
-    upgraded.updated_at = "2026-11-14T10:05:00.000Z".to_owned();
-    block_on(phone.put_circle_owner_state(&upgraded, legacy_cid.as_deref()))
-        .expect("CAS upgrade from legacy unversioned rkey to -000000000001 must succeed");
+        .unwrap();
+    assert_eq!(
+        parsed_v0, 0,
+        "36-char hyphenated UUID must parse as unversioned ver = 0"
+    );
+    let mut fresh_sibling = h.enroll_sibling(&mut phone, ALICE, 6, h.backends(ALICE, 6));
+    assert!(
+        matches!(
+            block_on(fresh_sibling.get_circle_owner_state(legacy_id)).unwrap_err(),
+            Error::Decrypt
+        ),
+        "downgrading v1 ciphertext to unversioned ver = 0 must fail AEAD"
+    );
 }
 
 #[test]
@@ -1887,4 +2003,156 @@ fn passkey_recovery_registration_rotates_owner_mailbox_epoch_and_anchors_virtual
     ))
     .expect("passkey restore after registration epoch rotation must succeed");
     assert_eq!(restored.latest_epoch(), 2);
+}
+
+struct TamperingSpaceRpc {
+    inner: Arc<dyn SpaceRpc>,
+    tamper_nsid: &'static str,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl SpaceRpc for TamperingSpaceRpc {
+    async fn query(&self, nsid: &str, params: &[(&str, String)]) -> Result<Vec<u8>, SpaceError> {
+        self.inner.query(nsid, params).await
+    }
+
+    async fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> Result<(Vec<(String, String)>, Vec<u8>), SpaceError> {
+        let (mut resp_headers, body) = self.inner.query_with_headers(nsid, params, headers).await?;
+        if nsid == self.tamper_nsid {
+            for (k, v) in &mut resp_headers {
+                if k.eq_ignore_ascii_case("signature") {
+                    *v = "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:".to_owned();
+                }
+            }
+        }
+        Ok((resp_headers, body))
+    }
+
+    async fn procedure(&self, nsid: &str, payload: &[u8]) -> Result<Vec<u8>, SpaceError> {
+        self.inner.procedure(nsid, payload).await
+    }
+
+    async fn upload_blob(&self, bytes: &[u8], mime_type: &str) -> Result<String, SpaceError> {
+        self.inner.upload_blob(bytes, mime_type).await
+    }
+
+    async fn get_blob(&self, space: &str, did: &str, cid: &str) -> Result<Vec<u8>, SpaceError> {
+        self.inner.get_blob(space, did, cid).await
+    }
+
+    async fn host_kem_did_key(&self, space: &str) -> Result<Option<String>, SpaceError> {
+        self.inner.host_kem_did_key(space).await
+    }
+}
+
+#[test]
+fn space_thread_store_authenticates_star_commit_and_record_macs_and_settled_tombstones_resist_resurrection()
+ {
+    let h = SpaceHarness::new();
+    let mut alice = h.init(ALICE, 1);
+    let mut tablet = h.enroll_sibling(&mut alice, ALICE, 2, h.backends(ALICE, 2));
+    let mut bob = h.init(BOB, 3);
+
+    let roster_b = block_on(bob.resolve_roster(&[ALICE, BOB])).unwrap();
+    block_on(bob.archive_outgoing(THREAD, &roster_b, "m-auth-1", 5_000, b"mac verified")).unwrap();
+    block_on(bob.flush()).unwrap();
+
+    // 1. Tampering `Atproto-Space-Commit` MAC on `getRepo` during `load_thread` fails closed with BadSignature.
+    let tamper_commit: Arc<dyn SpaceRpc> = Arc::new(TamperingSpaceRpc {
+        inner: h.transport(ALICE),
+        tamper_nsid: "com.atproto.space.getRepo",
+    });
+    let commit_threads = SpaceThreadStore::new(tamper_commit, ALICE).with_device_pubkey(&tpub(7));
+    commit_threads.set_thread_space(THREAD, h.conv_space.clone());
+    let mut alice_bad_commit = h.enroll_sibling(
+        &mut alice,
+        ALICE,
+        7,
+        Backends {
+            mailbox: Box::new(h.mailbox(ALICE)),
+            threads: Box::new(commit_threads),
+            directory: Box::new(h.directory()),
+            publishers: vec![Box::new(h.net.ds_publisher(ALICE))],
+            clock: Box::new(h.clock.clone()),
+        },
+    );
+    assert_eq!(
+        block_on(alice_bad_commit.load_thread(THREAD, TimeRange::ALL)).unwrap_err(),
+        Error::BadSignature
+    );
+
+    // 2. Tampering `Atproto-Space-Record` MAC on `getRecord` during `find_meks` fails closed with BadSignature.
+    let bob_meks: Value = serde_json::from_slice(
+        &block_on(h.host.client(BOB).query(
+            "com.atproto.space.listRecords",
+            &[
+                ("space", h.conv_space.to_string()),
+                ("repo", BOB.to_owned()),
+                ("collection", nsid::MEK.to_owned()),
+            ],
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let bob_mek_rkey = bob_meks["records"].as_array().unwrap()[0]["rkey"]
+        .as_str()
+        .unwrap();
+    let bob_mek_id: [u8; 12] = hex::decode(bob_mek_rkey).unwrap().try_into().unwrap();
+    let tamper_record: Arc<dyn SpaceRpc> = Arc::new(TamperingSpaceRpc {
+        inner: h.transport(ALICE),
+        tamper_nsid: "com.atproto.space.getRecord",
+    });
+    let rec_threads = SpaceThreadStore::new(tamper_record, ALICE).with_device_pubkey(&tpub(1));
+    rec_threads.set_thread_space(THREAD, h.conv_space.clone());
+    assert_eq!(
+        block_on(rec_threads.find_mek_from_author(THREAD, BOB, &bob_mek_id)).unwrap_err(),
+        Error::BadSignature
+    );
+
+    // 3. Multi-device settled ACL tombstone prevents resurrection when tablet merges stale pre-removal state.
+    let circle_id = "circle-monotone-tombstone";
+    let s1 = CircleOwnerState {
+        circle_id: circle_id.to_owned(),
+        space_uri: format!("at://{ALICE}/com.atproto.space.space/3k00000000077"),
+        current_key_version: 1,
+        joined_at_version_by_did: BTreeMap::from([(ALICE.to_owned(), 1), (BOB.to_owned(), 1)]),
+        pending_ops: BTreeMap::new(),
+        updated_at: "2026-11-15T12:00:00.000Z".to_owned(),
+    };
+    let (_, _) = block_on(alice.merge_circle_owner_state(&s1)).unwrap();
+
+    // Tablet snapshots v1 before BOB is removed and cleared on Alice's phone.
+    let (tablet_stale, _) = block_on(tablet.get_circle_owner_state(circle_id))
+        .unwrap()
+        .unwrap();
+
+    // Phone removes BOB at key version 2 and then clears the pending ACL tombstone.
+    let mut s2_remove = s1.clone();
+    s2_remove.current_key_version = 2;
+    s2_remove.updated_at = "2026-11-15T12:01:00.000Z".to_owned();
+    s2_remove.mark_acl_remove_pending(BOB, true);
+    block_on(alice.merge_circle_owner_state(&s2_remove)).unwrap();
+    let (cleared, _) = block_on(alice.clear_circle_acl_tombstone(circle_id, BOB))
+        .unwrap()
+        .expect("circle state present");
+    assert!(!cleared.has_acl_tombstone(BOB));
+    assert!(!cleared.joined_at_version_by_did.contains_key(BOB));
+
+    // Tablet adds CAROL onto its stale v1 snapshot (which still contained BOB at v1) and merges:
+    // BOB MUST stay evicted and `__acl__:bob` MUST stay cleared!
+    let mut tablet_update = tablet_stale;
+    tablet_update
+        .joined_at_version_by_did
+        .insert(CAROL.to_owned(), 2);
+    tablet_update.updated_at = "2026-11-15T12:02:00.000Z".to_owned();
+    let (merged, _) = block_on(tablet.merge_circle_owner_state(&tablet_update)).unwrap();
+    assert!(!merged.joined_at_version_by_did.contains_key(BOB));
+    assert!(!merged.has_acl_tombstone(BOB));
+    assert_eq!(merged.joined_at_version_by_did.get(CAROL), Some(&2));
 }
