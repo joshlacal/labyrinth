@@ -1,8 +1,9 @@
 //! Recovery codes (SPEC §6.1, paper p.30–32, [CB-12]).
 //!
 //! A recovery code is 40 characters over the alphabet
-//! `ACDEFHJKLMNPQRSTUVWXYZ0123456789`: version `2`, identifier `0`,
-//! 34 entropy characters and 4 ECC characters. The ECC is a GF(32) erasure
+//! `ACDEFHJKLMNPQRSTUVWXYZ0123456789`: a version (`2` or `3`), identifier
+//! `0`, 34 entropy characters and 4 ECC characters. Version `3` codes need
+//! an erasable share as well ([`crate::recovery_share`]). The ECC is a GF(32) erasure
 //! code whose parity-check matrix has every three columns independent, so up
 //! to three wrong characters (outside the version/identifier) can be
 //! corrected by brute force: [`RecoveryCode::candidates`] yields every
@@ -24,8 +25,10 @@ pub const CODE_LEN: usize = 40;
 pub const ENTROPY_LEN: usize = 34;
 /// Number of ECC characters.
 pub const ECC_LEN: usize = 4;
-/// The only supported version character.
+/// The version-2 character (the code alone opens the bundle).
 pub const VERSION: u8 = b'2';
+/// The version-3 character (the code plus an erasable share open the bundle).
+pub const VERSION_V3: u8 = b'3';
 /// The only supported identifier character.
 pub const IDENTIFIER: u8 = b'0';
 /// The most erasures [`RecoveryCode::candidates`] tries.
@@ -167,6 +170,37 @@ fn solve(cols: &[usize], s: [u8; 4]) -> Option<[u8; 4]> {
 }
 
 use crate::encoding::{kdf as hkdf_sha256, random};
+use crate::recovery_share::{RecoveryShare, V3Derivation};
+
+/// Recovery code format version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeVersion {
+    /// `2`: `(vdeviceId, vdeviceKey)` from the code alone.
+    V2,
+    /// `3`: `(vdeviceId, codeKey, fetchToken)` from the code; the bundle key
+    /// also needs the erasable share.
+    V3,
+}
+
+impl CodeVersion {
+    /// The version character.
+    pub fn char(self) -> u8 {
+        match self {
+            Self::V2 => VERSION,
+            Self::V3 => VERSION_V3,
+        }
+    }
+
+    fn from_symbol(sym: u8) -> Option<Self> {
+        if Some(sym) == symbol_of(VERSION) {
+            Some(Self::V2)
+        } else if Some(sym) == symbol_of(VERSION_V3) {
+            Some(Self::V3)
+        } else {
+            None
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RecoveryCode
@@ -211,7 +245,7 @@ impl RecoveryCode {
         for (e, b) in entropy.iter_mut().zip(bytes.iter()) {
             *e = b & 0x1f;
         }
-        Ok(Self::from_entropy_symbols(&entropy))
+        Ok(Self::from_entropy_versioned(&entropy, CodeVersion::V2))
     }
 
     /// Build the code for given entropy symbols (each `< 32`). Deterministic;
@@ -220,6 +254,19 @@ impl RecoveryCode {
     /// # Panics
     /// If any symbol is `≥ 32`.
     pub fn from_entropy_symbols(entropy: &[u8; ENTROPY_LEN]) -> Self {
+        Self::from_entropy_versioned(entropy, CodeVersion::V2)
+    }
+
+    /// The version-3 code for given entropy symbols (each `< 32`).
+    /// Deterministic; used for test vectors.
+    ///
+    /// # Panics
+    /// If any symbol is `≥ 32`.
+    pub fn from_entropy_symbols_v3(entropy: &[u8; ENTROPY_LEN]) -> Self {
+        Self::from_entropy_versioned(entropy, CodeVersion::V3)
+    }
+
+    fn from_entropy_versioned(entropy: &[u8; ENTROPY_LEN], version: CodeVersion) -> Self {
         assert!(entropy.iter().all(|&s| s < 32), "symbol out of range");
         let mut word = Zeroizing::new([0u8; WORD_LEN]);
         word[..ENTROPY_LEN].copy_from_slice(entropy);
@@ -228,12 +275,12 @@ impl RecoveryCode {
         let ecc = solve(&[34, 35, 36, 37], s).expect("ECC columns are invertible");
         word[ENTROPY_LEN..].copy_from_slice(&ecc);
         debug_assert_eq!(syndrome(&word), [0; 4]);
-        Self::from_word(&word)
+        Self::from_word(&word, version)
     }
 
-    fn from_word(word: &[u8; WORD_LEN]) -> Self {
+    fn from_word(word: &[u8; WORD_LEN], version: CodeVersion) -> Self {
         let mut chars = [0u8; CODE_LEN];
-        chars[0] = VERSION;
+        chars[0] = version.char();
         chars[1] = IDENTIFIER;
         for (c, &w) in chars[2..].iter_mut().zip(word.iter()) {
             *c = ALPHABET[w as usize];
@@ -245,8 +292,10 @@ impl RecoveryCode {
     ///
     /// Accepts upper or lower case, ignores spaces/whitespace and `-`, and
     /// applies the homoglyph mapping. Rejects anything that isn't 40 alphabet
-    /// characters with version `2`, identifier `0` and a valid ECC. To
-    /// recover from typos, use [`candidates`](Self::candidates).
+    /// characters with identifier `0` and a valid ECC. A code that is
+    /// otherwise well formed but carries a version other than `2` or `3`
+    /// fails with [`Error::UnsupportedCodeVersion`]. To recover from typos,
+    /// use [`candidates`](Self::candidates).
     pub fn parse(input: &str) -> Result<Self> {
         let raw = Raw::parse(input)?;
         if raw.erased != 0 {
@@ -255,7 +304,8 @@ impl RecoveryCode {
         if syndrome(&raw.word) != [0; 4] {
             return Err(Error::BadRecoveryCode);
         }
-        Ok(Self::from_word(&raw.word))
+        let version = raw.version()?;
+        Ok(Self::from_word(&raw.word, version))
     }
 
     /// Every valid code within [`MAX_CORRECTIONS`] substitutions of `input`.
@@ -271,9 +321,23 @@ impl RecoveryCode {
     /// knows (paper p.31).
     ///
     /// Errors if the input isn't 40 characters (ignoring separators), or the
-    /// version/identifier is wrong.
+    /// identifier is wrong. An unknown version character fails with
+    /// [`Error::UnsupportedCodeVersion`] when the rest of the code is a valid
+    /// codeword, and with [`Error::BadRecoveryCode`] otherwise.
     pub fn candidates(input: &str) -> Result<Candidates> {
         let raw = Raw::parse(input)?;
+        let version = raw.version()?;
+        Self::candidates_from(raw, version)
+    }
+
+    /// Like [`candidates`](Self::candidates), but reads the code as `version`
+    /// whatever its version character says, so a mistyped version character
+    /// can still be matched against the backend.
+    pub fn candidates_as(input: &str, version: CodeVersion) -> Result<Candidates> {
+        Self::candidates_from(Raw::parse(input)?, version)
+    }
+
+    fn candidates_from(raw: Raw, version: CodeVersion) -> Result<Candidates> {
         if raw.erased.count_ones() as usize > MAX_CORRECTIONS {
             return Err(Error::BadRecoveryCode);
         }
@@ -282,6 +346,7 @@ impl RecoveryCode {
             .collect();
         let s = syndrome(&raw.word);
         Ok(Candidates {
+            version,
             word: raw.word,
             syndrome: s,
             free: (0..WORD_LEN)
@@ -309,8 +374,19 @@ impl RecoveryCode {
         &self.chars[2..2 + ENTROPY_LEN]
     }
 
-    /// `(vdeviceId, vdeviceKey) = kdf(entropyChars, null,
-    /// "BackupRecoveryCode_v2_0_" || did, 48)` split 16 + 32 (SPEC §6.1).
+    /// This code's format version.
+    pub fn version(&self) -> CodeVersion {
+        CodeVersion::from_symbol(symbol_of(self.chars[0]).expect("canonical"))
+            .expect("constructed with a supported version")
+    }
+
+    /// `(vdeviceId, key) = kdf(entropyChars, null,
+    /// "BackupRecoveryCode_v<V>_0_" || did, 48)` split 16 + 32 (SPEC §6.1).
+    ///
+    /// For a version-2 code `key` is the bundle key. For a version-3 code it
+    /// is `codeKey` (the first 48 bytes of the 80-byte derivation are the
+    /// same), which opens nothing without the share: use
+    /// [`bundle_key`](Self::bundle_key).
     pub fn derive(&self, did: &str) -> ([u8; 16], Zeroizing<[u8; 32]>) {
         let mut info = Vec::with_capacity(24 + did.len());
         info.extend_from_slice(b"BackupRecoveryCode_v");
@@ -326,6 +402,58 @@ impl RecoveryCode {
         let mut key = Zeroizing::new([0u8; 32]);
         key.copy_from_slice(&okm[16..]);
         (id, key)
+    }
+
+    /// The `vdeviceId` this code names.
+    pub fn vdevice_id(&self, did: &str) -> [u8; 16] {
+        self.derive(did).0
+    }
+
+    /// Version-3 derivation `(vdeviceId, codeKey, fetchToken) = kdf(
+    /// entropyChars, null, "BackupRecoveryCode_v3_0_" || did, 80)` split
+    /// 16 + 32 + 32. Fails for a version-2 code.
+    pub fn derive_v3(&self, did: &str) -> Result<V3Derivation> {
+        if self.version() != CodeVersion::V3 {
+            return Err(Error::Malformed("not a version-3 recovery code"));
+        }
+        let mut info = Vec::with_capacity(24 + did.len());
+        info.extend_from_slice(b"BackupRecoveryCode_v3_0_");
+        info.extend_from_slice(did.as_bytes());
+        let mut okm = Zeroizing::new([0u8; 80]);
+        hkdf_sha256(self.entropy_chars(), None, &info, okm.as_mut());
+        let mut vdevice_id = [0u8; 16];
+        vdevice_id.copy_from_slice(&okm[..16]);
+        let mut code_key = Zeroizing::new([0u8; 32]);
+        code_key.copy_from_slice(&okm[16..48]);
+        let mut fetch_token = Zeroizing::new([0u8; 32]);
+        fetch_token.copy_from_slice(&okm[48..80]);
+        Ok(V3Derivation {
+            vdevice_id,
+            code_key,
+            fetch_token,
+        })
+    }
+
+    /// `(vdeviceId, bundle key)` for this code. A version-2 code takes no
+    /// share; a version-3 code requires one and fails with
+    /// [`Error::RecoveryShareUnavailable`] without it.
+    pub fn bundle_key(
+        &self,
+        did: &str,
+        share: Option<&RecoveryShare>,
+    ) -> Result<([u8; 16], Zeroizing<[u8; 32]>)> {
+        match (self.version(), share) {
+            (CodeVersion::V2, None) => Ok(self.derive(did)),
+            (CodeVersion::V2, Some(_)) => {
+                Err(Error::Malformed("version-2 recovery code takes no share"))
+            }
+            (CodeVersion::V3, Some(share)) => {
+                let d = self.derive_v3(did)?;
+                let key = d.vdevice_key(did, share);
+                Ok((d.vdevice_id, key))
+            }
+            (CodeVersion::V3, None) => Err(Error::RecoveryShareUnavailable),
+        }
     }
 }
 
@@ -370,6 +498,8 @@ impl core::str::FromStr for RecoveryCode {
 struct Raw {
     word: [u8; WORD_LEN],
     erased: u64,
+    /// Symbol of the version character.
+    version_sym: u8,
 }
 
 impl Raw {
@@ -384,12 +514,13 @@ impl Raw {
             chars.zeroize();
             return Err(Error::BadRecoveryCode);
         }
-        let header_ok = symbol_of(chars[0]) == symbol_of(VERSION)
-            && symbol_of(chars[1]) == symbol_of(IDENTIFIER);
+        let version_sym = symbol_of(chars[0]);
+        let header_ok = version_sym.is_some() && symbol_of(chars[1]) == symbol_of(IDENTIFIER);
         if !header_ok {
             chars.zeroize();
             return Err(Error::BadRecoveryCode);
         }
+        let version_sym = version_sym.expect("checked");
         let mut word = [0u8; WORD_LEN];
         let mut erased = 0u64;
         for (i, &c) in chars[2..].iter().enumerate() {
@@ -399,7 +530,23 @@ impl Raw {
             }
         }
         chars.zeroize();
-        Ok(Self { word, erased })
+        Ok(Self {
+            word,
+            erased,
+            version_sym,
+        })
+    }
+
+    /// The supported version this input names. An unknown version on an
+    /// otherwise valid codeword is [`Error::UnsupportedCodeVersion`].
+    fn version(&self) -> Result<CodeVersion> {
+        match CodeVersion::from_symbol(self.version_sym) {
+            Some(v) => Ok(v),
+            None if self.erased == 0 && syndrome(&self.word) == [0; 4] => {
+                Err(Error::UnsupportedCodeVersion)
+            }
+            None => Err(Error::BadRecoveryCode),
+        }
     }
 }
 
@@ -418,6 +565,7 @@ impl Drop for Raw {
 /// correction at a free position is skipped: the smaller set already
 /// produced it.
 pub struct Candidates {
+    version: CodeVersion,
     word: [u8; WORD_LEN],
     syndrome: [u8; 4],
     forced: Vec<usize>,
@@ -495,7 +643,7 @@ impl Iterator for Candidates {
                 w[c] ^= ec;
             }
             debug_assert_eq!(syndrome(&w), [0; 4]);
-            return Some(RecoveryCode::from_word(&w));
+            return Some(RecoveryCode::from_word(&w, self.version));
         }
     }
 }
@@ -656,13 +804,27 @@ mod tests {
     fn rejects_bad_input() {
         let c = RecoveryCode::generate().unwrap();
         let s = c.to_string();
-        // Wrong version / identifier.
-        for (pos, ch) in [(0, "3"), (1, "1")] {
+        // Wrong identifier.
+        let mut t = s.clone();
+        t.replace_range(1..2, "1");
+        assert_eq!(RecoveryCode::parse(&t), Err(Error::BadRecoveryCode));
+        assert!(RecoveryCode::candidates(&t).is_err());
+        // An unknown version on a valid codeword is a distinct error.
+        for v in ["4", "Z", "A"] {
             let mut t = s.clone();
-            t.replace_range(pos..pos + 1, ch);
-            assert_eq!(RecoveryCode::parse(&t), Err(Error::BadRecoveryCode));
-            assert!(RecoveryCode::candidates(&t).is_err());
+            t.replace_range(0..1, v);
+            assert_eq!(RecoveryCode::parse(&t), Err(Error::UnsupportedCodeVersion));
+            assert_eq!(
+                RecoveryCode::candidates(&t).err(),
+                Some(Error::UnsupportedCodeVersion)
+            );
         }
+        // Version '3' on the same word is a different, valid code.
+        let mut t = s.clone();
+        t.replace_range(0..1, "3");
+        let v3 = RecoveryCode::parse(&t).unwrap();
+        assert_eq!(v3.version(), CodeVersion::V3);
+        assert_ne!(v3, c);
         // Length.
         assert!(RecoveryCode::parse(&s[..39]).is_err());
         assert!(RecoveryCode::parse(&format!("{s}A")).is_err());

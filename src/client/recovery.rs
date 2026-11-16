@@ -201,6 +201,11 @@ impl Labyrinth {
             return Err(Error::DeviceTampered);
         }
         let _ = v.to_bundle_for_did(&self.did)?;
+        // Delete the erasable share first: once it is gone a version-3 code
+        // opens nothing, even if the steps below fail and are retried.
+        if let Some(shares) = &self.shares {
+            shares.store.delete_share(vdevice_id).await?;
+        }
         let report = self.revoke_device(&rec.public.device_key_pub).await?;
         self.b.mailbox.delete_virtual_device(vdevice_id).await?;
         Ok(report)

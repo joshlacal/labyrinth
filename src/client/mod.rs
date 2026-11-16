@@ -66,6 +66,7 @@ use crate::mailbox::{EpochPublic, MailboxKeys};
 use crate::mek::Mek;
 use crate::message::{OwnerMessage, SealedMessage};
 use crate::records::datetime_from_ms;
+use crate::recovery_share::RecoveryShares;
 use crate::sign::TransportSigner;
 use crate::store::{
     KeyPublisher, MailboxDirectory, MailboxStore, MaybeSend, MaybeSync, ThreadStore, VouchAt,
@@ -125,6 +126,9 @@ pub struct Labyrinth {
     transport: Box<dyn TransportSigner>,
     b: Backends,
     state_sink: Option<Box<dyn StateSink>>,
+    /// Erasable recovery shares for version-3 codes; `None` reads and writes
+    /// version-2 codes only.
+    shares: Option<RecoveryShares>,
     /// An epoch head which must still reach every configured directory.
     pending_directory_publication: Option<u64>,
     /// Epoch secrets this device holds, by sequence number.
@@ -258,6 +262,7 @@ impl Labyrinth {
             transport,
             b,
             state_sink: None,
+            shares: None,
             pending_directory_publication: None,
             epochs,
             latest,

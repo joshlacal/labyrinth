@@ -101,6 +101,14 @@ pub enum Error {
     /// than silently dropped.
     #[error("space writer {author} is withheld in {space}")]
     WriterWithheld { space: String, author: String },
+    /// A well-formed recovery code whose version this build cannot open;
+    /// a newer app may be able to.
+    #[error("recovery code version is not supported by this app")]
+    UnsupportedCodeVersion,
+    /// A version-3 recovery code needs its erasable share, and no share is
+    /// available: no share store is configured, or the service holds none.
+    #[error("recovery share unavailable")]
+    RecoveryShareUnavailable,
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

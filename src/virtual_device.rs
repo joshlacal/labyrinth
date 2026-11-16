@@ -19,7 +19,8 @@ use crate::epoch::{
     EpochKeys, EpochMemberRecord, EpochSecret, PendingEpoch, member_record, parse_seq,
 };
 use crate::hpke::hawk::{HAWK_ENC_SECRET_LEN, HawkEncSecret};
-use crate::recovery_code::RecoveryCode;
+use crate::recovery_code::{CodeVersion, RecoveryCode};
+use crate::recovery_share::RecoveryShare;
 use crate::sign::XSigningKey;
 use crate::{Error, Result};
 
@@ -188,13 +189,28 @@ pub fn seal_virtual_device(
     mechanism: Mechanism,
     created_at: Option<&str>,
 ) -> Result<VirtualDeviceRecord> {
+    seal_virtual_device_with_share(did, code, None, v, epoch, mechanism, created_at)
+}
+
+/// [`seal_virtual_device`] for a code of either version: a version-3 code
+/// needs its erasable `share`, a version-2 code takes none. The record
+/// format is the same for both.
+pub fn seal_virtual_device_with_share(
+    did: &str,
+    code: &RecoveryCode,
+    share: Option<&RecoveryShare>,
+    v: &DeviceSecrets,
+    epoch: &impl EpochKeys,
+    mechanism: Mechanism,
+    created_at: Option<&str>,
+) -> Result<VirtualDeviceRecord> {
     if !v.is_virtual() {
         return Err(Error::DeviceTampered);
     }
     if let Some(ts) = created_at {
         let _ = crate::records::ms_from_datetime(ts)?;
     }
-    let (vdevice_id, key) = code.derive(did);
+    let (vdevice_id, key) = code.bundle_key(did, share)?;
     let seal = |base: &[u8], pt: &[u8]| {
         let aad = bundle_aad(base, did, &vdevice_id, mechanism, created_at);
         aead::seal(&key, &aad, pt)
@@ -270,14 +286,34 @@ fn create_inner(
 }
 
 /// Find the typo-corrected code whose `vdeviceId` the backend knows.
+///
+/// The version character sits outside the ECC word, so when the code as
+/// typed matches nothing, every supported version is tried as well. A
+/// well-formed code with an unsupported version that matches nothing fails
+/// with [`Error::UnsupportedCodeVersion`].
 pub fn find_code(
     input: &str,
     did: &str,
     mut exists: impl FnMut(&[u8; 16]) -> bool,
 ) -> Result<RecoveryCode> {
-    RecoveryCode::candidates(input)?
-        .find(|c| exists(&c.derive(did).0))
-        .ok_or(Error::BadRecoveryCode)
+    let first_error = match RecoveryCode::candidates(input) {
+        Ok(mut c) => {
+            if let Some(code) = c.find(|c| exists(&c.vdevice_id(did))) {
+                return Ok(code);
+            }
+            Error::BadRecoveryCode
+        }
+        Err(e @ (Error::UnsupportedCodeVersion | Error::BadRecoveryCode)) => e,
+        Err(e) => return Err(e),
+    };
+    for version in [CodeVersion::V2, CodeVersion::V3] {
+        if let Ok(mut c) = RecoveryCode::candidates_as(input, version)
+            && let Some(code) = c.find(|c| exists(&c.vdevice_id(did)))
+        {
+            return Ok(code);
+        }
+    }
+    Err(first_error)
 }
 
 fn open_fixed<const N: usize>(key: &[u8; 32], aad: &[u8], ct: &[u8]) -> Result<Zeroizing<[u8; N]>> {
@@ -290,12 +326,23 @@ fn open_fixed<const N: usize>(key: &[u8; 32], aad: &[u8], ct: &[u8]) -> Result<Z
     Ok(out)
 }
 
-/// Decrypt a bundle with a recovery code.
+/// Decrypt a bundle with a version-2 recovery code.
 pub fn open(record: &VirtualDeviceRecord, code: &RecoveryCode, did: &str) -> Result<RestoredState> {
-    let (vdevice_id, key) = code.derive(did);
-    if vdevice_id != record.vdevice_id {
+    open_with_share(record, code, None, did)
+}
+
+/// Decrypt a bundle with a recovery code of either version; a version-3 code
+/// needs its erasable `share`.
+pub fn open_with_share(
+    record: &VirtualDeviceRecord,
+    code: &RecoveryCode,
+    share: Option<&RecoveryShare>,
+    did: &str,
+) -> Result<RestoredState> {
+    if code.vdevice_id(did) != record.vdevice_id {
         return Err(Error::BadRecoveryCode);
     }
+    let (_, key) = code.bundle_key(did, share)?;
     if !record.public.is_virtual {
         return Err(Error::DeviceTampered);
     }

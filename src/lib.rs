@@ -21,6 +21,7 @@ pub mod otc;
 pub mod padding;
 pub mod records;
 pub mod recovery_code;
+pub mod recovery_share;
 pub mod sign;
 pub mod store;
 pub mod virtual_device;

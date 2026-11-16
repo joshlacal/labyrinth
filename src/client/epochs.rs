@@ -1695,6 +1695,14 @@ impl Labyrinth {
             }
         }
 
+        // The invalidated methods' codes must stop working: delete their
+        // erasable shares before the rotation commits. A failure aborts the
+        // rotation so it is retried rather than leaving a live share.
+        if let Some(shares) = &self.shares {
+            for inv in &invalidated_recovery_methods {
+                shares.store.delete_share(&inv.vdevice_id).await?;
+            }
+        }
         let mut replacement_vdev: Option<(RecoveryCode, DeviceSecrets)> = None;
         let mut added_virtual_pubs = Vec::new();
         if !invalidated_recovery_methods.is_empty() {

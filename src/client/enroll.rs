@@ -20,7 +20,8 @@ use crate::mailbox::EpochPublic;
 use crate::otc::{Initiator, InitiatorMessage, OneTimeCode, Responder, ResponderMessage};
 use crate::records::mailbox::PasskeyWrap;
 use crate::records::{Device, Epoch, EpochMember, VirtualDevice, datetime_from_ms};
-use crate::recovery_code::RecoveryCode;
+use crate::recovery_code::{CodeVersion, RecoveryCode};
+use crate::recovery_share::{RecoveryShare, RecoveryShares};
 use crate::sign::{TransportSigner, XVerifyingKey};
 use crate::store::{AtomicEnrollBundle, EnrollCleanup};
 use crate::virtual_device::{self, Mechanism, OtcPayload, RestoredState, passkey};
@@ -137,7 +138,7 @@ fn select_passkey_bundles<'a>(
                 .as_ref()
                 .ok_or(Error::Malformed("passkey fields must come together"))?;
             let code = passkey::unwrap_code(prf_output, &wrapped.0)?;
-            let (vdevice_id, _) = code.derive(did);
+            let vdevice_id = code.vdevice_id(did);
             let mut canonical_matches = bundles
                 .iter()
                 .filter(|bundle| bundle.vdevice_id.0.as_slice() == vdevice_id);
@@ -185,7 +186,33 @@ struct PreparedRestore {
     stale_recovery_method: bool,
 }
 
+/// The erasable share a version-3 code needs; `None` for a version-2 code.
+async fn fetch_share(
+    shares: Option<&RecoveryShares>,
+    did: &str,
+    code: &RecoveryCode,
+) -> Result<Option<RecoveryShare>> {
+    if code.version() == CodeVersion::V2 {
+        return Ok(None);
+    }
+    let shares = shares.ok_or(Error::RecoveryShareUnavailable)?;
+    let d = code.derive_v3(did)?;
+    shares
+        .store
+        .get_share(&d.vdevice_id, &d.fetch_token)
+        .await?
+        .ok_or(Error::RecoveryShareUnavailable)
+        .map(Some)
+}
+
 impl Labyrinth {
+    /// Install (or remove) the recovery-share configuration. With a store,
+    /// version-3 codes restore and removing or re-keying a method deletes its
+    /// share; `None` keeps version-2-only behaviour.
+    pub fn set_recovery_shares(&mut self, shares: Option<RecoveryShares>) {
+        self.shares = shares;
+    }
+
     /// Create a recovery bundle in the current epoch (SPEC §6.2). The
     /// bundle's virtual device is carried over by later rotations.
     pub async fn create_recovery_code(&mut self, mechanism: Mechanism) -> Result<RecoverySetup> {
@@ -282,6 +309,20 @@ impl Labyrinth {
         transport: Box<dyn TransportSigner>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
+        Self::restore_with_recovery_code_shared(did, code_input, transport, b, None).await
+    }
+
+    /// [`restore_with_recovery_code`](Self::restore_with_recovery_code) with
+    /// a recovery-share configuration: a version-3 code fetches its share
+    /// from `shares` (and fails with [`Error::RecoveryShareUnavailable`]
+    /// without one). The restored client keeps `shares`.
+    pub async fn restore_with_recovery_code_shared(
+        did: &str,
+        code_input: &str,
+        transport: Box<dyn TransportSigner>,
+        b: Backends,
+        shares: Option<RecoveryShares>,
+    ) -> Result<(Self, Enrollment)> {
         let known_ids: BTreeSet<[u8; 16]> = b
             .mailbox
             .list_virtual_devices()
@@ -292,10 +333,17 @@ impl Labyrinth {
         let code = virtual_device::find_code(code_input, did, |id| known_ids.contains(id))?;
         let bundle = b
             .mailbox
-            .get_virtual_device(&code.derive(did).0)
+            .get_virtual_device(&code.vdevice_id(did))
             .await?
             .ok_or(Error::BadRecoveryCode)?;
-        Self::restore_from_bundle(did, &bundle, &code, transport, b).await
+        let share = fetch_share(shares.as_ref(), did, &code).await?;
+        let prepared =
+            Self::prepare_restore_from_bundle(did, &bundle, &code, share.as_ref(), &b).await?;
+        drop(share);
+        let (mut me, enrollment) =
+            Self::finish_prepared_restore(did, prepared, transport, b).await?;
+        me.shares = shares;
+        Ok((me, enrollment))
     }
 
     /// Enroll a new device from the passkey-wrapped code stored with the
@@ -307,13 +355,34 @@ impl Labyrinth {
         transport: Box<dyn TransportSigner>,
         b: Backends,
     ) -> Result<(Self, Enrollment)> {
+        Self::restore_with_passkey_shared(did, prf_output, credential_id, transport, b, None).await
+    }
+
+    /// [`restore_with_passkey`](Self::restore_with_passkey) with a
+    /// recovery-share configuration for a passkey-wrapped version-3 code.
+    pub async fn restore_with_passkey_shared(
+        did: &str,
+        prf_output: &[u8],
+        credential_id: &[u8],
+        transport: Box<dyn TransportSigner>,
+        b: Backends,
+        shares: Option<RecoveryShares>,
+    ) -> Result<(Self, Enrollment)> {
         passkey::validate_prf_output(prf_output)?;
         let bundles = b.mailbox.list_virtual_devices().await?;
         let candidates = select_passkey_bundles(did, prf_output, credential_id, &bundles)?;
         let mut prepared = None;
         let mut first_error = None;
         for (bundle, code) in candidates {
-            match Self::prepare_restore_from_bundle(did, bundle, &code, &b).await {
+            let share = match fetch_share(shares.as_ref(), did, &code).await {
+                Ok(share) => share,
+                Err(error @ Error::RecoveryShareUnavailable) => {
+                    prefer_passkey_error(&mut first_error, error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match Self::prepare_restore_from_bundle(did, bundle, &code, share.as_ref(), &b).await {
                 Ok(_) if prepared.is_some() => return Err(Error::Conflict),
                 Ok(candidate) => prepared = Some(candidate),
                 Err(Error::NotEpochMember) => {
@@ -324,24 +393,17 @@ impl Labyrinth {
         }
         let prepared = prepared
             .ok_or_else(|| first_error.unwrap_or(Error::NotFound("active passkey bundle")))?;
-        Self::finish_prepared_restore(did, prepared, transport, b).await
-    }
-
-    async fn restore_from_bundle(
-        did: &str,
-        bundle: &VirtualDevice,
-        code: &RecoveryCode,
-        transport: Box<dyn TransportSigner>,
-        b: Backends,
-    ) -> Result<(Self, Enrollment)> {
-        let prepared = Self::prepare_restore_from_bundle(did, bundle, code, &b).await?;
-        Self::finish_prepared_restore(did, prepared, transport, b).await
+        let (mut me, enrollment) =
+            Self::finish_prepared_restore(did, prepared, transport, b).await?;
+        me.shares = shares;
+        Ok((me, enrollment))
     }
 
     async fn prepare_restore_from_bundle(
         did: &str,
         bundle: &VirtualDevice,
         code: &RecoveryCode,
+        share: Option<&RecoveryShare>,
         b: &Backends,
     ) -> Result<PreparedRestore> {
         let (record, _) = bundle.to_bundle_for_did(did)?;
@@ -359,7 +421,7 @@ impl Labyrinth {
         if fresh_record != record {
             return Err(Error::Conflict);
         }
-        let restored = virtual_device::open(&record, code, did)?;
+        let restored = virtual_device::open_with_share(&record, code, share, did)?;
         let seq = restored.epoch.seq();
         let (id, start_record) = epoch_record(b.mailbox.as_ref(), seq).await?;
         let start = PendingEpoch::new(seq, *restored.epoch.root()).assign_id(id);
