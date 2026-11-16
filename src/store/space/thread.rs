@@ -193,6 +193,15 @@ fn build_mac_headers(
 /// Alias retained for sequenced conversation Space thread store callers.
 pub type SequencedSpaceThreadStore = SpaceThreadStore;
 
+/// How a Space read response is authenticated.
+enum ReadAuth {
+    /// This store verifies the host's HPKE `0xFFFF` Export MAC itself.
+    Host(String),
+    /// The transport declared that it verifies every response itself
+    /// ([`SpaceRpc::authenticates_responses`]).
+    Transport,
+}
+
 /// Spaces-only [`ThreadStore`] reading and writing directly against conversation Spaces.
 pub struct SpaceThreadStore {
     did: String,
@@ -321,6 +330,9 @@ impl SpaceThreadStore {
                             .await
                             .map_err(map_space_error)?,
                     };
+                    if kem.is_none() && !transport.authenticates_responses() {
+                        return Err(Error::Unauthenticated("listSpaces repository revision"));
+                    }
                     if let Some(kem_key) = kem {
                         match Self::fetch_repo_star_authenticated_raw(
                             transport,
@@ -457,6 +469,35 @@ impl SpaceThreadStore {
             .host_kem_did_key(space_str)
             .await
             .map_err(map_member_repo_space_error)
+    }
+
+    /// Resolves how reads of `space_str` are authenticated, refusing with
+    /// [`Error::Unauthenticated`] when neither a host KEM key nor an
+    /// authenticating transport is available.
+    async fn read_auth(&self, space_str: &str) -> Result<ReadAuth> {
+        match self.resolve_host_kem_did_key(space_str).await? {
+            Some(k) => Ok(ReadAuth::Host(k)),
+            None if self.t.authenticates_responses() => Ok(ReadAuth::Transport),
+            None => Err(Error::Unauthenticated("space host KEM key")),
+        }
+    }
+
+    /// `getRecord` whose response is authenticated by the host MAC or by the
+    /// transport; never an unauthenticated read.
+    async fn get_checked<T: DeserializeOwned>(
+        &self,
+        space: &SpaceRef,
+        repo: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Option<T>> {
+        match self.read_auth(&space.to_string()).await? {
+            ReadAuth::Host(kem_key) => Ok(self
+                .get_record_authenticated_in_space::<T>(space, repo, collection, rkey, &kem_key)
+                .await?
+                .map(|(_, v)| v)),
+            ReadAuth::Transport => self.get_from(space, repo, collection, rkey).await,
+        }
     }
 
     async fn get_record_authenticated_in_space<T: DeserializeOwned>(
@@ -806,6 +847,11 @@ impl SpaceThreadStore {
                 }
             }
         }
+        // The listing is not authenticated: it may add candidate writers but
+        // cannot remove one whose repository this client already
+        // authenticated in this Space. Those stay candidates and are
+        // re-verified by the authenticated per-writer read.
+        active.extend(self.floors.authors_in(&space_str));
         Ok(active.into_iter().collect())
     }
 
@@ -913,21 +959,9 @@ impl SpaceThreadStore {
         did: &str,
         rkey: &str,
     ) -> Result<Option<Stored<MekDistribution>>> {
-        let space_str = space.to_string();
-        let fetched = if let Some(kem_key) = self.resolve_host_kem_did_key(&space_str).await? {
-            self.get_record_authenticated_in_space::<MekDistribution>(
-                space,
-                did,
-                nsid::MEK,
-                rkey,
-                &kem_key,
-            )
-            .await
-            .map(|opt| opt.map(|(_, m)| m))
-        } else {
-            self.get_from::<MekDistribution>(space, did, nsid::MEK, rkey)
-                .await
-        };
+        let fetched = self
+            .get_checked::<MekDistribution>(space, did, nsid::MEK, rkey)
+            .await;
         match fetched {
             Ok(Some(m)) => Ok(Some(Stored {
                 author: did.to_owned(),
@@ -1106,7 +1140,10 @@ impl ThreadStore for SpaceThreadStore {
     ) -> Result<Vec<Stored<Batch>>> {
         let space = self.space_for(thread_id)?;
         let space_str = space.to_string();
-        let host_kem = self.resolve_host_kem_did_key(&space_str).await?;
+        let host_kem = match self.read_auth(&space_str).await? {
+            ReadAuth::Host(k) => Some(k),
+            ReadAuth::Transport => None,
+        };
         let repos = self.list_repos(&space).await?;
         let mut out = Vec::new();
         for did in repos {
@@ -1124,6 +1161,14 @@ impl ThreadStore for SpaceThreadStore {
                 .await
                 {
                     Ok(p) => p,
+                    Err(Error::NotFound("repo" | "record"))
+                        if self.floors.get(&space_str, &did).is_some() =>
+                    {
+                        return Err(Error::WriterWithheld {
+                            space: space_str.clone(),
+                            author: did,
+                        });
+                    }
                     Err(Error::NotFound("repo" | "record")) => continue,
                     Err(e) => return Err(e),
                 };
@@ -1201,7 +1246,10 @@ impl ThreadStore for SpaceThreadStore {
         };
         let space = self.space_for(thread_id)?;
         let space_str = space.to_string();
-        let host_kem = self.resolve_host_kem_did_key(&space_str).await?;
+        let host_kem = match self.read_auth(&space_str).await? {
+            ReadAuth::Host(k) => Some(k),
+            ReadAuth::Transport => None,
+        };
         let repos = self.list_repos(&space).await?;
         let mut out = Vec::new();
         let mut quarantined = Vec::new();
@@ -1220,6 +1268,17 @@ impl ThreadStore for SpaceThreadStore {
                 .await
                 {
                     Ok(p) => p,
+                    Err(Error::NotFound("repo" | "record"))
+                        if self.floors.get(&space_str, &did).is_some() =>
+                    {
+                        push_quarantine(
+                            &mut quarantined,
+                            did,
+                            QuarantineReason::WithheldRepository,
+                            "authenticated writer repository is no longer served".to_owned(),
+                        );
+                        continue;
+                    }
                     Err(Error::NotFound("repo" | "record")) => continue,
                     Err(e) => return Err(e),
                 };
@@ -1419,7 +1478,7 @@ impl ThreadStore for SpaceThreadStore {
             .count();
 
         if let Some(existing) = self
-            .get_from::<AuthorRedaction>(&space, &self.did, nsid::AUTHOR_REDACTION, &rkey)
+            .get_checked::<AuthorRedaction>(&space, &self.did, nsid::AUTHOR_REDACTION, &rkey)
             .await?
         {
             existing
@@ -1448,7 +1507,12 @@ impl ThreadStore for SpaceThreadStore {
             Ok(_) => Ok(count),
             Err(Error::Conflict) => {
                 let existing = self
-                    .get_from::<AuthorRedaction>(&space, &self.did, nsid::AUTHOR_REDACTION, &rkey)
+                    .get_checked::<AuthorRedaction>(
+                        &space,
+                        &self.did,
+                        nsid::AUTHOR_REDACTION,
+                        &rkey,
+                    )
                     .await?
                     .ok_or(Error::Conflict)?;
                 existing
@@ -1511,7 +1575,7 @@ impl ThreadStore for SpaceThreadStore {
         rkey: &str,
     ) -> Result<Option<AttachmentManifest>> {
         let space = self.space_for(thread_id)?;
-        self.get_from(&space, author_did, nsid::ATTACHMENT_MANIFEST, rkey)
+        self.get_checked(&space, author_did, nsid::ATTACHMENT_MANIFEST, rkey)
             .await
     }
 
@@ -1523,7 +1587,7 @@ impl ThreadStore for SpaceThreadStore {
     ) -> Result<Vec<u8>> {
         let space = self.space_for(thread_id)?;
         let manifest: AttachmentManifest = self
-            .get_from(&space, author_did, nsid::ATTACHMENT_MANIFEST, rkey)
+            .get_checked(&space, author_did, nsid::ATTACHMENT_MANIFEST, rkey)
             .await?
             .ok_or(Error::NotFound("attachmentManifest"))?;
         let (cid, meta) = manifest.to_meta()?;

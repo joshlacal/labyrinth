@@ -91,6 +91,16 @@ pub enum Error {
         pinned_rev: String,
         offered_rev: String,
     },
+    /// A Space response could not be authenticated: no host KEM key is known
+    /// for the Space and the transport does not authenticate responses itself.
+    /// The read is refused instead of trusting unauthenticated bytes.
+    #[error("space response authentication unavailable: {0}")]
+    Unauthenticated(&'static str),
+    /// A writer whose repository this client already authenticated in the
+    /// Space is no longer served. Its history is reported as withheld rather
+    /// than silently dropped.
+    #[error("space writer {author} is withheld in {space}")]
+    WriterWithheld { space: String, author: String },
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

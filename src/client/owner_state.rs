@@ -560,6 +560,7 @@ impl Labyrinth {
         if state.conversation_id != rkey {
             return Err(Error::Malformed("readState rkey mismatch"));
         }
+        self.confirm_owner_state_version(nsid::READ_STATE, rkey, cas_version)?;
         Ok(state)
     }
 
@@ -608,6 +609,7 @@ impl Labyrinth {
         if state.circle_id != rkey {
             return Err(Error::Malformed("circleOwnerState rkey mismatch"));
         }
+        self.confirm_owner_state_version(nsid::CIRCLE_OWNER_STATE, rkey, cas_version)?;
         Ok(state)
     }
 

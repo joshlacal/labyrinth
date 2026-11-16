@@ -519,6 +519,9 @@ pub enum QuarantineReason {
     TimestampOutOfRange,
     /// Uncached MEK lookup misses from this author exceeded the per-restore budget.
     ExcessiveMekMisses,
+    /// A writer whose repository this client already authenticated in the
+    /// Space was omitted, reported removed, or not served by the host.
+    WithheldRepository,
 }
 
 /// Per-author quarantine entry reported on [`crate::client::ThreadHistory`].

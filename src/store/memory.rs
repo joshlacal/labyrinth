@@ -461,6 +461,16 @@ impl MemoryMailbox {
             .unwrap_or(0)
     }
 
+    /// Read-only rollback check; reads never raise the floor because the
+    /// record is authenticated only when the client decrypts it.
+    fn check_version(&self, collection: &str, id: &str, ver: u64) -> Result<()> {
+        crate::store::validate_owner_state_version_floor(collection, id, ver)?;
+        if ver < self.pinned_version(collection, id) {
+            return Err(Error::Malformed("owner state version rollback"));
+        }
+        Ok(())
+    }
+
     fn observe_version(&self, collection: &str, id: &str, ver: u64) -> Result<()> {
         crate::store::validate_owner_state_version_floor(collection, id, ver)?;
         let mut guard = self
@@ -877,7 +887,7 @@ impl MailboxStore for MemoryMailbox {
         })?;
         match row {
             Some((rec, cid, ver)) => {
-                self.observe_version(crate::records::nsid::READ_STATE, conversation_id, ver)?;
+                self.check_version(crate::records::nsid::READ_STATE, conversation_id, ver)?;
                 Ok(Some((rec, cid, ver)))
             }
             None => {
@@ -973,7 +983,7 @@ impl MailboxStore for MemoryMailbox {
             }
         }
         for (id, _, _, ver) in &rows {
-            self.observe_version(crate::records::nsid::READ_STATE, id, *ver)?;
+            self.check_version(crate::records::nsid::READ_STATE, id, *ver)?;
         }
         Ok(rows)
     }
@@ -998,7 +1008,7 @@ impl MailboxStore for MemoryMailbox {
         })?;
         match row {
             Some((rec, cid, ver)) => {
-                self.observe_version(crate::records::nsid::CIRCLE_OWNER_STATE, circle_id, ver)?;
+                self.check_version(crate::records::nsid::CIRCLE_OWNER_STATE, circle_id, ver)?;
                 Ok(Some((rec, cid, ver)))
             }
             None => {
@@ -1098,7 +1108,7 @@ impl MailboxStore for MemoryMailbox {
             }
         }
         for (id, _, _, ver) in &rows {
-            self.observe_version(crate::records::nsid::CIRCLE_OWNER_STATE, id, *ver)?;
+            self.check_version(crate::records::nsid::CIRCLE_OWNER_STATE, id, *ver)?;
         }
         Ok(rows)
     }

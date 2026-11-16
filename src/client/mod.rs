@@ -425,6 +425,41 @@ impl Labyrinth {
         Ok(())
     }
 
+    /// Raise the `(collection, logical_id)` CAS version floor to `ver` after
+    /// the record at that version has decrypted and authenticated. Stores only
+    /// check floors on read, so an unauthenticated listing cannot pin one.
+    pub(super) fn confirm_owner_state_version(
+        &mut self,
+        collection: &str,
+        logical_id: &str,
+        ver: u64,
+    ) -> Result<()> {
+        crate::store::validate_owner_state_version_floor(collection, logical_id, ver)?;
+        let key = (collection.to_owned(), logical_id.to_owned());
+        match self.owner_state_floors.get(&key) {
+            Some(&pinned) if ver < pinned => {
+                return Err(Error::Malformed("owner state version rollback"));
+            }
+            Some(&pinned) if ver == pinned => return Ok(()),
+            Some(_) => {}
+            None if self.owner_state_floors.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES => {
+                return Err(Error::Malformed("owner state version floor table full"));
+            }
+            None => {}
+        }
+        let previous = self.owner_state_floors.insert(key.clone(), ver);
+        self.replace_store_owner_state_floors();
+        if let Err(err) = self.checkpoint_state() {
+            match previous {
+                Some(p) => self.owner_state_floors.insert(key, p),
+                None => self.owner_state_floors.remove(&key),
+            };
+            self.replace_store_owner_state_floors();
+            return Err(err);
+        }
+        Ok(())
+    }
+
     /// Pinned CAS version floor for `(collection, logical_id)`, if one has been observed.
     pub fn owner_state_version_floor(&self, collection: &str, logical_id: &str) -> Option<u64> {
         self.owner_state_floors

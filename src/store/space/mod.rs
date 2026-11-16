@@ -190,6 +190,17 @@ impl WriterRevFloors {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Every author with an authenticated revision floor in `space`.
+    pub fn authors_in(&self, space: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .filter(|(s, _)| s == space)
+            .map(|(_, author)| author.clone())
+            .collect()
+    }
+
     pub fn get(&self, space: &str, author: &str) -> Option<String> {
         self.inner
             .lock()
@@ -217,6 +228,19 @@ impl OwnerStateVersionFloors {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(collection.to_owned(), logical_id.to_owned()))
             .copied()
+    }
+
+    /// Read-only check that `ver` is well formed and not below the pinned
+    /// floor for `(collection, logical_id)`; never raises the floor.
+    pub fn check(&self, collection: &str, logical_id: &str, ver: u64) -> Result<()> {
+        crate::store::validate_owner_state_version_floor(collection, logical_id, ver)?;
+        if self
+            .pinned(collection, logical_id)
+            .is_some_and(|pinned| ver < pinned)
+        {
+            return Err(Error::Malformed("owner state version rollback"));
+        }
+        Ok(())
     }
 
     pub fn observe(&self, collection: &str, logical_id: &str, ver: u64) -> Result<()> {
@@ -408,6 +432,16 @@ pub trait SpaceRpc: MaybeSend + MaybeSync {
         _space: &str,
     ) -> core::result::Result<Option<String>, SpaceError> {
         Ok(None)
+    }
+
+    /// `true` only when this transport itself verifies every Space read
+    /// response (RFC 9421 + HPKE `0xFFFF` Export MAC on `getRecord`/`getRepo`,
+    /// writer-inventory commitment on `listWriters`) and fails closed. When
+    /// no host KEM key is known, readers accept plain responses only from a
+    /// transport that returns `true`; otherwise they refuse with
+    /// [`Error::Unauthenticated`].
+    fn authenticates_responses(&self) -> bool {
+        false
     }
 }
 
@@ -773,8 +807,10 @@ impl SpaceMailboxStore {
         &self.floors
     }
 
-    /// Queries `listSpaces` for this mailbox's authority and checks/advances
-    /// the owner's `(space_uri, owner_did)` commit revision floor.
+    /// Queries `listSpaces` for this mailbox's authority and checks the
+    /// owner's `(space_uri, owner_did)` commit revision against the pinned
+    /// floor. The listing is not authenticated, so it never raises the floor;
+    /// only an authenticated commit does.
     pub async fn observe_space_revision(&self) -> Result<Option<String>> {
         let p = [
             ("spaceDid", self.space.space_did.clone()),
@@ -804,7 +840,8 @@ impl SpaceMailboxStore {
             if s.space == target
                 && let Some(rev) = s.repo_rev
             {
-                self.floors.observe(&target, &self.did, &rev)?;
+                self.floors
+                    .check_not_rolled_back(&target, &self.did, &rev)?;
                 return Ok(Some(rev));
             }
         }
@@ -1116,7 +1153,9 @@ impl SpaceMailboxStore {
             }
             return Ok(None);
         };
-        self.version_floors.observe(collection, logical_id, ver)?;
+        // Check only: the record is not authenticated until the client opens
+        // it, so the floor is raised by the client after decryption.
+        self.version_floors.check(collection, logical_id, ver)?;
         Ok(Some((decode(value)?, cid, ver)))
     }
 
@@ -1145,7 +1184,7 @@ impl SpaceMailboxStore {
             }
         }
         for (logical_id, (ver, _, _)) in &by_logical {
-            self.version_floors.observe(collection, logical_id, *ver)?;
+            self.version_floors.check(collection, logical_id, *ver)?;
         }
         Ok(by_logical
             .into_iter()
