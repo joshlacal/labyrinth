@@ -103,6 +103,11 @@ fn missing_active_space_is_not_an_owner_archive_fallback() {
         async fn procedure(&self, _nsid: &str, _body: &[u8]) -> Result<Vec<u8>, SpaceError> {
             panic!("history reads must not write to the conversation Space")
         }
+        // Stands in for a transport that verifies response MACs itself, so
+        // the read reaches the host and sees its status.
+        fn authenticates_responses(&self) -> bool {
+            true
+        }
     }
 
     let net = MemoryBackend::new();
