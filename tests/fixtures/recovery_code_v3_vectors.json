@@ -1,5 +1,6 @@
 {
-  "description": "Known-answer vectors for Labyrinth recovery code version 3 (erasable share). Derivation fields (vdeviceId, codeKey, fetchToken, fetchVerifier, vdeviceKey, v2VdeviceId, v2VdeviceKey) were computed independently of the crate with Python hmac/hashlib from entropyChars. code/v2Code and the wrap records come from the crate under a deterministic randomness hook.",
+  "description": "Known-answer vectors for Labyrinth recovery code version 3 (erasable share). Derivation fields (vdeviceId, codeKey, fetchToken, fetchVerifier, vdeviceKey, v2VdeviceId, v2VdeviceKey) are reproduced independently of the crate by the retained Python hmac/hashlib checker. code/v2Code and the wrap records come from the crate under a deterministic randomness hook.",
+  "referenceChecker": "tests/check_recovery_code_v3_vectors.py",
   "kdf": {
     "v3Info": "BackupRecoveryCode_v3_0_ || did",
     "v3Length": 80,

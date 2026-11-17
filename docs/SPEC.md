@@ -226,7 +226,7 @@ encEntropy[d] = hawk_encrypt_with_psk(d.epochStorageKeyPub, self.authPriv, self.
 ### 6.1 Recovery codes
 
 - Alphabet `ACDEFHJKLMNPQRSTUVWXYZ0123456789`. On input, `B→8`, `G→C`, `I→1`, `O→0`.
-- 40 characters: version `2`, identifier `0`, 34 entropy characters, 4 ECC characters.
+- 40 characters: version (`2` for legacy code-only recovery or `3` for an erasable-share code), identifier `0`, 34 entropy characters, 4 ECC characters.
 - **ECC over GF(32)** **[CB-12]**:
   - The field is GF(2⁵) with modulus x⁵+x²+1. Symbol value = index in the alphabet.
   - The paper says "any four columns" of the 4×38 matrix `G` are invertible. **That can't hold at length 38.** Such columns would form an arc in PG(3,32), and the largest arc there has q+1 = 33 points (Segre).
@@ -243,13 +243,35 @@ encEntropy[d] = hawk_encrypt_with_psk(d.epochStorageKeyPub, self.authPriv, self.
   - Decoding brute-forces up to 3 erasures, solves the overdetermined system, and accepts a candidate only if it is consistent and the derived `vdeviceId` exists on the backend.
     - A typo'd code yields a few hundred triple-erasure candidates, because each 3-erasure set passes the single redundant equation with probability about 1/32.
     - A character outside the alphabet (after the homoglyph mapping) counts as a known erasure.
-- Derivation:
+- `entropyChars` is the 34 canonical ASCII characters. Version 2 derives its bundle identifier and key directly:
 
 ```
-(vdeviceId, vdeviceKey) = kdf(entropyChars, null, "BackupRecoveryCode_v" || ver || "_" || id || "_" || did, 48)
+(vdeviceId16, vdeviceKey32) =
+    HKDF-SHA256(ikm = entropyChars, salt = null,
+                info = "BackupRecoveryCode_v2_0_" || did, L = 48)
 ```
 
-- `entropyChars` is the 34 ASCII characters.
+- Version 3 uses this exact transcript:
+
+```
+(vdeviceId16, codeKey32, fetchToken32) =
+    HKDF-SHA256(ikm = entropyChars, salt = null,
+                info = "BackupRecoveryCode_v3_0_" || did, L = 80)
+
+fetchVerifier32 =
+    SHA-256("catbird.labyrinth.recovery_share.fetch.v1|" || did || "|"
+           || hex(vdeviceId16) || "|" || fetchToken32)
+
+vdeviceKey32 =
+    HKDF-SHA256(ikm = codeKey32 || share32,
+                salt = "catbird.labyrinth.recovery_share.v1",
+                info = "vdevice_key|did=" || did || "|vid=" || hex(vdeviceId16),
+                L = 32)
+```
+
+  The home delivery service holds the uniformly random 32-byte `share32`, stores `fetchVerifier32`, and releases the share only through its signed procedure when the request body presents the matching raw `fetchToken32`. A version-2 code rejects a supplied share; a version-3 code without a fetched share fails with `RecoveryShareUnavailable` and has no code-only fallback. Both versions keep the same ECC and `virtualDevice` record format, but their version-bound identifiers differ. `tests/check_recovery_code_v3_vectors.py` independently reproduces all seven frozen v2/v3 derivation fields with Python `hmac`/`hashlib`; it only reports mismatches and never rewrites the fixture.
+
+- **Erasure boundary.** “Erasable” means that, after the configured share service has durably stopped returning `share32`, a caller holding only the code and bundle cannot derive `vdeviceKey32`. Share deletion does **not** revoke a copied share or key, an already decrypted bundle, recovered epoch roots, an enrolled physical device, cached plaintext, or backups. `Zeroizing` limits ordinary in-process lifetime only; it is not proof of platform-memory, replica, tombstone, or backup erasure. Removal and re-key paths request share deletion only when the client has a configured `RecoveryShares` store, so an unconfigured client cannot claim server-share erasure. Membership revocation still requires the separately published epoch rotation, and previously enrolled physical devices remain members until independently revoked.
 
 ### 6.2 Virtual device bundle (p.32–34; ORF-free PQ layout)
 
@@ -282,7 +304,7 @@ A PIN vault (HSM or Juicebox) is out of scope for the first release.
 - `keychain` and `passkey` bundles become stale 180 days (`AUTO_RECOVERY_TTL_MS`) after `max(createdAt, lastUsedAt)`; `code` and `otc` bundles do not become stale.
 - A stale bundle may restore. `Enrollment.stale_recovery_method` tells the app to prompt for rotation or replacement. Local time alone never returns `Expired`, deletes the bundle or removes its member.
 - A restore touches its bundle (`lastUsedAt` updated atomically inside `atomic_enroll`); the app may also call `touch_recovery_method` when it confirms its keychain copy still exists.
-- `remove_recovery_method` revokes the virtual device by opening a new epoch without it, then deletes the bundle. That shared rotation is the authoritative expiry boundary: an excluded virtual device can no longer reach the new epoch.
+- `remove_recovery_method` first asks a configured `RecoveryShares` store to delete the erasable share (a refusal aborts), then revokes the virtual device by opening a new epoch without it, and finally deletes the bundle. Without a configured share store it performs only the legacy rotation-and-bundle removal and makes no share-erasure claim. The shared rotation is the authoritative membership-expiry boundary: an excluded virtual device can no longer reach the new epoch.
 - `Labyrinth::rotate` (ordinary `rotate_epoch` and `revoke_device` rotations) also excludes stale `keychain`/`passkey` virtual devices and reports them in `RotationReport::excluded`. Callers surface those exclusions for every rotation, not only targeted revocation (G7, G9; Fix Round 4). Enrollment rotations (§6.3, §6.5) still carry over every valid unrevoked member. A client clock alone never removes a member; a published rotation does.
 
 ### 6.5 Hybrid post-quantum one-time code (`CPace + ML-KEM-768`, `I16`, `Gate 3`)

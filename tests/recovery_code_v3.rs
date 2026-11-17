@@ -2,6 +2,8 @@
 //! derivation, sealing ("wrap") and opening ("unwrap") of a bundle, the
 //! wrong-share and missing-share failures, version dispatch, and the
 //! guarantee that version-2 behaviour is byte-identical.
+//! The seven independent derivation fields are also checked without Rust by
+//! `tests/check_recovery_code_v3_vectors.py` using only Python hmac/hashlib.
 
 use std::sync::{Arc, Mutex};
 
