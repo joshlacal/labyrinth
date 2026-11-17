@@ -667,7 +667,11 @@ impl Labyrinth {
                 Err(error) => {
                     return match self.clear_pending_if_two_source_superseded(pending).await {
                         Ok(true) => Ok(true),
-                        Ok(false) => Err(error),
+                        Ok(false)
+                        | Err(Error::DirectoryIncomplete {
+                            pds_present: true,
+                            ds_present: false,
+                        }) => Err(error),
                         Err(verification_error) => Err(verification_error),
                     };
                 }
