@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::executor::block_on;
 use labyrinth::Error;
-use labyrinth::client::{Backends, Clock, Labyrinth, MessageSource};
+use labyrinth::client::{
+    Backends, Clock, Labyrinth, MessageSource, enroll::passkey_recovery_requires_share,
+};
 use labyrinth::mailbox::{EpochPublic, MailboxKeys};
 use labyrinth::records::{
     Device, Epoch, EpochMember, MailboxKeysRecord, OtcSession, OwnerBatch, VirtualDevice,
@@ -664,6 +666,24 @@ fn passkey_creation_rejects_invalid_prf_without_storing_bundle() {
             "length {len}"
         );
     }
+}
+
+#[test]
+fn version_two_passkey_preflight_needs_no_recovery_share_service() {
+    let w = World::new();
+    let mut phone = w.init(ALICE, 1);
+    block_on(phone.create_passkey_recovery(&[42u8; 32], b"credential-1")).unwrap();
+    let bundles = block_on(w.net.mailbox(ALICE).list_virtual_devices()).unwrap();
+
+    assert!(
+        !passkey_recovery_requires_share(
+            ALICE,
+            &[42u8; 32],
+            b"credential-1",
+            &bundles,
+        )
+        .unwrap()
+    );
 }
 
 #[test]

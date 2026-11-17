@@ -116,6 +116,31 @@ pub(super) fn vdevice_stale_at_ms(
     ))
 }
 
+fn select_recovery_code(
+    did: &str,
+    code_input: &str,
+    bundles: &[VirtualDevice],
+) -> Result<RecoveryCode> {
+    virtual_device::find_code(code_input, did, |id| {
+        bundles
+            .iter()
+            .any(|bundle| bundle.vdevice_id.0.as_slice() == id)
+    })
+}
+
+/// Whether the typo-corrected recovery code matching `bundles` is version 3.
+///
+/// This is only a preflight for choosing whether to prove the recovery-share
+/// service. The share store independently checks that proof immediately before
+/// it serializes a version-3 fetch token.
+pub fn recovery_code_requires_share(
+    did: &str,
+    code_input: &str,
+    bundles: &[VirtualDevice],
+) -> Result<bool> {
+    Ok(select_recovery_code(did, code_input, bundles)?.version() == CodeVersion::V3)
+}
+
 fn select_passkey_bundles<'a>(
     did: &str,
     prf_output: &[u8],
@@ -176,6 +201,21 @@ fn select_passkey_bundles<'a>(
         Ok(selected)
     }
 }
+
+/// Whether any passkey bundle selected by the unwrapped code needs a
+/// version-3 recovery share. No unwrapped code escapes this call.
+pub fn passkey_recovery_requires_share(
+    did: &str,
+    prf_output: &[u8],
+    credential_id: &[u8],
+    bundles: &[VirtualDevice],
+) -> Result<bool> {
+    passkey::validate_prf_output(prf_output)?;
+    Ok(select_passkey_bundles(did, prf_output, credential_id, bundles)?
+        .iter()
+        .any(|(_, code)| code.version() == CodeVersion::V3))
+}
+
 
 struct PreparedRestore {
     vdev: VirtualDevice,
@@ -323,14 +363,8 @@ impl Labyrinth {
         b: Backends,
         shares: Option<RecoveryShares>,
     ) -> Result<(Self, Enrollment)> {
-        let known_ids: BTreeSet<[u8; 16]> = b
-            .mailbox
-            .list_virtual_devices()
-            .await?
-            .into_iter()
-            .filter_map(|v| <[u8; 16]>::try_from(v.vdevice_id.0.as_slice()).ok())
-            .collect();
-        let code = virtual_device::find_code(code_input, did, |id| known_ids.contains(id))?;
+        let bundles = b.mailbox.list_virtual_devices().await?;
+        let code = select_recovery_code(did, code_input, &bundles)?;
         let bundle = b
             .mailbox
             .get_virtual_device(&code.vdevice_id(did))

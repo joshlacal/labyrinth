@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use labyrinth::Error;
+use labyrinth::client::enroll::recovery_code_requires_share;
 use labyrinth::device::DeviceSecrets;
 use labyrinth::encoding::{RandomFillHook, with_random_hook};
 use labyrinth::epoch::{EpochKeys as _, EpochSecret};
@@ -157,6 +158,56 @@ fn derivation_vectors() {
         );
     }
     diffs.finish();
+}
+
+#[test]
+fn share_preflight_uses_the_backend_matched_version_not_the_typed_version() {
+    let f = fixture();
+    let (did, v3, share, v2, w) = wrap_vector(&f);
+    let v3_wrapped = wrap(&v3, Some(&share), w, did);
+    let v3_bundle = VirtualDevice::from_bundle(
+        &v3_wrapped.record,
+        None,
+        w["createdAt"].as_str().unwrap().to_owned(),
+    );
+    v3_bundle.to_bundle_for_did(did).unwrap();
+    let v2_wrapped = wrap(&v2, None, w, did);
+    let v2_bundle = VirtualDevice::from_bundle(
+        &v2_wrapped.record,
+        None,
+        w["createdAt"].as_str().unwrap().to_owned(),
+    );
+    v2_bundle.to_bundle_for_did(did).unwrap();
+
+    assert!(
+        recovery_code_requires_share(did, v2.as_str(), std::slice::from_ref(&v3_bundle)).unwrap(),
+        "a mistyped V2 version symbol that resolves to the stored V3 bundle still needs a share"
+    );
+    assert!(
+        !recovery_code_requires_share(did, v3.as_str(), std::slice::from_ref(&v2_bundle)).unwrap(),
+        "a mistyped V3 version symbol that resolves to the stored V2 bundle needs no share"
+    );
+
+    let mut unsupported = v3.as_str().to_owned();
+    unsupported.replace_range(0..1, "7");
+    assert!(
+        recovery_code_requires_share(
+            did,
+            &unsupported,
+            std::slice::from_ref(&v3_bundle)
+        )
+        .unwrap(),
+        "an unsupported typed version still resolves the stored V3 bundle"
+    );
+    assert!(
+        !recovery_code_requires_share(
+            did,
+            &unsupported,
+            std::slice::from_ref(&v2_bundle)
+        )
+        .unwrap(),
+        "an unsupported typed version still resolves the stored V2 bundle"
+    );
 }
 
 struct Wrapped {
