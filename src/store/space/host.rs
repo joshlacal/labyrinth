@@ -72,6 +72,12 @@ struct State {
     blobs: HashMap<(String, String), StoredBlob>,
     /// Injected `409 ConcurrentWrite` conflict count per `(space, did)`.
     injected_conflicts: HashMap<(String, String), usize>,
+    /// Space refs created through `createSpace`.
+    ///
+    /// Unlike a real PDS, this host still serves and accepts records for a Space that was
+    /// never created; the set only makes `createSpace` answer `SpaceAlreadyExists` the
+    /// second time, as a PDS does.
+    created: BTreeSet<String>,
     /// Host P-256 KEM secret key for HPKE `0xFFFF` Export MAC negotiation.
     kem_secret: atproto_spaces::kem::P256SecretKey,
     tid: u64,
@@ -89,6 +95,7 @@ impl Default for State {
             revoked_members: BTreeSet::new(),
             blobs: HashMap::new(),
             injected_conflicts: HashMap::new(),
+            created: BTreeSet::new(),
             kem_secret,
             tid: 0,
         }
@@ -477,6 +484,14 @@ struct AuthorizeSpaceSyncIn {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSpaceIn {
+    space_type: String,
+    skey: Option<String>,
+    policy: Value,
+}
+
+#[derive(Deserialize)]
 struct PutMembersIn {
     space: String,
     members: Vec<MemberAccess>,
@@ -685,6 +700,32 @@ impl SpaceClient {
             out["spaceRev"] = Value::from(sr);
         }
         ok(out)
+    }
+
+    /// `com.atproto.space.createSpace`: the caller becomes the new Space's authority.
+    fn create_space(&self, payload: &[u8]) -> Reply {
+        let input: CreateSpaceIn = serde_json::from_slice(payload)
+            .map_err(|e| err(400, "InvalidRequest", e.to_string()))?;
+        match input.policy["$type"].as_str() {
+            Some(
+                "com.atproto.personalspace.policy"
+                | "com.atproto.memberspace.policy"
+                | "com.atproto.managedspace.policy",
+            ) => {}
+            _ => return Err(err(400, "UnsupportedPolicy", "unsupported space policy")),
+        }
+        let mut s = self.host.s.lock().unwrap();
+        let skey = match input.skey {
+            Some(skey) => skey,
+            None => s.next_tid(),
+        };
+        let space = atproto_spaces::SpaceUri::new(&self.did, &input.space_type, &skey)
+            .map_err(|_| err(400, "InvalidRequest", "invalid space type or key"))?
+            .raw;
+        if !s.created.insert(space.clone()) {
+            return Err(err(400, "SpaceAlreadyExists", "space already exists"));
+        }
+        ok(serde_json::json!({ "space": space }))
     }
 
     fn put_members(&self, payload: &[u8]) -> Reply {
@@ -1087,6 +1128,7 @@ impl SpaceRpc for SpaceClient {
         }
         match nsid {
             endpoint::APPLY_WRITES => self.apply_writes(payload),
+            endpoint::CREATE_SPACE => self.create_space(payload),
             endpoint::DELETE_RECORD => self.delete_record(payload),
             endpoint::AUTHORIZE_SPACE_SYNC => self.authorize_space_sync(payload),
             endpoint::PUT_MEMBERS => self.put_members(payload),

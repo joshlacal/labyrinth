@@ -52,6 +52,7 @@ pub(super) const MAX_SPACE_CURSOR_BYTES: usize = 1_024;
 /// The Space NSIDs the stores call.
 pub mod endpoint {
     pub const APPLY_WRITES: &str = "com.atproto.space.applyWrites";
+    pub const CREATE_SPACE: &str = "com.atproto.space.createSpace";
     pub const GET_RECORD: &str = "com.atproto.space.getRecord";
     pub const LIST_RECORDS: &str = "com.atproto.space.listRecords";
     pub const LIST_WRITERS: &str = "com.atproto.space.listWriters";
