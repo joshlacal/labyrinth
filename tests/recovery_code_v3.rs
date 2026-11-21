@@ -193,21 +193,11 @@ fn share_preflight_uses_the_backend_matched_version_not_the_typed_version() {
     let mut unsupported = v3.as_str().to_owned();
     unsupported.replace_range(0..1, "7");
     assert!(
-        recovery_code_requires_share(
-            did,
-            &unsupported,
-            std::slice::from_ref(&v3_bundle)
-        )
-        .unwrap(),
+        recovery_code_requires_share(did, &unsupported, std::slice::from_ref(&v3_bundle)).unwrap(),
         "an unsupported typed version still resolves the stored V3 bundle"
     );
     assert!(
-        !recovery_code_requires_share(
-            did,
-            &unsupported,
-            std::slice::from_ref(&v2_bundle)
-        )
-        .unwrap(),
+        !recovery_code_requires_share(did, &unsupported, std::slice::from_ref(&v2_bundle)).unwrap(),
         "an unsupported typed version still resolves the stored V2 bundle"
     );
 }

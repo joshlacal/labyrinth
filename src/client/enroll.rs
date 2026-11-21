@@ -211,11 +211,12 @@ pub fn passkey_recovery_requires_share(
     bundles: &[VirtualDevice],
 ) -> Result<bool> {
     passkey::validate_prf_output(prf_output)?;
-    Ok(select_passkey_bundles(did, prf_output, credential_id, bundles)?
-        .iter()
-        .any(|(_, code)| code.version() == CodeVersion::V3))
+    Ok(
+        select_passkey_bundles(did, prf_output, credential_id, bundles)?
+            .iter()
+            .any(|(_, code)| code.version() == CodeVersion::V3),
+    )
 }
-
 
 struct PreparedRestore {
     vdev: VirtualDevice,

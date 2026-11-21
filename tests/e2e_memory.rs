@@ -676,13 +676,7 @@ fn version_two_passkey_preflight_needs_no_recovery_share_service() {
     let bundles = block_on(w.net.mailbox(ALICE).list_virtual_devices()).unwrap();
 
     assert!(
-        !passkey_recovery_requires_share(
-            ALICE,
-            &[42u8; 32],
-            b"credential-1",
-            &bundles,
-        )
-        .unwrap()
+        !passkey_recovery_requires_share(ALICE, &[42u8; 32], b"credential-1", &bundles,).unwrap()
     );
 }
 
