@@ -222,13 +222,9 @@ fn publish_failure_after_epoch_zero_keeps_the_client() {
         strict_backends(&net, &primary_down, &pub_down),
     ))
     .unwrap();
-    assert_eq!(
-        published,
-        Some(Error::DirectoryIncomplete {
-            pds_present: true,
-            ds_present: false,
-        })
-    );
+    // A PDS-only directory is not proof of supersession, so the publisher's
+    // own failure is reported rather than masked as DirectoryIncomplete.
+    assert_eq!(published, Some(Error::Backend("publisher down".into())));
     assert!(
         block_on(net.ds_directory().latest(ALICE))
             .unwrap()
@@ -333,10 +329,7 @@ fn one_source_or_mismatched_head_never_clears_pending_publication() {
     .unwrap();
     assert_eq!(
         block_on(client.retry_pending_directory_publication()),
-        Err(Error::DirectoryIncomplete {
-            pds_present: true,
-            ds_present: false,
-        })
+        Err(Error::Backend("publisher down".into()))
     );
     assert_eq!(client.pending_directory_epoch(), Some(0));
 
