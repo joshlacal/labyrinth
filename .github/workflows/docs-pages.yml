@@ -64,6 +64,12 @@ jobs:
       - name: Build the API reference
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+          # tangled.org resets HTTP/2 streams partway through a clone
+          # ("curl 92 ... INTERNAL_ERROR"), so have git fetch over HTTP/1.1.
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: http.version
+          GIT_CONFIG_VALUE_0: HTTP/1.1
+          CARGO_NET_RETRY: '5'
         run: cargo doc --no-deps --locked -p labyrinth -p labyrinth-protocol
       - name: Assemble the site
         run: |
