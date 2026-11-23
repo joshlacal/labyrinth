@@ -43,7 +43,7 @@ After the first valid receipt, the conversation durably latches `receipts_requir
 
 ## 2. XRPC surface: `blue.catbird.labyrinth.*`
 
-Exactly six endpoints remain (`PROCEDURES` and `QUERIES` in mls-ds `server/src/handlers/labyrinth/mod.rs`):
+Six directory endpoints remain (`PROCEDURES` and `QUERIES` in mls-ds `server/src/handlers/labyrinth/mod.rs`):
 
 | NSID | Kind | Input → output | Notes |
 |---|---|---|---|
@@ -53,6 +53,11 @@ Exactly six endpoints remain (`PROCEDURES` and `QUERIES` in mls-ds `server/src/h
 | `getMemberDevices` | query | `threadId, did, cursor?, limit?` → `{keyId, signingPublicKey, joinedSeq, removedSeq?}[]` | Complete per-leaf history for one conversation, keyed by the same immutable device key IDs. |
 | `purgeMailbox` | procedure | `{}` → `{}` | Deletes the caller's head chain and raises its floor to the newest deleted epoch. |
 | `deleteAccountData` | procedure | `{}` → `{}` | Account deletion on this DS. It sequences a signed `accountDeletedEntry` in every active conversation this DS sequences for the account, relays the deletion to remote sequencers, prunes the account's application and C33 opening ciphertext, deletes push bindings, and purges the head chain. A DS that cannot sign or relay an owed entry refuses the whole deletion (`SignerUnavailable`, `PeerHomeUnavailable`). |
+
+The same router also serves two later additions, mounted only when `LABYRINTH_ENABLED` is set:
+
+- `getMailboxKeysRecord` fetches a peer's public `blue.catbird.labyrinth.mailboxKeys` record from its PDS and verifies the signed repository proof (CAR and MST inclusion or non-inclusion) instead of trusting the PDS response.
+- The recovery-share endpoints for version-3 recovery codes: `putRecoveryShare`, `getRecoveryShare` (a POST), `deleteRecoveryShare`, `listRecoveryShares`, `listRecoveryShareEvents` and `getRecoveryShareCapabilities`. mls-ds `server/docs/recovery-shares.md` describes how shares are stored and erased.
 
 **Authentication.** Every call is made by an enrolled chat device. Queries carry `actorDeviceId` plus `catbird-labyrinth-read` and `catbird-labyrinth-read-signature`. The signature is Ed25519 by the chat device key over `CATBIRD-LABYRINTH-READ\0` followed by the claim, and the claim covers every wire parameter. Procedures carry `catbird-labyrinth-write` and `catbird-labyrinth-write-signature`, signed over `CATBIRD-LABYRINTH-WRITE\0` (catbird-mls `src/labyrinth/write_auth.rs`). Operation ids are idempotent for 7 days (`labyrinth.operations`). The read-header golden vector `tests/vectors/labyrinth_read_header.json` is byte-identical to the copy mls-ds pins (`server/tests/fixtures/labyrinth_read_header.json`, tested in `server/src/labyrinth/read_auth.rs`); no test in this crate reads it.
 
