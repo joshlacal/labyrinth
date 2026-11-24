@@ -17,7 +17,7 @@ Writes go through the account's PDS OAuth session as `com.atproto.space.applyWri
 |---|---|
 | `blue.catbird.labyrinth.mek` | `hex(mekId)` ([CB-21]) |
 | `blue.catbird.labyrinth.batch` | `<16-hex first receipt seq>-<8-hex device tag>-<TID>` |
-| `blue.catbird.labyrinth.redaction` | deterministic original-sender/message key |
+| `blue.catbird.labyrinth.authorRedaction` | deterministic original-sender/message key |
 | `blue.catbird.labyrinth.attachmentManifest` | deterministic manifest key (SPEC §8) |
 
 Readers list the Space's writers via paginated `com.atproto.space.listWriters` (`#repoWrite` active entries, `#repoRemoved` tombstones) and each active repo's records (`com.atproto.space.listRecords`, sorted ascending by `rkey` client-side). Each device also pins the highest observed `repoRev` per `(spaceUri, authorDid)` in `LBYS` v4 state and fails closed with `Error::WriterRollback` if a Space host ever serves an older writer revision on `listWriters`, `listSpaces`, or `getRepo`. The production store attaches no server order, so the history merge sees batches in listing order: by writer DID, then by rkey.
@@ -122,7 +122,7 @@ Peer epoch pins are per-device, not recovered account state. A restored device r
 
 ## Deletion and cleanup
 
-- **Unsend** writes a separate immutable `blue.catbird.labyrinth.redaction` record under the author's deterministic message key. It never rewrites or empties the source batch. Listing, leave and account-cleanup inventory retain the redaction, so concurrent writes and retries cannot resurrect the ciphertext.
+- **Unsend** writes a separate immutable `blue.catbird.labyrinth.authorRedaction` record under the author's deterministic message key. It never rewrites or empties the source batch. Listing, leave and account-cleanup inventory retain the redaction, so concurrent writes and retries cannot resurrect the ciphertext.
 - **Leave** (`rearchive_before_leave`) copies what reading accepts, including the original-sender attestation and applied redactions, into owner batches, and copies the account's attachment manifests into the personal mailbox Space. For each message already in the account's owner archive that a verified author redaction now hides, it writes an owner tombstone. Leave deletes nothing from the conversation Space: the account's MEK, batch, redaction and attachment-manifest records stay, because they may be the only copy that remaining members can restore from.
 - **Account cleanup** inventories conversation Spaces from saved pins and the owner's paginated `listSpaces`, including more than one page, records written by other devices and conversations already left. It deletes only the signed-in account's erasable records and retains redaction evidence required by peers. Before local erasure, the app saves placement, pins and required cleanup in a durable deletion journal. An unreachable required host leaves cleanup pending.
 - **Close.** catbird-mls's terminal close erases the conversation's archive queue, retained evidence and staged C33 opening with its MLS state. Nothing is archived or rescued afterwards; local message rows stay unsendable.

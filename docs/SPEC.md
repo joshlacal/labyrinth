@@ -456,7 +456,7 @@ Decision J1 defaults (`src/deletion.rs`, `src/client/delete.rs`):
 | Operation | Mechanism | Who sees what |
 |---|---|---|
 | **Delete for me** (`delete_for_me`) | an owner-mode v5 tombstone (§7.1, kind `0x01`) in the reader's personal mailbox Space, with the target's `messageId`, `timestamp`, and optional author DID | every device of the account hides matching messages (`ThreadHistory::deleted_for_me`); author-scoped tombstones match attributed sender and attributed owner copies of that author without hiding another sender's copy |
-| **Unsend** (`unsend`) | an immutable `blue.catbird.labyrinth.redaction` record at the deterministic author/message key, carrying the author's signed redaction; the source `batch` and its ciphertext are never rewritten | readers apply the redaction to every sender, witness and owner copy with the same authenticated original-sender identity. Repeated/concurrent writes converge, and Space inventory, leave and account cleanup retain the record |
+| **Unsend** (`unsend`) | an immutable `blue.catbird.labyrinth.authorRedaction` record at the deterministic author/message key, carrying the author's signed redaction; the source `batch` and its ciphertext are never rewritten | readers apply the redaction to every sender, witness and owner copy with the same authenticated original-sender identity. Repeated/concurrent writes converge, and Space inventory, leave and account cleanup retain the record |
 | **Account deletion** (sequencer evidence) | when an account deletes its chat identity, the sequencer DS sequences a signed `accountDeletedEntry` in each affected conversation (v2 authority: `catbird-mls-account-deletion-authority-v2\0`, length-prefixed key ID, then the complete `catbird-mls-account-deletion-v1\0` record). mls-ds never writes a DS redaction record | readers verify the entry under the exact retained `{sequencerDid}#mls-receipt-N` method it names, then hide every copy attributed to the deleted account unless its receipt orders it after the deletion; a copy without a receipt is hidden; missing or mismatched keys fail closed |
 | **Account deletion** (`purge_account`) | retain the deletion/redaction evidence needed by peers, delete the account's own conversation records, retract directory heads (`PdsPublisher` + mls-ds), and `purge_mailbox` on the personal mailbox Space | local state and personal mailbox records are wiped; peers keep durable evidence that the user's messages are removed |
 | **Edit** | frame level: a new message referencing the old id in the chat frame schema | Labyrinth stores both; the client applies the edit |
@@ -489,7 +489,7 @@ Every record is a `blue.catbird.labyrinth.*` lexicon in `lexicons/blue/catbird/l
 | `mailboxKeys` | **public** PDS repo | `self`, plus `<12-digit epochNumber>` per epoch | `self` updated on rotation; per-epoch copies immutable ([CB-19], [CB-29]) |
 | `mek` | conversation Space, sender's repo | `hex(mekId)` | immutable ([CB-21]) |
 | `batch` | conversation Space, sender's repo | `<16-hex-first-seq>-<tid>` (or TID when unstamped) | immutable and append-only (`Gate 4`, [CB-15]) |
-| `redaction` | conversation Space, author's repo | deterministic original-sender/message key | immutable author unsend ([CB-38]) |
+| `authorRedaction` | conversation Space, author's repo | deterministic original-sender/message key | immutable author unsend ([CB-38]) |
 
 Every `epochNumber` is bounded at 2⁴⁰. `mek#labyrinthSender` embeds the sender's full `epochPublic` (including `membersHash`, `self_sig`, and [CB-18] `attestation`).
 

@@ -1,0 +1,20 @@
+[book]
+title = "Labyrinth for Catbird"
+description = "Encrypted, recoverable chat history for Catbird's MLS chat on AT Protocol: an implementation of Meta's Labyrinth 1.1 protocol."
+authors = ["Josh LaCalamito"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../../target/book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/joshlacal/labyrinth"
+edit-url-template = "https://github.com/joshlacal/labyrinth/edit/main/docs/book/{path}"
+site-url = "/labyrinth/"
+no-section-label = false
+
+[output.html.search]
+enable = true
+
