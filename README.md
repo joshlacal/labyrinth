@@ -2,6 +2,10 @@
 
 A Rust implementation of Meta's **Labyrinth 1.1** encrypted message-history storage protocol, adapted for Catbird's MLS chat on atproto (the "Catbird profile").
 
+## Documentation
+
+Rust API documentation: <https://joshlacal.github.io/labyrinth/> (rustdoc, rebuilt from `main`; start at `labyrinth`).
+
 MLS keeps chat messages end-to-end encrypted in transit, but it does not give a new or restored device the conversation's history. Labyrinth adds an encrypted per-account *mailbox* of key material (devices, epochs, recovery bundles) and an encrypted archive of messages that only the account's enrolled devices, or a recovery code, can open. Both live in atproto Spaces, which see only ciphertext: the mailbox in the account's personal Space, and history in each conversation's Space. Catbird's `mls-ds` delivery service stores no Labyrinth content. It is only the directory and sequencer (`docs/MLSDS_BACKEND.md`).
 
 **Status: pre-GA draft.** Nothing here has been audited, the wire formats and lexicons may still change, and the crate is not published. Do not rely on it to protect real data yet. The bookmark `clean-slate-2026-10-31` holds R0 (`6462096a`). The Task 4 archive work on top of it (latest reviewed cut `276c0972`) is unsealed. Its independent R3 review failed, and Fix Round 4 is in progress; see `docs/SPACE_CONVERSATIONS.md` and `docs/DECISIONS.md`.
