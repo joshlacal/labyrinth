@@ -446,7 +446,7 @@ pub trait SpaceRpc: MaybeSend + MaybeSync {
     }
 }
 
-/// A Space reference, `at://{spaceDid}/space/{spaceType}/{skey}`.
+/// A Space reference, `at:space/{spaceDid}/{spaceType}/{skey}`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SpaceRef {
     pub space_did: String,
@@ -464,7 +464,7 @@ impl SpaceRef {
         }
     }
 
-    /// Conversation Space `at://{authority_did}/space/blue.catbird.labyrinth.conversation/{skey}`.
+    /// Conversation Space `at:space/{authority_did}/blue.catbird.labyrinth.conversation/{skey}`.
     pub fn conversation(authority_did: &str, skey: &str) -> Self {
         Self {
             space_did: authority_did.to_owned(),
@@ -473,7 +473,7 @@ impl SpaceRef {
         }
     }
 
-    /// Parses the canonical `at://{did}/space/{type}/{skey}` form via
+    /// Parses the canonical `at:space/{did}/{type}/{skey}` form via
     /// [`atproto_spaces::SpaceUri::parse`]; a record URI inside a Space is refused.
     pub fn parse(s: &str) -> Result<Self> {
         atproto_spaces::SpaceUri::parse(s)
@@ -481,9 +481,9 @@ impl SpaceRef {
             .map_err(|_| Error::Malformed("space ref"))
     }
 
-    /// Parses canonical `at://{did}/space/{type}/{skey}` or hedged
-    /// `at:space/{did}/{type}/{skey}` / `at://space/{did}/{type}/{skey}` via
-    /// [`atproto_spaces::SpaceUri::parse_hedged`].
+    /// Parses canonical `at:space/{did}/{type}/{skey}` or, leniently for values read back from
+    /// storage, the alpha `at://{did}/space/{type}/{skey}` form via
+    /// [`atproto_spaces::SpaceUri::parse_hedged`] (TODO: remove before beta).
     pub fn parse_hedged(s: &str) -> Result<Self> {
         atproto_spaces::SpaceUri::parse_hedged(s)
             .map(Self::from)
@@ -514,7 +514,7 @@ impl core::fmt::Display for SpaceRef {
         } else {
             write!(
                 f,
-                "at://{}/space/{}/{}",
+                "at:space/{}/{}/{}",
                 self.space_did, self.space_type, self.skey
             )
         }

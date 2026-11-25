@@ -167,7 +167,7 @@ fn make_space_client(
         }],
     );
     let mb_space = SpaceRef::parse(&format!(
-        "at://{did}/space/blue.catbird.labyrinth.mailbox/self"
+        "at:space/{did}/blue.catbird.labyrinth.mailbox/self"
     ))
     .unwrap();
     let mailbox = SpaceMailboxStore::new(host.client(did), mb_space, did.to_owned())
@@ -196,7 +196,7 @@ fn restore_space_client(
 ) -> Labyrinth {
     let t = transport(seed);
     let mb_space = SpaceRef::parse(&format!(
-        "at://{did}/space/blue.catbird.labyrinth.mailbox/self"
+        "at:space/{did}/blue.catbird.labyrinth.mailbox/self"
     ))
     .unwrap();
     let mailbox = SpaceMailboxStore::new(host.client(did), mb_space, did.to_owned())
@@ -395,7 +395,7 @@ fn fault_line_3_clear_squatted_epoch_in_space_mailbox_and_safety_guards() {
     let net = MemoryBackend::new();
     let host = MemorySpaceHost::new();
     let convo_space = SpaceRef::parse(&format!(
-        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+        "at:space/{SEQUENCER_DID}/blue.catbird.labyrinth.conversation/{CONVO_ID}"
     ))
     .unwrap();
     host.grant_space_member(&convo_space, ALICE_DID);
@@ -410,7 +410,7 @@ fn fault_line_3_clear_squatted_epoch_in_space_mailbox_and_safety_guards() {
     let laptop_t = transport(2);
     net.register_chat_device(ALICE_DID, laptop_t.transport_public_key());
     let mb_space = SpaceRef::parse(&format!(
-        "at://{ALICE_DID}/space/blue.catbird.labyrinth.mailbox/self"
+        "at:space/{ALICE_DID}/blue.catbird.labyrinth.mailbox/self"
     ))
     .unwrap();
     let laptop_backends = Backends {
@@ -858,7 +858,7 @@ fn fault_line_5_and_2_owner_v5_attribution_receipts_rearchive_dedupe_and_tombsto
     let (seq_sk, seq_rk) = sequencer_keys();
 
     let convo_space = SpaceRef::parse(&format!(
-        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+        "at:space/{SEQUENCER_DID}/blue.catbird.labyrinth.conversation/{CONVO_ID}"
     ))
     .unwrap();
     host.grant_space_member(&convo_space, ALICE_DID);
@@ -1107,12 +1107,12 @@ fn fault_line_3_directory_incomplete_and_chunked_concurrent_delete_and_otc_squat
     let net = MemoryBackend::new();
     let host = MemorySpaceHost::new();
     let convo_space = SpaceRef::parse(&format!(
-        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+        "at:space/{SEQUENCER_DID}/blue.catbird.labyrinth.conversation/{CONVO_ID}"
     ))
     .unwrap();
     host.grant_space_member(&convo_space, ALICE_DID);
     let mb_space = SpaceRef::parse(&format!(
-        "at://{ALICE_DID}/space/blue.catbird.labyrinth.mailbox/self"
+        "at:space/{ALICE_DID}/blue.catbird.labyrinth.mailbox/self"
     ))
     .unwrap();
 

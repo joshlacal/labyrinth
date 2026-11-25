@@ -107,6 +107,25 @@ pub struct CircleOwnerState {
     pub updated_at: String,
 }
 
+/// Lenient read of a Space URI stored during the alpha: old-form `at://{did}/space/{rest}` ->
+/// `at:space/{did}/{rest}`; `None` for anything else. Never for request input.
+/// TODO: remove before beta.
+pub fn from_legacy_space_uri(raw: &str) -> Option<String> {
+    let rest = raw.strip_prefix("at://")?;
+    let (authority, tail) = rest.split_once('/')?;
+    let tail = tail.strip_prefix("space/")?;
+    if !authority.starts_with("did:") || tail.is_empty() {
+        return None;
+    }
+    Some(format!("at:space/{authority}/{tail}"))
+}
+
+/// A stored `spaceUri` in the current form (old-form Space URIs rewritten, others unchanged).
+/// TODO: remove before beta.
+fn normalize_space_uri(raw: &str) -> String {
+    from_legacy_space_uri(raw).unwrap_or_else(|| raw.to_owned())
+}
+
 impl CircleOwnerState {
     /// Key used in [`Self::pending_ops`] for a pending Space ACL removal tombstone.
     pub fn acl_tombstone_key(did: &str) -> String {
@@ -263,7 +282,9 @@ impl CircleOwnerState {
         if self.circle_id != other.circle_id {
             return Err(Error::Malformed("circleOwnerState circleId mismatch"));
         }
-        if self.space_uri != other.space_uri {
+        // Devices that wrote during the alpha stored the old `at://{did}/space/...` form.
+        let space_uri = normalize_space_uri(&self.space_uri);
+        if space_uri != normalize_space_uri(&other.space_uri) {
             return Err(Error::Malformed("circleOwnerState spaceUri mismatch"));
         }
 
@@ -375,7 +396,7 @@ impl CircleOwnerState {
 
         Ok(Self {
             circle_id: self.circle_id.clone(),
-            space_uri: self.space_uri.clone(),
+            space_uri,
             current_key_version: self.current_key_version.max(other.current_key_version),
             joined_at_version_by_did,
             pending_ops,
@@ -1030,6 +1051,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err_promoted, Error::Decrypt));
+    }
+
+    #[test]
+    fn circle_owner_state_merge_accepts_alpha_space_uri_and_emits_new_form() {
+        let state = |space_uri: &str| CircleOwnerState {
+            circle_id: "circle-uri".to_owned(),
+            space_uri: space_uri.to_owned(),
+            current_key_version: 1,
+            joined_at_version_by_did: BTreeMap::new(),
+            pending_ops: BTreeMap::new(),
+            updated_at: "2026-11-15T10:00:00.000Z".to_owned(),
+        };
+        let old = state("at://did:plc:alice0000000000000000000/space/blue.catbird.circles.circle/c1");
+        let new = state("at:space/did:plc:alice0000000000000000000/blue.catbird.circles.circle/c1");
+        for merged in [old.merge(&new).unwrap(), new.merge(&old).unwrap(), old.merge(&old).unwrap()] {
+            assert_eq!(merged.space_uri, new.space_uri);
+        }
+        let other = state("at:space/did:plc:alice0000000000000000000/blue.catbird.circles.circle/c2");
+        assert!(old.merge(&other).is_err());
     }
 
     #[test]

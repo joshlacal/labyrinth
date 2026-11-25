@@ -74,7 +74,7 @@ fn space_backends(
     convo_space: &SpaceRef,
 ) -> Backends {
     let mb_space = SpaceRef::parse(&format!(
-        "at://{did}/space/blue.catbird.labyrinth.mailbox/self"
+        "at:space/{did}/blue.catbird.labyrinth.mailbox/self"
     ))
     .unwrap();
     let mailbox = SpaceMailboxStore::new(host.client(did), mb_space, did.to_owned())
@@ -219,7 +219,7 @@ fn gate1_receipt_commitment_accepts_genuine_and_rejects_substitution() {
     net.set_sequencer_receipt_key(CONVO_ID, seq_rk);
 
     let convo_space = SpaceRef::parse(&format!(
-        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+        "at:space/{SEQUENCER_DID}/blue.catbird.labyrinth.conversation/{CONVO_ID}"
     ))
     .unwrap();
 
@@ -341,7 +341,7 @@ fn gate1_receipt_commitment_accepts_genuine_and_rejects_substitution() {
         .expect("create recovery code");
     owner_net.register_chat_device(ALICE_DID, transport(9).transport_public_key());
     let mailbox_space = SpaceRef::parse(&format!(
-        "at://{ALICE_DID}/space/blue.catbird.labyrinth.mailbox/self",
+        "at:space/{ALICE_DID}/blue.catbird.labyrinth.mailbox/self",
     ))
     .unwrap();
     let lookups = Arc::new(AtomicUsize::new(0));
@@ -490,7 +490,7 @@ fn gate14_nonmember_space_repo_is_ignored_by_independent_mls_roster() {
     let (sequencer, receipt_key) = sequencer_keys();
     net.set_sequencer_receipt_key(CONVO_ID, receipt_key);
     let convo_space = SpaceRef::parse(&format!(
-        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+        "at:space/{SEQUENCER_DID}/blue.catbird.labyrinth.conversation/{CONVO_ID}"
     ))
     .unwrap();
     host.grant_space_member(&convo_space, ALICE_DID);
@@ -575,7 +575,7 @@ fn receipt_rotation_retains_exact_keys_across_directory_removal_and_restart() {
     let net = MemoryBackend::new();
     let host = MemorySpaceHost::new();
     let convo_space = SpaceRef::parse(&format!(
-        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+        "at:space/{SEQUENCER_DID}/blue.catbird.labyrinth.conversation/{CONVO_ID}"
     ))
     .unwrap();
     let (key1, public1) = sequencer_keys();

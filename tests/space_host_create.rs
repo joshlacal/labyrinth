@@ -30,7 +30,7 @@ fn create_space_makes_the_caller_the_authority_and_refuses_a_second_create() {
     let created = create(&host, personal_mailbox()).expect("first create succeeds");
     assert_eq!(
         created,
-        json!({ "space": format!("at://{ALICE}/space/{MAILBOX_SPACE_TYPE}/{MAILBOX_SKEY}") })
+        json!({ "space": format!("at:space/{ALICE}/{MAILBOX_SPACE_TYPE}/{MAILBOX_SKEY}") })
     );
 
     assert_eq!(

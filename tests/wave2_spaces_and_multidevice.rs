@@ -284,7 +284,7 @@ fn nov12_list_writers_memberspace_authorize_mac_and_star_end_to_end() {
             .unwrap();
     assert_eq!(
         circle_space.to_string(),
-        "at://did:plc:alice/space/blue.catbird.circles.circle/close-friends"
+        "at:space/did:plc:alice/blue.catbird.circles.circle/close-friends"
     );
 
     // Batched memberspace ACL management + authorizeSpaceSync.
@@ -782,7 +782,7 @@ fn encrypted_circle_owner_state_cas_monotonic_join_version_and_acl_tombstone_dom
     let mut tablet = h.enroll_sibling(&mut phone, ALICE, 2, h.backends(ALICE, 2));
 
     let circle_id = "circle-close-friends";
-    let space_uri = "at://did:plc:alice/space/blue.catbird.circles.circle/circle-close-friends";
+    let space_uri = "at:space/did:plc:alice/blue.catbird.circles.circle/circle-close-friends";
     let initial = CircleOwnerState {
         circle_id: circle_id.to_owned(),
         space_uri: space_uri.to_owned(),
@@ -1383,7 +1383,7 @@ fn versioned_circle_owner_state_create_cas_eliminates_toctou_and_preserves_acl_t
     let hook_armed_cl = hook_armed.clone();
 
     let circle_id = "550e8400-e29b-41d4-a716-446655440000";
-    let space_uri = format!("at://{ALICE}/space/blue.catbird.circles.circle/{circle_id}");
+    let space_uri = format!("at:space/{ALICE}/blue.catbird.circles.circle/{circle_id}");
 
     // Seed initial state v1 on phone.
     let initial = CircleOwnerState {

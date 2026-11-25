@@ -50,7 +50,7 @@ fn gate3_concurrent_e_to_e_plus_1_atomic_conflict_leaves_zero_orphans() {
     let net = MemoryBackend::new();
     let host = MemorySpaceHost::new();
     let mb_space = SpaceRef::parse(&format!(
-        "at://{DID}/space/blue.catbird.labyrinth.mailbox/self"
+        "at:space/{DID}/blue.catbird.labyrinth.mailbox/self"
     ))
     .unwrap();
 

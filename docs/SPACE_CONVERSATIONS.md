@@ -6,7 +6,7 @@ Labyrinth encrypts chat history before storage. Each conversation has one atprot
 
 ## Storage and identity
 
-A conversation's Space is `at://{sequencerDid}/space/blue.catbird.labyrinth.conversation/{conversationId}-{generation}`. In production the sequencer creates it under the membership policy derived from authenticated MLS membership; only current members receive conversation-Space credentials. An open-app or owner-only policy is a development fixture, never the production membership contract. Clients do not infer membership from repository visibility and never create an open production conversation Space.
+A conversation's Space is `at:space/{sequencerDid}/blue.catbird.labyrinth.conversation/{conversationId}-{generation}`. In production the sequencer creates it under the membership policy derived from authenticated MLS membership; only current members receive conversation-Space credentials. An open-app or owner-only policy is a development fixture, never the production membership contract. Clients do not infer membership from repository visibility and never create an open production conversation Space.
 
 catbird-mls pins the Space per account as a `ThreadPlacement` (`{space, generation}`) under `native.placements:threads:{did}` in the encrypted account database:
 - Before every flush, rescue or restore, `pin_native_conversation` re-derives the pin from the authenticated local conversation row. It refuses a Space whose authority differs from the conversation's pinned `sequencerDid`.
@@ -24,7 +24,7 @@ Readers list the Space's writers via paginated `com.atproto.space.listWriters` (
 
 ### Personal mailbox Space state records
 
-In addition to `device`, `epoch`, `epochMember`, `virtualDevice`, `otcSession`, `ownerBatch`, and `attachmentManifest`, the personal mailbox Space (`at://<did>/space/blue.catbird.labyrinth.mailbox/self`) stores two encrypted multi-device state collections sealed with PADMÉ + `AES-256-DNDK-GCM` under domain-separated keys derived from the mailbox epoch root and AAD-bound to `(did, collection, rkey, epoch)`:
+In addition to `device`, `epoch`, `epochMember`, `virtualDevice`, `otcSession`, `ownerBatch`, and `attachmentManifest`, the personal mailbox Space (`at:space/<did>/blue.catbird.labyrinth.mailbox/self`) stores two encrypted multi-device state collections sealed with PADMÉ + `AES-256-DNDK-GCM` under domain-separated keys derived from the mailbox epoch root and AAD-bound to `(did, collection, rkey, epoch)`:
 - `blue.catbird.labyrinth.readState` (`rkey = <conversationId>`): `{ conversationId, readThroughSeq, updatedAt }`, synchronized monotonically across sibling devices via `MAX(readThroughSeq)` CRDT + optimistic CAS (`Labyrinth::advance_read_state`).
 - `blue.catbird.labyrinth.circleOwnerState` (`rkey = <circleId>`): `{ circleId, spaceUri, currentKeyVersion, joinedAtVersionByDid, pendingOps, updatedAt }`, updated via `#create` / CID-checked CAS (`Labyrinth::merge_circle_owner_state`), enforcing `joinedAtVersion = MAX` and `__acl__:<did>` removal-tombstone dominance until ACL removal completes (`Labyrinth::clear_circle_acl_tombstone`).
 

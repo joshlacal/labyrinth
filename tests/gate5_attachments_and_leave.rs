@@ -64,7 +64,7 @@ fn make_client(
         }],
     );
     let mb_space = SpaceRef::parse(&format!(
-        "at://{did}/space/blue.catbird.labyrinth.mailbox/self"
+        "at:space/{did}/blue.catbird.labyrinth.mailbox/self"
     ))
     .unwrap();
     let mailbox = SpaceMailboxStore::new(host.client(did), mb_space, did.to_owned())
@@ -91,7 +91,7 @@ fn gate5_attachments_redact_siblings_intact_and_rearchive_before_leave() {
     net.set_sequencer_receipt_key(CONVO_ID, seq_rk);
 
     let convo_space = SpaceRef::parse(&format!(
-        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+        "at:space/{SEQUENCER_DID}/blue.catbird.labyrinth.conversation/{CONVO_ID}"
     ))
     .unwrap();
     // Grant Alice and Bob Space read membership on the reference host.
@@ -243,7 +243,7 @@ fn gate5_attachments_redact_siblings_intact_and_rearchive_before_leave() {
     );
 
     let alice_mb_space = SpaceRef::parse(&format!(
-        "at://{ALICE_DID}/space/blue.catbird.labyrinth.mailbox/self"
+        "at:space/{ALICE_DID}/blue.catbird.labyrinth.mailbox/self"
     ))
     .unwrap();
     let alice_mb =
@@ -273,7 +273,7 @@ fn concurrent_unsends_are_independent_and_cleanup_retains_durable_redactions() {
     let net = MemoryBackend::new();
     let host = MemorySpaceHost::new();
     let convo_space = SpaceRef::parse(&format!(
-        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+        "at:space/{SEQUENCER_DID}/blue.catbird.labyrinth.conversation/{CONVO_ID}"
     ))
     .unwrap();
     host.grant_space_member(&convo_space, ALICE_DID);
@@ -347,7 +347,7 @@ fn leave_tombstones_owner_copies_of_messages_unsent_in_the_space() {
     let (seq_sk, seq_rk) = sequencer_keys();
     net.set_sequencer_receipt_key(CONVO_ID, seq_rk);
     let convo_space = SpaceRef::parse(&format!(
-        "at://{SEQUENCER_DID}/space/blue.catbird.labyrinth.conversation/{CONVO_ID}"
+        "at:space/{SEQUENCER_DID}/blue.catbird.labyrinth.conversation/{CONVO_ID}"
     ))
     .unwrap();
     host.grant_space_member(&convo_space, ALICE_DID);

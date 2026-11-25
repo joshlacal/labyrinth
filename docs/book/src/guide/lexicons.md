@@ -6,7 +6,7 @@ Labyrinth's records are defined as AT Protocol lexicons under `lexicons/blue/cat
 
 | Lexicon | Space |
 |---|---|
-| `blue.catbird.labyrinth.mailbox` | The personal mailbox Space type: `at://<did>/space/blue.catbird.labyrinth.mailbox/self` |
+| `blue.catbird.labyrinth.mailbox` | The personal mailbox Space type: `at:space/<did>/blue.catbird.labyrinth.mailbox/self` |
 | `blue.catbird.labyrinth.conversation` | The conversation Space type: one per conversation generation, under the sequencer's DID |
 | `blue.catbird.labyrinth.conversationPolicy` | The policy object a conversation Space carries |
 
