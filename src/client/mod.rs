@@ -220,7 +220,7 @@ impl Labyrinth {
         ] {
             for ((space, author), rev) in source {
                 crate::store::validate_writer_rev_floor(&space, &author, &rev)?;
-                let key = (space, author);
+                let key = (crate::store::canonical_writer_floor_space(&space), author);
                 match writer_floors.get(&key) {
                     Some(cur) if cur.as_str() >= rev.as_str() => {}
                     Some(_) => {
@@ -328,7 +328,10 @@ impl Labyrinth {
         ] {
             for ((space, author), offered) in source {
                 crate::store::validate_writer_rev_floor(&space, &author, &offered)?;
-                let key = (space.clone(), author.clone());
+                let key = (
+                    crate::store::canonical_writer_floor_space(&space),
+                    author.clone(),
+                );
                 match merged.get(&key) {
                     Some(pinned) if offered.as_str() < pinned.as_str() => {
                         return Err(Error::WriterRollback {
@@ -489,7 +492,10 @@ impl Labyrinth {
     /// previously pinned revision for `(space, author)`.
     pub fn observe_writer_rev(&mut self, space: &str, author: &str, rev: &str) -> Result<()> {
         crate::store::validate_writer_rev_floor(space, author, rev)?;
-        let key = (space.to_owned(), author.to_owned());
+        let key = (
+            crate::store::canonical_writer_floor_space(space),
+            author.to_owned(),
+        );
         if let Some(pinned) = self.writer_floors.get(&key) {
             if rev < pinned.as_str() {
                 return Err(Error::WriterRollback {

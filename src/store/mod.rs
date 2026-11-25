@@ -87,6 +87,55 @@ pub fn validate_writer_rev_floor(space: &str, author: &str, offered_rev: &str) -
     Ok(())
 }
 
+/// The canonical `at:space/...` spelling of a writer-floor Space key.
+///
+/// Floors persisted before the `at:space/` migration are keyed by the alpha
+/// `at://{did}/space/...` form; lookups use the canonical form, so every floor
+/// key is normalized before it is stored or looked up. A value that does not
+/// parse is returned unchanged (validation rejects it separately).
+pub fn canonical_writer_floor_space(space: &str) -> String {
+    atproto_spaces::SpaceUri::parse_hedged(space)
+        .map(|uri| uri.as_str().to_owned())
+        .unwrap_or_else(|_| space.to_owned())
+}
+
+/// Insert `(space, author) -> rev` into `floors` under the canonical Space key,
+/// keeping the maximum revision when both spellings of one Space are present.
+/// Returns `false` (and inserts nothing) when the key is new and `floors`
+/// already holds `MAX_WRITER_FLOOR_ENTRIES` entries.
+pub fn merge_writer_floor_max(
+    floors: &mut BTreeMap<(String, String), String>,
+    space: &str,
+    author: &str,
+    rev: &str,
+) -> bool {
+    let key = (canonical_writer_floor_space(space), author.to_owned());
+    match floors.get(&key) {
+        Some(cur) if cur.as_str() >= rev => true,
+        Some(_) => {
+            floors.insert(key, rev.to_owned());
+            true
+        }
+        None if floors.len() < MAX_WRITER_FLOOR_ENTRIES => {
+            floors.insert(key, rev.to_owned());
+            true
+        }
+        None => false,
+    }
+}
+
+/// Normalize every key of a writer-floor table to the canonical `at:space/`
+/// form, keeping the maximum revision on collisions.
+pub fn normalize_writer_floors(
+    floors: &BTreeMap<(String, String), String>,
+) -> BTreeMap<(String, String), String> {
+    let mut out = BTreeMap::new();
+    for ((space, author), rev) in floors {
+        merge_writer_floor_max(&mut out, space, author, rev);
+    }
+    out
+}
+
 /// Validate `(collection, logical_id, version)` for monotonic owner-state CAS floors.
 pub fn validate_owner_state_version_floor(
     collection: &str,
