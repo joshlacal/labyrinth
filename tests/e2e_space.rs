@@ -626,9 +626,13 @@ fn space_ref_round_trips() {
         r
     );
     assert_eq!(
-        SpaceRef::parse_hedged("at://space/did:plc:alice/blue.catbird.labyrinth.mailbox/self")
+        SpaceRef::parse_hedged("at://did:plc:alice/space/blue.catbird.labyrinth.mailbox/self")
             .unwrap(),
         r
+    );
+    assert!(
+        SpaceRef::parse_hedged("at://space/did:plc:alice/blue.catbird.labyrinth.mailbox/self")
+            .is_err()
     );
     for bad in [
         "at://did:plc:alice/space/blue.catbird.labyrinth.mailbox/self",
