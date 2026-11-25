@@ -1063,12 +1063,18 @@ mod tests {
             pending_ops: BTreeMap::new(),
             updated_at: "2026-11-15T10:00:00.000Z".to_owned(),
         };
-        let old = state("at://did:plc:alice0000000000000000000/space/blue.catbird.circles.circle/c1");
+        let old =
+            state("at://did:plc:alice0000000000000000000/space/blue.catbird.circles.circle/c1");
         let new = state("at:space/did:plc:alice0000000000000000000/blue.catbird.circles.circle/c1");
-        for merged in [old.merge(&new).unwrap(), new.merge(&old).unwrap(), old.merge(&old).unwrap()] {
+        for merged in [
+            old.merge(&new).unwrap(),
+            new.merge(&old).unwrap(),
+            old.merge(&old).unwrap(),
+        ] {
             assert_eq!(merged.space_uri, new.space_uri);
         }
-        let other = state("at:space/did:plc:alice0000000000000000000/blue.catbird.circles.circle/c2");
+        let other =
+            state("at:space/did:plc:alice0000000000000000000/blue.catbird.circles.circle/c2");
         assert!(old.merge(&other).is_err());
     }
 
