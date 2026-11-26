@@ -611,24 +611,35 @@ fn space_ref_round_trips() {
     let s = r.to_string();
     assert_eq!(
         s,
-        "at://did:plc:alice/space/blue.catbird.labyrinth.mailbox/self"
+        "at:space/did:plc:alice/blue.catbird.labyrinth.mailbox/self"
     );
     assert_eq!(SpaceRef::parse(&s).unwrap(), r);
+    // Alpha-form URIs read back from storage still normalize (TODO: remove before beta).
+    assert_eq!(
+        SpaceRef::parse_hedged("at://did:plc:alice/space/blue.catbird.labyrinth.mailbox/self")
+            .unwrap(),
+        r
+    );
     assert_eq!(
         SpaceRef::parse_hedged("at:space/did:plc:alice/blue.catbird.labyrinth.mailbox/self")
             .unwrap(),
         r
     );
     assert_eq!(
-        SpaceRef::parse_hedged("at://space/did:plc:alice/blue.catbird.labyrinth.mailbox/self")
+        SpaceRef::parse_hedged("at://did:plc:alice/space/blue.catbird.labyrinth.mailbox/self")
             .unwrap(),
         r
     );
+    assert!(
+        SpaceRef::parse_hedged("at://space/did:plc:alice/blue.catbird.labyrinth.mailbox/self")
+            .is_err()
+    );
     for bad in [
+        "at://did:plc:alice/space/blue.catbird.labyrinth.mailbox/self",
         "did:plc:alice/space/x/y",
-        "at://did:plc:alice/space/x",
-        "at://did:plc:alice/space/x/y/did:plc:bob/c/k",
-        "at://alice.test/space/x/y",
+        "at:space/did:plc:alice/x",
+        "at:space/did:plc:alice/x/y/did:plc:bob/c/k",
+        "at:space/alice.test/x/y",
     ] {
         assert!(SpaceRef::parse(bad).is_err(), "{bad}");
     }

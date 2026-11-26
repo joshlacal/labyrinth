@@ -111,8 +111,12 @@ impl WriterRevFloors {
         offered_rev: &str,
     ) -> Result<()> {
         crate::store::validate_writer_rev_floor(space, author, offered_rev)?;
+        let key = (
+            crate::store::canonical_writer_floor_space(space),
+            author.to_owned(),
+        );
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pinned) = guard.get(&(space.to_owned(), author.to_owned()))
+        if let Some(pinned) = guard.get(&key)
             && offered_rev < pinned.as_str()
         {
             return Err(Error::WriterRollback {
@@ -128,7 +132,10 @@ impl WriterRevFloors {
     pub fn observe(&self, space: &str, author: &str, offered_rev: &str) -> Result<()> {
         crate::store::validate_writer_rev_floor(space, author, offered_rev)?;
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (space.to_owned(), author.to_owned());
+        let key = (
+            crate::store::canonical_writer_floor_space(space),
+            author.to_owned(),
+        );
         if let Some(pinned) = guard.get(&key) {
             if offered_rev < pinned.as_str() {
                 return Err(Error::WriterRollback {
@@ -151,37 +158,27 @@ impl WriterRevFloors {
         Ok(())
     }
 
+    /// Raises floors from `floors`, keyed by the canonical `at:space/` form; a legacy
+    /// `at://{did}/space/...` key and its canonical spelling merge to the maximum revision.
     pub fn seed(&self, floors: &BTreeMap<(String, String), String>) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for ((space, author), rev) in floors {
             if crate::store::validate_writer_rev_floor(space, author, rev).is_err() {
                 continue;
             }
-            let key = (space.clone(), author.clone());
-            match guard.get(&key) {
-                Some(cur) if cur.as_str() >= rev.as_str() => {}
-                Some(_) => {
-                    guard.insert(key, rev.clone());
-                }
-                None if guard.len() < crate::store::MAX_WRITER_FLOOR_ENTRIES => {
-                    guard.insert(key, rev.clone());
-                }
-                None => {}
-            }
+            crate::store::merge_writer_floor_max(&mut guard, space, author, rev);
         }
     }
 
+    /// Replaces the table with `floors`, keyed by the canonical `at:space/` form; a legacy
+    /// `at://{did}/space/...` key and its canonical spelling merge to the maximum revision.
     pub fn replace(&self, floors: &BTreeMap<(String, String), String>) {
         let mut next = BTreeMap::new();
         for ((space, author), rev) in floors {
             if crate::store::validate_writer_rev_floor(space, author, rev).is_err() {
                 continue;
             }
-            let key = (space.clone(), author.clone());
-            if next.len() >= crate::store::MAX_WRITER_FLOOR_ENTRIES && !next.contains_key(&key) {
-                continue;
-            }
-            next.insert(key, rev.clone());
+            crate::store::merge_writer_floor_max(&mut next, space, author, rev);
         }
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         *guard = next;
@@ -193,11 +190,12 @@ impl WriterRevFloors {
 
     /// Every author with an authenticated revision floor in `space`.
     pub fn authors_in(&self, space: &str) -> Vec<String> {
+        let space = crate::store::canonical_writer_floor_space(space);
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .keys()
-            .filter(|(s, _)| s == space)
+            .filter(|(s, _)| *s == space)
             .map(|(_, author)| author.clone())
             .collect()
     }
@@ -206,7 +204,10 @@ impl WriterRevFloors {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&(space.to_owned(), author.to_owned()))
+            .get(&(
+                crate::store::canonical_writer_floor_space(space),
+                author.to_owned(),
+            ))
             .cloned()
     }
 }
@@ -446,7 +447,7 @@ pub trait SpaceRpc: MaybeSend + MaybeSync {
     }
 }
 
-/// A Space reference, `at://{spaceDid}/space/{spaceType}/{skey}`.
+/// A Space reference, `at:space/{spaceDid}/{spaceType}/{skey}`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SpaceRef {
     pub space_did: String,
@@ -464,7 +465,7 @@ impl SpaceRef {
         }
     }
 
-    /// Conversation Space `at://{authority_did}/space/blue.catbird.labyrinth.conversation/{skey}`.
+    /// Conversation Space `at:space/{authority_did}/blue.catbird.labyrinth.conversation/{skey}`.
     pub fn conversation(authority_did: &str, skey: &str) -> Self {
         Self {
             space_did: authority_did.to_owned(),
@@ -473,7 +474,7 @@ impl SpaceRef {
         }
     }
 
-    /// Parses the canonical `at://{did}/space/{type}/{skey}` form via
+    /// Parses the canonical `at:space/{did}/{type}/{skey}` form via
     /// [`atproto_spaces::SpaceUri::parse`]; a record URI inside a Space is refused.
     pub fn parse(s: &str) -> Result<Self> {
         atproto_spaces::SpaceUri::parse(s)
@@ -481,9 +482,9 @@ impl SpaceRef {
             .map_err(|_| Error::Malformed("space ref"))
     }
 
-    /// Parses canonical `at://{did}/space/{type}/{skey}` or hedged
-    /// `at:space/{did}/{type}/{skey}` / `at://space/{did}/{type}/{skey}` via
-    /// [`atproto_spaces::SpaceUri::parse_hedged`].
+    /// Parses canonical `at:space/{did}/{type}/{skey}` or, leniently for values read back from
+    /// storage, the alpha `at://{did}/space/{type}/{skey}` form via
+    /// [`atproto_spaces::SpaceUri::parse_hedged`] (TODO: remove before beta).
     pub fn parse_hedged(s: &str) -> Result<Self> {
         atproto_spaces::SpaceUri::parse_hedged(s)
             .map(Self::from)
@@ -514,7 +515,7 @@ impl core::fmt::Display for SpaceRef {
         } else {
             write!(
                 f,
-                "at://{}/space/{}/{}",
+                "at:space/{}/{}/{}",
                 self.space_did, self.space_type, self.skey
             )
         }
@@ -2020,5 +2021,96 @@ mod bounded_tests {
             .err(),
             Some(Error::Malformed("mailbox Space owner"))
         );
+    }
+}
+
+#[cfg(test)]
+mod writer_floor_migration_tests {
+    use super::*;
+
+    const AUTHOR: &str = "did:plc:abcdefghijklmnopqrstuvwx";
+    const OLD_REV: &str = "3kaaaaaaaaaaa";
+    const MID_REV: &str = "3kbbbbbbbbbbb";
+    const NEW_REV: &str = "3kccccccccccc";
+
+    fn spellings() -> (String, String) {
+        let space = SpaceRef::conversation("did:plc:zyxwvutsrqponmlkjihgfedc", "3kzzzzzzzzzzz");
+        let canonical = space.to_string();
+        assert!(canonical.starts_with("at:space/"));
+        let legacy = format!(
+            "at://{}/space/{}/{}",
+            space.space_did, space.space_type, space.skey
+        );
+        (canonical, legacy)
+    }
+
+    fn floors(entries: &[(&str, &str)]) -> BTreeMap<(String, String), String> {
+        entries
+            .iter()
+            .map(|(space, rev)| (((*space).to_owned(), AUTHOR.to_owned()), (*rev).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn legacy_persisted_floor_blocks_rollback_under_canonical_key() {
+        let (canonical, legacy) = spellings();
+        let persisted = floors(&[(legacy.as_str(), MID_REV)]);
+        for restored in [WriterRevFloors::from_map(persisted.clone()), {
+            let f = WriterRevFloors::new();
+            f.seed(&persisted);
+            f
+        }] {
+            let err = restored
+                .check_not_rolled_back(&canonical, AUTHOR, OLD_REV)
+                .unwrap_err();
+            assert!(matches!(err, Error::WriterRollback { .. }), "{err:?}");
+            assert!(matches!(
+                restored.observe(&canonical, AUTHOR, OLD_REV),
+                Err(Error::WriterRollback { .. })
+            ));
+            restored
+                .check_not_rolled_back(&canonical, AUTHOR, MID_REV)
+                .unwrap();
+            assert_eq!(restored.get(&canonical, AUTHOR).as_deref(), Some(MID_REV));
+            assert_eq!(restored.authors_in(&canonical), vec![AUTHOR.to_owned()]);
+            let snapshot = restored.snapshot();
+            assert_eq!(snapshot.len(), 1);
+            assert!(snapshot.contains_key(&(canonical.clone(), AUTHOR.to_owned())));
+        }
+    }
+
+    #[test]
+    fn both_spellings_merge_to_the_maximum_revision() {
+        let (canonical, legacy) = spellings();
+        for (legacy_rev, canonical_rev) in [(NEW_REV, MID_REV), (MID_REV, NEW_REV)] {
+            let persisted = floors(&[
+                (legacy.as_str(), legacy_rev),
+                (canonical.as_str(), canonical_rev),
+            ]);
+            assert_eq!(persisted.len(), 2);
+
+            let normalized = crate::store::normalize_writer_floors(&persisted);
+            assert_eq!(normalized.len(), 1);
+            assert_eq!(
+                normalized.get(&(canonical.clone(), AUTHOR.to_owned())),
+                Some(&NEW_REV.to_owned())
+            );
+
+            let replaced = WriterRevFloors::from_map(persisted.clone());
+            let seeded = WriterRevFloors::new();
+            seeded.seed(&persisted);
+            for restored in [replaced, seeded] {
+                assert_eq!(restored.snapshot(), normalized);
+                for lookup in [&canonical, &legacy] {
+                    assert!(matches!(
+                        restored.check_not_rolled_back(lookup, AUTHOR, MID_REV),
+                        Err(Error::WriterRollback { .. })
+                    ));
+                    restored
+                        .check_not_rolled_back(lookup, AUTHOR, NEW_REV)
+                        .unwrap();
+                }
+            }
+        }
     }
 }

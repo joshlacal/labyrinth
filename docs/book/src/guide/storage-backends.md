@@ -53,7 +53,7 @@ let threads = SpaceThreadStore::new(transport, did);
 
 `transport` implements `SpaceRpc`: `query`, `query_with_headers` and `procedure` for `com.atproto.space.*`, plus Space-scoped blob upload and download. The store handles record keys, writer-revision floors (`WriterRollback`), CID checks and pagination.
 
-`SpaceRef::mailbox(did)` names `at://<did>/space/blue.catbird.labyrinth.mailbox/self`. `SpaceRef::conversation(authority_did, skey)` names a conversation Space, `{conversationId}-{generation}` under the sequencer's DID.
+`SpaceRef::mailbox(did)` names `at:space/<did>/blue.catbird.labyrinth.mailbox/self`. `SpaceRef::conversation(authority_did, skey)` names a conversation Space, `{conversationId}-{generation}` under the sequencer's DID.
 
 ## The memory backend
 

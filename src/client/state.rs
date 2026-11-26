@@ -415,16 +415,20 @@ impl Labyrinth {
         if writer_floor_count > crate::store::MAX_WRITER_FLOOR_ENTRIES {
             return Err(Error::Malformed("state writer revision floor table full"));
         }
-        let mut writer_floors = BTreeMap::new();
+        let mut raw_writer_floors = BTreeMap::new();
         for _ in 0..writer_floor_count {
             let space = r.str()?;
             let author = r.str()?;
             let rev = r.str()?;
             crate::store::validate_writer_rev_floor(&space, &author, &rev)?;
-            if writer_floors.insert((space, author), rev).is_some() {
+            if raw_writer_floors.insert((space, author), rev).is_some() {
                 return Err(Error::Malformed("duplicate state writer revision floor"));
             }
         }
+        // State written before the `at:space/` migration keys floors by the alpha
+        // `at://{did}/space/...` form; readers look floors up by the canonical form, so
+        // re-key them here, keeping the higher revision if both spellings were persisted.
+        let writer_floors = crate::store::normalize_writer_floors(&raw_writer_floors);
         let owner_floor_count = r.count(2 + 2 + 8)?;
         if owner_floor_count > crate::store::MAX_WRITER_FLOOR_ENTRIES {
             return Err(Error::Malformed(

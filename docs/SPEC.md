@@ -27,7 +27,7 @@ Whitepaper page numbers below refer to the v1.1 paper, e.g. "(p.27)". Every plac
 | thread | an MLS conversation (`chat.conversations.conversation_id`) **[CB-2]** |
 | message | an MLS application frame body (opaque bytes) plus `messageId`, `timestamp` |
 | transport signing key | the sending chat device's Ed25519 key, the key `mls-ds` registers in `chat.device_keys` **[CB-3]** |
-| metastore + mailbox server | **ATProto Spaces only** (`I14`, `I15`): `at://<did>/space/blue.catbird.labyrinth.mailbox/self` for the personal mailbox Space and `at://<authority>/space/blue.catbird.labyrinth.conversation/<id>` for conversation Spaces; `mls-ds` serves strictly as directory + sequencer, never a content store (§9) |
+| metastore + mailbox server | **ATProto Spaces only** (`I14`, `I15`): `at:space/<did>/blue.catbird.labyrinth.mailbox/self` for the personal mailbox Space and `at:space/<authority>/blue.catbird.labyrinth.conversation/<id>` for conversation Spaces; `mls-ds` serves strictly as directory + sequencer, never a content store (§9) |
 
 ## 2. Encodings
 

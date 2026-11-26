@@ -1,7 +1,7 @@
 //! Spaces-only conversation thread store (`com.atproto.space.*`, Gates 1 & 5).
 //!
 //! Each conversation maps to a single ATProto Space
-//! (`at://{authorityDid}/space/blue.catbird.labyrinth.conversation/{skey}`).
+//! (`at:space/{authorityDid}/blue.catbird.labyrinth.conversation/{skey}`).
 //! Members write MEK distributions, sender batches
 //! (`<16-hex-first-seq>-<8-hex-device-tag>-<tid>`), and encrypted attachment
 //! manifests directly into their own Space repo. `mls-ds` holds zero long-term
