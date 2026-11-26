@@ -22,7 +22,7 @@ jobs:
       - name: Check out sibling catbird-atproto
         run: |
           git init -q ../catbird-atproto
-          git -C ../catbird-atproto fetch -q --depth 1 https://github.com/joshlacal/catbird-atproto 6bc32e6da7b09b6b577d70eaeab381eaeda9a440
+          git -C ../catbird-atproto fetch -q --depth 1 https://github.com/joshlacal/catbird-atproto 4299c438ff92d13cd554cdf686ca74156c987f84
           git -C ../catbird-atproto checkout -q FETCH_HEAD
       - uses: dtolnay/rust-toolchain@stable
         with:
