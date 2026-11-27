@@ -71,13 +71,13 @@ pub fn is_valid_atproto_tid(s: &str) -> bool {
 pub fn validate_writer_rev_floor(space: &str, author: &str, offered_rev: &str) -> Result<()> {
     if space.is_empty()
         || space.len() > MAX_WRITER_FLOOR_SPACE_LEN
-        || atproto_spaces::SpaceUri::parse_hedged(space).is_err()
+        || space::SpaceRef::parse_hedged(space).is_err()
     {
         return Err(Error::Malformed("invalid writer revision space"));
     }
     if author.is_empty()
         || author.len() > MAX_WRITER_FLOOR_AUTHOR_LEN
-        || !atproto_spaces::is_valid_did(author)
+        || petrel_spaces::Did::parse(author).is_err()
     {
         return Err(Error::Malformed("invalid writer revision author"));
     }
@@ -94,8 +94,8 @@ pub fn validate_writer_rev_floor(space: &str, author: &str, offered_rev: &str) -
 /// key is normalized before it is stored or looked up. A value that does not
 /// parse is returned unchanged (validation rejects it separately).
 pub fn canonical_writer_floor_space(space: &str) -> String {
-    atproto_spaces::SpaceUri::parse_hedged(space)
-        .map(|uri| uri.as_str().to_owned())
+    space::SpaceRef::parse_hedged(space)
+        .map(|uri| uri.to_string())
         .unwrap_or_else(|_| space.to_owned())
 }
 
@@ -144,7 +144,7 @@ pub fn validate_owner_state_version_floor(
 ) -> Result<()> {
     if collection.is_empty()
         || collection.len() > MAX_OWNER_STATE_COLLECTION_LEN
-        || !atproto_spaces::is_valid_nsid(collection)
+        || petrel_spaces::Nsid::parse(collection).is_err()
     {
         return Err(Error::Malformed("invalid owner state collection"));
     }

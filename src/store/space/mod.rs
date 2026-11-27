@@ -4,7 +4,7 @@
 pub mod host;
 pub mod thread;
 
-pub use atproto_spaces;
+pub use petrel_spaces;
 pub use thread::{SequencedSpaceThreadStore, SpaceThreadStore, batch_cid};
 
 use std::collections::BTreeMap;
@@ -475,50 +475,44 @@ impl SpaceRef {
     }
 
     /// Parses the canonical `at:space/{did}/{type}/{skey}` form via
-    /// [`atproto_spaces::SpaceUri::parse`]; a record URI inside a Space is refused.
+    /// [`petrel_spaces::SpaceRef::parse`]; a record URI inside a Space is refused.
     pub fn parse(s: &str) -> Result<Self> {
-        atproto_spaces::SpaceUri::parse(s)
+        petrel_spaces::SpaceRef::parse(s)
             .map(Self::from)
             .map_err(|_| Error::Malformed("space ref"))
     }
 
     /// Parses canonical `at:space/{did}/{type}/{skey}` or, leniently for values read back from
     /// storage, the alpha `at://{did}/space/{type}/{skey}` form via
-    /// [`atproto_spaces::SpaceUri::parse_hedged`] (TODO: remove before beta).
+    /// [`petrel_spaces::AtUri::from_legacy_space_uri`] (TODO: remove before beta).
     pub fn parse_hedged(s: &str) -> Result<Self> {
-        atproto_spaces::SpaceUri::parse_hedged(s)
-            .map(Self::from)
-            .map_err(|_| Error::Malformed("space ref"))
+        let canonical = petrel_spaces::AtUri::from_legacy_space_uri(s);
+        Self::parse(canonical.as_deref().unwrap_or(s))
     }
 
-    /// Converts to a validated [`atproto_spaces::SpaceUri`].
-    pub fn to_space_uri(&self) -> Result<atproto_spaces::SpaceUri> {
-        atproto_spaces::SpaceUri::new(&self.space_did, &self.space_type, &self.skey)
-            .map_err(|_| Error::Malformed("space ref"))
+    /// Converts to a validated [`petrel_spaces::SpaceRef`].
+    pub fn to_space_uri(&self) -> Result<petrel_spaces::SpaceRef> {
+        petrel_spaces::SpaceRef::parse(self.to_string()).map_err(|_| Error::Malformed("space ref"))
     }
 }
 
-impl From<atproto_spaces::SpaceUri> for SpaceRef {
-    fn from(uri: atproto_spaces::SpaceUri) -> Self {
+impl From<petrel_spaces::SpaceRef> for SpaceRef {
+    fn from(uri: petrel_spaces::SpaceRef) -> Self {
         Self {
-            space_did: uri.authority,
-            space_type: uri.space_type,
-            skey: uri.rkey,
+            space_did: uri.space_did().to_string(),
+            space_type: uri.space_type().to_string(),
+            skey: uri.skey().to_string(),
         }
     }
 }
 
 impl core::fmt::Display for SpaceRef {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if let Ok(uri) = self.to_space_uri() {
-            f.write_str(uri.as_str())
-        } else {
-            write!(
-                f,
-                "at:space/{}/{}/{}",
-                self.space_did, self.space_type, self.skey
-            )
-        }
+        write!(
+            f,
+            "at:space/{}/{}/{}",
+            self.space_did, self.space_type, self.skey
+        )
     }
 }
 

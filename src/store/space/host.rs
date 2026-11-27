@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
+use petrel_crypto::P256Keypair;
+use petrel_spaces::{Cid, Did, MacProfile, SpaceMacHeaders, SpaceSetHash, Tid};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::{
     CONVERSATION_SPACE_TYPE, MAX_WRITES, MemberAccess, SpaceError, SpaceRef, SpaceRpc, endpoint,
@@ -79,14 +80,13 @@ struct State {
     /// second time, as a PDS does.
     created: BTreeSet<String>,
     /// Host P-256 KEM secret key for HPKE `0xFFFF` Export MAC negotiation.
-    kem_secret: atproto_spaces::kem::P256SecretKey,
+    kem_secret: P256Keypair,
     tid: u64,
 }
 
 impl Default for State {
     fn default() -> Self {
-        let kem_secret = atproto_spaces::kem::P256SecretKey::from_slice(&[0x42; 32])
-            .expect("valid fixed test P-256 scalar");
+        let kem_secret = P256Keypair::from_raw(&[0x42; 32]).expect("valid fixed test P-256 scalar");
         Self {
             repos: BTreeMap::new(),
             writer_meta: BTreeMap::new(),
@@ -163,22 +163,20 @@ impl State {
     }
 
     fn repo_lthash_digest(&self, space: &str, did: &str) -> [u8; 32] {
-        let mut lt = atproto_spaces::lthash::LtHash::empty();
+        let mut lt = SpaceSetHash::new();
         if let Some(repo) = self.repos.get(&(space.to_owned(), did.to_owned())) {
             for (collection, rkey, val) in repo.values() {
                 let dagcbor = json_to_canonical_dagcbor(val);
-                let rec_cid = atproto_spaces::lthash::compute_dagcbor_cid(&dagcbor);
-                lt.add(&atproto_spaces::lthash::compute_record_element_hash(
-                    collection, rkey, &rec_cid,
-                ));
+                let rec_cid = Cid::for_dag_cbor(&dagcbor);
+                lt.add(&format!("{collection}/{rkey}"), &rec_cid.to_string());
             }
         }
-        lt.commitment()
+        lt.digest()
     }
 }
 
 /// Converts an ATProto JSON `Value` (`$bytes`, `$link`, maps, arrays, scalars)
-/// into canonical DAG-CBOR bytes matching `atproto_spaces::star` rules.
+/// into canonical DAG-CBOR bytes for the record CID and Space set commitment.
 fn json_to_canonical_dagcbor(v: &Value) -> Vec<u8> {
     struct Canonical<'a>(&'a Value);
 
@@ -288,7 +286,7 @@ impl MemorySpaceHost {
     /// Host P-256 `#atproto_kem` `did:key:zDn...` for HPKE `0xFFFF` Export MAC negotiation.
     pub fn kem_did_key(&self) -> String {
         let s = self.s.lock().unwrap();
-        atproto_spaces::kem::encode_p256_did_key(&s.kem_secret.public_key())
+        s.kem_secret.did_key()
     }
 
     /// Grants `did` membership read/write access on `space`.
@@ -441,7 +439,19 @@ fn cid(v: &Value) -> String {
         return cid;
     }
     let dagcbor = json_to_canonical_dagcbor(v);
-    atproto_spaces::lthash::compute_dagcbor_cid(&dagcbor).to_string()
+    Cid::for_dag_cbor(&dagcbor).to_string()
+}
+
+fn invalid_mac(error: impl std::fmt::Display) -> SpaceError {
+    err(400, "InvalidSpaceMac", error.to_string())
+}
+
+fn mac_response_headers(profile: MacProfile, signed: SpaceMacHeaders) -> Vec<(String, String)> {
+    vec![
+        (profile.response_header().into(), signed.covered_signature),
+        ("signature-input".into(), signed.signature_input),
+        ("signature".into(), signed.signature),
+    ]
 }
 
 fn err(status: u16, name: &str, msg: impl Into<String>) -> SpaceError {
@@ -675,7 +685,7 @@ impl SpaceClient {
     fn authorize_space_sync(&self, payload: &[u8]) -> Reply {
         let input: AuthorizeSpaceSyncIn = serde_json::from_slice(payload)
             .map_err(|e| err(400, "InvalidRequest", e.to_string()))?;
-        atproto_spaces::kem::decode_p256_did_key(&input.credential_key)
+        petrel_spaces::kem::decode_p256_did_key(&input.credential_key)
             .map_err(|e| err(400, "InvalidRequest", e.to_string()))?;
         let mut s = self.host.s.lock().unwrap();
         if s.revoked_members
@@ -719,9 +729,12 @@ impl SpaceClient {
             Some(skey) => skey,
             None => s.next_tid(),
         };
-        let space = atproto_spaces::SpaceUri::new(&self.did, &input.space_type, &skey)
-            .map_err(|_| err(400, "InvalidRequest", "invalid space type or key"))?
-            .raw;
+        let space = petrel_spaces::SpaceRef::parse(format!(
+            "at:space/{}/{}/{skey}",
+            self.did, input.space_type
+        ))
+        .map_err(|_| err(400, "InvalidRequest", "invalid space type or key"))?
+        .into_string();
         if !s.created.insert(space.clone()) {
             return Err(err(400, "SpaceAlreadyExists", "space already exists"));
         }
@@ -830,31 +843,23 @@ impl SpaceClient {
         let mut resp_headers = Vec::new();
         if let Some(accept) = req_headers
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(atproto_spaces::mac::ACCEPT_SIGNATURE_HEADER))
+            .find(|(k, _)| k.eq_ignore_ascii_case("accept-signature"))
             .map(|(_, val)| val.as_str())
         {
-            let (label, key_share) = atproto_spaces::mac::parse_accept_signature(
-                accept,
-                atproto_spaces::mac::MacProfile::Record,
+            let request =
+                petrel_spaces::parse_accept_signature_for_profile(accept, MacProfile::Record)
+                    .map_err(invalid_mac)?;
+            let shared = petrel_spaces::decapsulate_p256(
+                &s.kem_secret.export_raw_representation(),
+                request.keyid(),
             )
-            .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
-            let shared = atproto_spaces::kem::decapsulate_p256(&s.kem_secret, &key_share)
-                .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
-            let (mac_headers, _) =
-                atproto_spaces::mac::sign_record_mac(&shared, &key_share, &label, &uri, &cid_str)
-                    .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
-            resp_headers.push((
-                mac_headers.covered_header_name.to_owned(),
-                mac_headers.covered_header,
-            ));
-            resp_headers.push((
-                atproto_spaces::mac::SIGNATURE_INPUT_HEADER.to_owned(),
-                mac_headers.signature_input,
-            ));
-            resp_headers.push((
-                atproto_spaces::mac::SIGNATURE_HEADER.to_owned(),
-                mac_headers.signature,
-            ));
+            .map_err(invalid_mac)?;
+            let record_uri = petrel_spaces::AtUri::parse(&uri).map_err(invalid_mac)?;
+            let record_cid = Cid::parse(&cid_str).map_err(invalid_mac)?;
+            let signed = request
+                .sign_record(&shared, &record_uri, &record_cid)
+                .map_err(invalid_mac)?;
+            resp_headers = mac_response_headers(MacProfile::Record, signed);
         }
         let body =
             serde_json::to_vec(&json!({ "uri": uri, "cid": cid_str, "value": v })).expect("json");
@@ -875,7 +880,7 @@ impl SpaceClient {
             None => s.next_tid(),
         };
         let data = s.repo_lthash_digest(space, repo);
-        let mut entries: Vec<atproto_spaces::star::StarRecordEntry> = r
+        let mut entries: Vec<_> = r
             .values()
             .map(
                 |(collection, rkey, val)| atproto_spaces::star::StarRecordEntry {
@@ -884,39 +889,30 @@ impl SpaceClient {
                 },
             )
             .collect();
-        entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
         let star_bytes = atproto_spaces::star::write_star_repo(space, repo, &rev, &data, &entries)
             .map_err(|e| err(500, "InternalServerError", e.to_string()))?;
-
         let mut resp_headers = Vec::new();
         if let Some(accept) = req_headers
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(atproto_spaces::mac::ACCEPT_SIGNATURE_HEADER))
+            .find(|(k, _)| k.eq_ignore_ascii_case("accept-signature"))
             .map(|(_, val)| val.as_str())
         {
-            let (label, key_share) = atproto_spaces::mac::parse_accept_signature(
-                accept,
-                atproto_spaces::mac::MacProfile::Commit,
+            let request =
+                petrel_spaces::parse_accept_signature_for_profile(accept, MacProfile::Commit)
+                    .map_err(invalid_mac)?;
+            let shared = petrel_spaces::decapsulate_p256(
+                &s.kem_secret.export_raw_representation(),
+                request.keyid(),
             )
-            .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
-            let shared = atproto_spaces::kem::decapsulate_p256(&s.kem_secret, &key_share)
-                .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
-            let (mac_headers, _) = atproto_spaces::mac::sign_commit_mac(
-                &shared, &key_share, &label, space, repo, &rev, &data,
-            )
-            .map_err(|e| err(400, "InvalidSpaceMac", e.to_string()))?;
-            resp_headers.push((
-                mac_headers.covered_header_name.to_owned(),
-                mac_headers.covered_header,
-            ));
-            resp_headers.push((
-                atproto_spaces::mac::SIGNATURE_INPUT_HEADER.to_owned(),
-                mac_headers.signature_input,
-            ));
-            resp_headers.push((
-                atproto_spaces::mac::SIGNATURE_HEADER.to_owned(),
-                mac_headers.signature,
-            ));
+            .map_err(invalid_mac)?;
+            let space = petrel_spaces::parse_space_ref(space).map_err(invalid_mac)?;
+            let repo = Did::parse(repo).map_err(invalid_mac)?;
+            let rev = Tid::parse(rev).map_err(invalid_mac)?;
+            let signed = request
+                .sign_commit(&shared, &space, &repo, &rev, &data)
+                .map_err(invalid_mac)?;
+            resp_headers = mac_response_headers(MacProfile::Commit, signed);
         }
         Ok((resp_headers, star_bytes))
     }
@@ -1143,18 +1139,13 @@ impl SpaceRpc for SpaceClient {
         _mime_type: &str,
     ) -> core::result::Result<String, SpaceError> {
         let mut s = self.host.s.lock().unwrap();
-        let n = s.next_tid();
-        let mut h = Sha256::new();
-        h.update(bytes);
-        h.update(n.as_bytes());
-        let cid = format!("bafkrei{}", hex::encode(&h.finalize()[..20]));
-        s.blobs.insert(
-            (self.did.clone(), cid.clone()),
-            StoredBlob {
+        let cid = Cid::for_raw(bytes).to_string();
+        s.blobs
+            .entry((self.did.clone(), cid.clone()))
+            .or_insert_with(|| StoredBlob {
                 bytes: bytes.to_vec(),
                 visibility: BlobVisibility::Staged,
-            },
-        );
+            });
         Ok(cid)
     }
 

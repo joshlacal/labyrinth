@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use atproto_spaces::star::ParsedStarRepo;
+use petrel_spaces::MacProfile;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -173,20 +175,17 @@ fn extract_single_header<'a>(
     found.ok_or(Error::BadSignature)
 }
 
-fn build_mac_headers(
-    profile: atproto_spaces::mac::MacProfile,
-    headers: &[(String, String)],
-) -> Result<atproto_spaces::mac::SpaceMacResponseHeaders> {
-    let covered_header = extract_single_header(headers, profile.response_header())?.to_owned();
-    let signature_input =
-        extract_single_header(headers, atproto_spaces::mac::SIGNATURE_INPUT_HEADER)?.to_owned();
-    let signature =
-        extract_single_header(headers, atproto_spaces::mac::SIGNATURE_HEADER)?.to_owned();
-    Ok(atproto_spaces::mac::SpaceMacResponseHeaders {
-        covered_header_name: profile.response_header(),
-        covered_header,
-        signature_input,
-        signature,
+struct MacHeaders<'a> {
+    covered: &'a str,
+    input: &'a str,
+    signature: &'a str,
+}
+
+fn mac_headers(profile: MacProfile, headers: &[(String, String)]) -> Result<MacHeaders<'_>> {
+    Ok(MacHeaders {
+        covered: extract_single_header(headers, profile.response_header())?,
+        input: extract_single_header(headers, "signature-input")?,
+        signature: extract_single_header(headers, "signature")?,
     })
 }
 
@@ -509,23 +508,17 @@ impl SpaceThreadStore {
         host_kem_did_key: &str,
     ) -> Result<Option<(String, T)>> {
         let space_str = space.to_string();
-        let enc = atproto_spaces::kem::encapsulate_p256(host_kem_did_key)
+        let enc = petrel_spaces::kem::encapsulate_p256(host_kem_did_key)
             .map_err(|_| Error::BadPublicKey)?;
-        let accept = atproto_spaces::mac::format_accept_signature(
-            atproto_spaces::mac::MacProfile::Record,
-            &enc.key_share_did_key,
-        )
-        .map_err(|_| Error::Malformed("accept-signature"))?;
+        let accept = petrel_spaces::format_accept_signature(MacProfile::Record, &enc.key_share)
+            .map_err(|_| Error::Malformed("accept-signature"))?;
         let p = [
             ("space", space_str.clone()),
             ("repo", repo.to_owned()),
             ("collection", collection.to_owned()),
             ("rkey", rkey.to_owned()),
         ];
-        let req_headers = [(
-            atproto_spaces::mac::ACCEPT_SIGNATURE_HEADER.to_owned(),
-            accept,
-        )];
+        let req_headers = [("accept-signature".to_owned(), accept)];
         match self
             .t
             .query_with_headers(endpoint::GET_RECORD, &p, &req_headers)
@@ -539,18 +532,22 @@ impl SpaceThreadStore {
                     return Err(Error::BadSignature);
                 }
                 let cid = out.cid.ok_or(Error::BadSignature)?;
-                let header_map =
-                    build_mac_headers(atproto_spaces::mac::MacProfile::Record, &resp_headers)?
-                        .to_header_map()
-                        .map_err(|_| Error::BadSignature)?;
-                atproto_spaces::mac::verify_record_mac(
+                let headers = mac_headers(MacProfile::Record, &resp_headers)?;
+                let verified = petrel_spaces::verify_record_mac(
                     &enc.shared_secret,
-                    &enc.key_share_did_key,
-                    &header_map,
-                    &expected_uri,
-                    &cid,
+                    headers.covered,
+                    headers.input,
+                    headers.signature,
                 )
                 .map_err(|_| Error::BadSignature)?;
+                if verified.keyid != enc.key_share
+                    || verified.uri.as_str() != expected_uri
+                    || verified.cid.to_string() != cid
+                {
+                    return Err(Error::BadSignature);
+                }
+                petrel_spaces::verify_record_cid(&out.value, &verified.cid)
+                    .map_err(|_| Error::BadSignature)?;
                 Ok(Some((cid, decode(out.value)?)))
             }
             Err(Error::NotFound("record" | "repo")) => Ok(None),
@@ -564,50 +561,50 @@ impl SpaceThreadStore {
         space_str: &str,
         repo: &str,
         host_kem_did_key: &str,
-    ) -> Result<atproto_spaces::star::ParsedStarRepo> {
-        let enc = atproto_spaces::kem::encapsulate_p256(host_kem_did_key)
+    ) -> Result<ParsedStarRepo> {
+        let enc = petrel_spaces::kem::encapsulate_p256(host_kem_did_key)
             .map_err(|_| Error::BadPublicKey)?;
-        let accept = atproto_spaces::mac::format_accept_signature(
-            atproto_spaces::mac::MacProfile::Commit,
-            &enc.key_share_did_key,
-        )
-        .map_err(|_| Error::Malformed("accept-signature"))?;
+        let accept = petrel_spaces::format_accept_signature(MacProfile::Commit, &enc.key_share)
+            .map_err(|_| Error::Malformed("accept-signature"))?;
         let p = [("space", space_str.to_owned()), ("repo", repo.to_owned())];
-        let req_headers = [(
-            atproto_spaces::mac::ACCEPT_SIGNATURE_HEADER.to_owned(),
-            accept,
-        )];
+        let req_headers = [("accept-signature".to_owned(), accept)];
         let (resp_headers, body) = transport
             .query_with_headers(endpoint::GET_REPO, &p, &req_headers)
             .await
             .map_err(map_member_repo_space_error)?;
-        let header_map = build_mac_headers(atproto_spaces::mac::MacProfile::Commit, &resp_headers)?
-            .to_header_map()
-            .map_err(|_| Error::BadSignature)?;
-        let mut rollback_err: Option<Error> = None;
+        let headers = mac_headers(MacProfile::Commit, &resp_headers)?;
+        let verified = petrel_spaces::verify_commit_mac(
+            &enc.shared_secret,
+            headers.covered,
+            headers.input,
+            headers.signature,
+        )
+        .map_err(|_| Error::BadSignature)?;
+        if verified.keyid != enc.key_share
+            || verified.space.as_str() != space_str
+            || verified.repo.as_str() != repo
+        {
+            return Err(Error::BadSignature);
+        }
+        let mut floor_error = None;
         let parsed =
             atproto_spaces::star::read_star_repo_authenticated(&body, space_str, repo, |meta| {
-                atproto_spaces::mac::verify_commit_mac(
-                    &enc.shared_secret,
-                    &enc.key_share_did_key,
-                    &header_map,
-                    &meta.space,
-                    &meta.repo,
-                    &meta.rev,
-                    &meta.data,
-                )?;
-                if let Err(e) = floors.observe(&meta.space, &meta.repo, &meta.rev) {
-                    rollback_err = Some(e);
+                if meta.rev != verified.rev.as_str() || meta.data != verified.data {
+                    return Err(atproto_spaces::SpacesError::MacMismatch(
+                        "STAR metadata and signed commit differ".into(),
+                    ));
+                }
+                if let Err(error) = floors.observe(space_str, repo, &meta.rev) {
+                    floor_error = Some(error);
                     return Err(atproto_spaces::SpacesError::FutureRev(meta.rev.clone()));
                 }
                 Ok(())
             });
-        if let Some(err) = rollback_err {
-            return Err(err);
+        if let Some(error) = floor_error {
+            return Err(error);
         }
-        parsed.map_err(|e| match e {
-            atproto_spaces::SpacesError::MacMismatch(_)
-            | atproto_spaces::SpacesError::BadSpaceSignature(_) => Error::BadSignature,
+        parsed.map_err(|error| match error {
+            atproto_spaces::SpacesError::MacMismatch(_) => Error::BadSignature,
             _ => Error::Malformed("STAR repository archive"),
         })
     }
@@ -628,14 +625,14 @@ impl SpaceThreadStore {
     }
 
     /// Downloads a writer's repository as a Nov-12 `STAR` v0.2 archive (`com.atproto.space.getRepo`),
-    /// verifying the RFC 9421 + HPKE `0xFFFF` `Atproto-Space-Commit` MAC and `WriterRevFloors`
-    /// BEFORE parsing any record frames, then verifying canonical DAG-CBOR + `LtHash`.
+    /// verifying the commit MAC and rollback floor before reading raw record frames.
+    /// Raw frames let recovery quarantine out-of-range timestamps per author.
     pub async fn get_repo_star_authenticated(
         &self,
         thread_id: &str,
         repo: &str,
         host_kem_did_key: &str,
-    ) -> Result<atproto_spaces::star::ParsedStarRepo> {
+    ) -> Result<ParsedStarRepo> {
         let space = self.space_for(thread_id)?;
         let space_str = space.to_string();
         Self::fetch_repo_star_authenticated_raw(
@@ -835,7 +832,7 @@ impl SpaceThreadStore {
                 WriterUpdate::RepoRemoved {
                     repo, space_rev, ..
                 } => {
-                    if !atproto_spaces::is_valid_did(&repo)
+                    if petrel_spaces::Did::parse(&repo).is_err()
                         || repo.len() > crate::store::MAX_WRITER_FLOOR_AUTHOR_LEN
                     {
                         return Err(Error::Malformed("invalid writer revision author"));

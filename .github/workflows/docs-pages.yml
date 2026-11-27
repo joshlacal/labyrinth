@@ -43,12 +43,13 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      # Cargo.toml takes atproto-spaces from the sibling catbird-atproto
-      # checkout, pinned to the same commit as ci.yml.
-      - name: Check out sibling catbird-atproto
+      - name: Check out Petrel and the Spaces compatibility crate
         run: |
+          git init -q ../Petrel
+          git -C ../Petrel fetch -q --depth 1 https://github.com/joshlacal/Petrel 76bf7c8beb83fbb861183d04948fa5a061698772
+          git -C ../Petrel checkout -q FETCH_HEAD
           git init -q ../catbird-atproto
-          git -C ../catbird-atproto fetch -q --depth 1 https://github.com/joshlacal/catbird-atproto 4299c438ff92d13cd554cdf686ca74156c987f84
+          git -C ../catbird-atproto fetch -q --depth 1 https://github.com/joshlacal/catbird-atproto aed64f2c6decd58696f482b9d024dafc407d3aa2
           git -C ../catbird-atproto checkout -q FETCH_HEAD
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -62,14 +63,6 @@ jobs:
       - name: Build the book
         run: mdbook build docs/book
       - name: Build the API reference
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
-          # tangled.org resets HTTP/2 streams partway through a clone
-          # ("curl 92 ... INTERNAL_ERROR"), so have git fetch over HTTP/1.1.
-          GIT_CONFIG_COUNT: '1'
-          GIT_CONFIG_KEY_0: http.version
-          GIT_CONFIG_VALUE_0: HTTP/1.1
-          CARGO_NET_RETRY: '5'
         run: cargo doc --no-deps --locked -p labyrinth -p labyrinth-protocol
       - name: Assemble the site
         run: |
