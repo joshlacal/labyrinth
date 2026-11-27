@@ -6,14 +6,18 @@ resolver = "2"
 name = "labyrinth"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Labyrinth 1.1 encrypted message-history storage (Catbird clean-slate PQ Spaces profile) for MLS chat on atproto"
 repository = "https://github.com/joshlacal/labyrinth"
 
 [dependencies]
 labyrinth-protocol = { path = "labyrinth-protocol" }
+# Recovery classifies malformed legacy batch timestamps before discarding a writer.
+# This Petrel-backed codec verifies STAR blocks without narrowing their original integers.
 atproto-spaces = { path = "../catbird-atproto/atproto-spaces", default-features = false }
+petrel-spaces = { path = "../Petrel/rust/petrel-spaces", default-features = false }
+petrel-crypto = { path = "../Petrel/rust/petrel-crypto", default-features = false }
 async-trait = "0.1"
 web-time = "1.1"
 aes = "0.9"
@@ -41,6 +45,7 @@ thiserror = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
+petrel-spaces = { path = "../Petrel/rust/petrel-spaces", default-features = false, features = ["wasm"] }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 [features]

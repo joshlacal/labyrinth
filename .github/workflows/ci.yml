@@ -16,13 +16,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Cargo.toml takes atproto-spaces from the sibling catbird-atproto
-      # checkout (../catbird-atproto), so CI fetches that public repo at a
-      # pinned commit next to this one.
-      - name: Check out sibling catbird-atproto
+      - name: Check out Petrel and the Spaces compatibility crate
         run: |
+          git init -q ../Petrel
+          git -C ../Petrel fetch -q --depth 1 https://github.com/joshlacal/Petrel 76bf7c8beb83fbb861183d04948fa5a061698772
+          git -C ../Petrel checkout -q FETCH_HEAD
           git init -q ../catbird-atproto
-          git -C ../catbird-atproto fetch -q --depth 1 https://github.com/joshlacal/catbird-atproto 4299c438ff92d13cd554cdf686ca74156c987f84
+          git -C ../catbird-atproto fetch -q --depth 1 https://github.com/joshlacal/catbird-atproto aed64f2c6decd58696f482b9d024dafc407d3aa2
           git -C ../catbird-atproto checkout -q FETCH_HEAD
       - uses: dtolnay/rust-toolchain@stable
         with:

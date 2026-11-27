@@ -2,6 +2,6 @@
 # Patchable semver advisory `ctutils >=0.4.4` (`RUSTSEC-2026-0385`) upgraded to `0.4.5` in `Cargo.lock`.
 [advisories]
 ignore = [
-    # `p256 0.13` / `jacquard 0.13` transitive pin on `elliptic-curve 0.13` -> `crypto-bigint 0.5.5`.
+    # `p256 0.13` transitive pin on `elliptic-curve 0.13` -> `crypto-bigint 0.5.5`.
     "RUSTSEC-2026-0387",
 ]

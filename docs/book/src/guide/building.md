@@ -9,25 +9,24 @@ Labyrinth is a Cargo workspace with two crates:
 | `labyrinth` | repository root | The client (`Labyrinth`), the store traits and their memory and Space implementations, recovery, enrollment, deletion |
 | `labyrinth-protocol` | `labyrinth-protocol/` | Pure verification code shared with servers: epoch-head chains, sequencer receipts, and the errors they raise |
 
-Rust 1.85 or newer is required (`edition = "2024"`).
+Rust 1.88 or newer is required (`edition = "2024"`).
 
-## The sibling checkout
+## Sibling checkouts
 
-`labyrinth` depends on the `atproto-spaces` crate by path:
-
-```toml
-atproto-spaces = { path = "../catbird-atproto/atproto-spaces", default-features = false }
-```
-
-Clone [`catbird-atproto`](https://github.com/joshlacal/catbird-atproto) next to this repository before building. The README records the commit the current `main` was tested against.
+Clone Petrel and catbird-atproto next to Labyrinth. Use the revisions pinned in
+[`.github/workflows/ci.yml`](https://github.com/joshlacal/labyrinth/blob/main/.github/workflows/ci.yml)
+from the Labyrinth revision you are building.
 
 ```text
 workspace/
+├── Petrel/
 ├── catbird-atproto/
 └── labyrinth/
 ```
 
-Some of `catbird-atproto`'s dependencies are fetched over git. If Cargo's built-in git client can't reach a host, set `CARGO_NET_GIT_FETCH_WITH_CLI=true` so it uses the system `git` instead.
+Petrel provides Space identifiers, CID verification, MACs, inventory hashing and signing keys.
+The Petrel-backed `atproto-spaces` crate reads raw STAR records so recovery can quarantine a
+malformed writer independently.
 
 ## Tests
 

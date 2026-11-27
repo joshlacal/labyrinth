@@ -98,12 +98,12 @@ impl Labyrinth {
             .redact_item(thread_id, message_id, &redaction)
             .await?;
 
-        if !pending.is_empty() {
-            if let Some(q) = self.outbox.get_mut(thread_id) {
-                q.retain(|m| m.message_id != message_id);
-                if q.is_empty() {
-                    self.outbox_rosters.remove(thread_id);
-                }
+        if !pending.is_empty()
+            && let Some(q) = self.outbox.get_mut(thread_id)
+        {
+            q.retain(|m| m.message_id != message_id);
+            if q.is_empty() {
+                self.outbox_rosters.remove(thread_id);
             }
         }
         Ok(stored + pending.len())
